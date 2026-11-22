@@ -1,0 +1,12 @@
+{
+  "options": [
+    {"path":"users.users.<name>.openssh.authorizedKeys.keys", "type":{"list":"string"}, "merge":"set", "description":"Inline authorized public keys"},
+    {"path":"users.users.<name>.openssh.authorizedKeys.keyFiles", "type":{"list":"sourceFile"}, "merge":"set", "description":"Repository public key files relative to declarations"},
+    {"path":"age.identityPaths", "type":{"list":"string"}, "description":"Target-side age identity paths in the specified order"},
+    {"path":"age.secrets.<name>.file", "type":"sourceFile", "description":"Repository ciphertext file relative to its declaration"},
+    {"path":"age.secrets.<name>.path", "type":"string", "description":"Target path for decrypted contents"},
+    {"path":"age.secrets.<name>.owner", "type":"string", "description":"Owner on the target"},
+    {"path":"age.secrets.<name>.group", "type":"string", "description":"Group on the target"},
+    {"path":"age.secrets.<name>.mode", "type":"string", "description":"Permission mode string on the target"}
+  ]
+}
