@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, error::Error, io::Write};
 
-use dek_cli::evaluation::evaluate_options;
+use crate::evaluation::evaluate_options;
 use dek_controller::{
     cache::{CacheStore, CachedHttpInputs},
     eval::{HttpInputProvider, RubyProviders, RubySession, TargetAnswer, TargetProvider},

@@ -22,6 +22,10 @@ use dek_target::backend::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+#[path = "planning/incremental.rs"]
+mod incremental;
+
 const CADDY_PATH: &str = "/etc/caddy/Caddyfile";
 const CADDY_INITIAL: &str = ":8080 {\n  respond \"hello\"\n}\n";
 const CADDY_UPDATED: &str = ":8080 {\n  respond \"updated\"\n}\n";
@@ -29,11 +33,25 @@ const CADDY_UPDATED: &str = ":8080 {\n  respond \"updated\"\n}\n";
 #[derive(Default)]
 struct MemoryTarget {
     deployed: Cell<bool>,
-    actual_file: RefCell<Option<ContentDigest>>,
+    actual_files: RefCell<BTreeMap<String, FileContent>>,
     executes: Cell<usize>,
 }
 
 impl MemoryTarget {
+    fn set_file(&self, path: &str, digest: ContentDigest) {
+        self.set_file_content(
+            path,
+            FileContent {
+                digest,
+                attributes: FileAttributes::default(),
+            },
+        );
+    }
+
+    fn set_file_content(&self, path: &str, content: FileContent) {
+        self.actual_files.borrow_mut().insert(path.into(), content);
+    }
+
     fn registry(&self) -> BackendRegistry<'_> {
         let mut registry = BackendRegistry::new(
             TargetIdentity {
@@ -54,7 +72,7 @@ impl Backend for MemoryTarget {
     fn capabilities(&self) -> Vec<ResourceCapability> {
         [
             (ResourceKind::Package, &[][..]),
-            (ResourceKind::File, &[]),
+            (ResourceKind::File, &["mode"]),
             (ResourceKind::SystemdUnit, &["enabled", "running", "reload"]),
         ]
         .into_iter()
@@ -81,15 +99,10 @@ impl Backend for MemoryTarget {
                 expected: deployed.then_some("2.0.0".into()),
             }],
             DesiredResource::File(file) => {
-                let digest = self.actual_file.borrow().clone();
+                let actual = self.actual_files.borrow().get(&file.path).cloned();
                 vec![Precondition::File {
                     path: file.path.clone(),
-                    expected: digest.map_or(FileObservation::Missing, |digest| {
-                        FileObservation::Present(FileContent {
-                            digest,
-                            attributes: FileAttributes::default(),
-                        })
-                    }),
+                    expected: actual.map_or(FileObservation::Missing, FileObservation::Present),
                 }]
             }
             DesiredResource::SystemdUnit(unit) => vec![
@@ -136,8 +149,7 @@ impl Backend for MemoryTarget {
                 let FileState::Present(content) = &file.state else {
                     panic!("expected a present file");
                 };
-                if matches!(expected, FileObservation::Present(actual) if actual.digest == content.digest)
-                {
+                if matches!(expected, FileObservation::Present(actual) if actual == content) {
                     Vec::new()
                 } else {
                     vec![action(
@@ -359,9 +371,7 @@ fn changed_caddy_content_updates_then_notifies_while_converged_plan_is_empty() {
     let memory = MemoryTarget::default();
     let registry = memory.registry();
     memory.deployed.set(true);
-    memory
-        .actual_file
-        .replace(Some(digest(CADDY_INITIAL.as_bytes())));
+    memory.set_file(CADDY_PATH, digest(CADDY_INITIAL.as_bytes()));
     let selector = HostSelector::Named("server");
     let safe = plan_host(&repo, selector, &registry, &mut NoTargetQueries).unwrap();
     assert!(safe.plan.actions.is_empty());
@@ -396,9 +406,7 @@ fn changed_caddy_content_updates_then_notifies_while_converged_plan_is_empty() {
     ] {
         assert!(text.contains(part), "{text}");
     }
-    memory
-        .actual_file
-        .replace(Some(digest(CADDY_UPDATED.as_bytes())));
+    memory.set_file(CADDY_PATH, digest(CADDY_UPDATED.as_bytes()));
     let converged = plan_host(&repo, selector, &registry, &mut NoTargetQueries).unwrap();
     assert!(converged.plan.actions.is_empty());
     assert_eq!(memory.executes.get(), 0);
