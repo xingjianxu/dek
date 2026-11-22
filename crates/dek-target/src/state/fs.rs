@@ -190,6 +190,11 @@ impl Directory {
         self.sync()
     }
 
+    pub(super) fn remove(&self, name: &str) -> Result<(), StateError> {
+        unlinkat(&self.fd, name, rustix::fs::AtFlags::empty())
+            .map_err(|err| StateError::io("移除已回收的文件", &self.path.join(name), err.into()))
+    }
+
     pub(super) fn sync(&self) -> Result<(), StateError> {
         self.fd
             .sync_all()
