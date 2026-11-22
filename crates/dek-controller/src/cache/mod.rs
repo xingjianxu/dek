@@ -123,6 +123,7 @@ impl CacheError {
 
 #[derive(Clone, Debug)]
 pub struct CacheStore {
+    repository: PathBuf,
     units: PathBuf,
 }
 
@@ -150,8 +151,13 @@ impl CacheStore {
             .map_err(|err| CacheError::io("无法定位仓库工作副本", repo_root, err))?;
         let repo_id = CacheDigest::of_bytes(repo.as_os_str().as_encoded_bytes()).to_string();
         Ok(Self {
+            repository: repo,
             units: cache_home.join("dek").join(repo_id).join("units"),
         })
+    }
+
+    pub fn repository_root(&self) -> &Path {
+        &self.repository
     }
 
     pub fn record_path(&self, key: &UnitKey) -> PathBuf {
