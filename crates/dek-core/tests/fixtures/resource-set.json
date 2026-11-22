@@ -1,0 +1,91 @@
+{
+  "resources": [
+    {
+      "desired": {
+        "package": {
+          "package": { "source": "official", "name": "backup" },
+          "state": "present"
+        }
+      },
+      "origins": [
+        {
+          "module": "backup",
+          "origin": { "file": "profiles/backup.json", "pointer": "/options/0" }
+        }
+      ],
+      "dependsOn": [],
+      "notifications": []
+    },
+    {
+      "desired": {
+        "file": {
+          "path": "/etc/backup/../backup.conf",
+          "state": {
+            "present": {
+              "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+              "attributes": { "owner": "root", "group": "root", "mode": "0644" }
+            }
+          }
+        }
+      },
+      "origins": [
+        {
+          "module": "backup",
+          "origin": { "file": "hosts/server/default.rb", "line": 12 }
+        }
+      ],
+      "dependsOn": [
+        { "package": { "source": "official", "name": "backup" } }
+      ],
+      "notifications": [
+        {
+          "unit": { "scope": "system", "name": "backup.service" },
+          "effect": "restart",
+          "when": "contentChanged"
+        }
+      ]
+    },
+    {
+      "desired": {
+        "systemdUnit": {
+          "unit": { "scope": "system", "name": "backup.timer" },
+          "definition": { "content": null, "dropIns": {} },
+          "enabled": true,
+          "running": null,
+          "activates": { "scope": "system", "name": "backup.service" }
+        }
+      },
+      "origins": [],
+      "dependsOn": [],
+      "notifications": []
+    },
+    {
+      "desired": {
+        "systemdUnit": {
+          "unit": { "scope": { "user": { "user": "alice" } }, "name": "backup.timer" },
+          "definition": { "content": null, "dropIns": {} },
+          "enabled": null,
+          "running": false,
+          "activates": null
+        }
+      },
+      "origins": [],
+      "dependsOn": [{ "user": "alice" }],
+      "notifications": []
+    },
+    {
+      "desired": {
+        "systemdUnit": {
+          "unit": { "scope": { "user": { "user": "bob" } }, "name": "backup.timer" },
+          "definition": { "content": null, "dropIns": {} },
+          "enabled": false,
+          "running": true,
+          "activates": null
+        }
+      },
+      "origins": [],
+      "dependsOn": [{ "user": "bob" }],
+      "notifications": []
+    }
+  ]
+}
