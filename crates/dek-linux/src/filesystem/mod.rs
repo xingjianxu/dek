@@ -1,6 +1,6 @@
 //! Observe and atomically publish Linux regular-file resources.
 
-mod atomic_file;
+pub(crate) mod atomic_file;
 mod validation;
 
 pub use validation::{FileValidationGroup, ValidationInput};
