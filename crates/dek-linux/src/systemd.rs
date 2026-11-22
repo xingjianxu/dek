@@ -1,5 +1,7 @@
 //! System manager unit definitions, enablement, and live state.
 
+mod notification;
+
 use std::{
     collections::BTreeMap,
     io,
@@ -9,10 +11,13 @@ use std::{
 
 use dek_core::{
     Action, ActionKind, ContentDigest, DesiredResource, Observation, Precondition,
-    ResourceCapability, ResourceId, ResourceKind, SystemdUnitResource, UnitDefinition, UnitId,
-    UnitScope,
+    ResourceCapability, ResourceId, ResourceKind, ServiceNotification, SystemdUnitResource,
+    UnitDefinition, UnitId, UnitScope,
 };
-use dek_target::backend::{ActionContext, ActionReadiness, Backend, BackendError, PlannedAction};
+use dek_target::backend::{
+    ActionContext, ActionReadiness, Backend, BackendError, NotificationError, PlannedAction,
+    PlannedNotification,
+};
 use rustix::{
     fs::{Mode, Stat, fstat},
     process::{Gid, Uid},
@@ -28,10 +33,18 @@ impl Backend for SystemdBackend {
         vec![ResourceCapability {
             kind: ResourceKind::SystemdUnit,
             version: 1,
-            attributes: ["content", "dropIns", "enabled", "running", "activates"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            attributes: [
+                "content",
+                "dropIns",
+                "enabled",
+                "running",
+                "activates",
+                "reload",
+                "restart",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         }]
     }
 
@@ -155,6 +168,21 @@ impl Backend for SystemdBackend {
         Ok(actions)
     }
 
+    fn validate_notification(
+        &self,
+        notification: &ServiceNotification,
+    ) -> Result<(), BackendError> {
+        notification::validate(&notification.unit)
+    }
+
+    fn plan_notification(
+        &self,
+        notification: &ServiceNotification,
+        service_will_start: bool,
+    ) -> Result<Option<PlannedNotification>, BackendError> {
+        notification::plan(notification, service_will_start)
+    }
+
     fn validate_action(&self, action: &Action) -> Result<(), BackendError> {
         match &action.kind {
             ActionKind::DeployUnit { unit, definition } => {
@@ -165,6 +193,7 @@ impl Backend for SystemdBackend {
                 validate_unit(unit)
             }
             ActionKind::ReloadManager(UnitScope::System) => Ok(()),
+            ActionKind::NotifyService { unit, .. } => notification::validate(unit),
             _ => Err(BackendError("后端无法执行此系统级单元动作".into())),
         }
     }
@@ -208,6 +237,9 @@ impl Backend for SystemdBackend {
             ActionKind::ReloadManager(UnitScope::System) => {
                 return Ok(ActionReadiness::Ready);
             }
+            ActionKind::NotifyService { unit, effect } => {
+                return notification::inspect(action, unit, *effect);
+            }
             _ => return Err(BackendError("未知的系统级单元动作".into())),
         };
         if satisfied {
@@ -222,6 +254,11 @@ impl Backend for SystemdBackend {
     }
 
     fn execute(&self, context: &ActionContext<'_>) -> Result<(), BackendError> {
+        if matches!(context.action.kind, ActionKind::NotifyService { .. }) {
+            return self
+                .execute_notification(context)
+                .map_err(|error| BackendError(error.to_string()));
+        }
         match self.inspect_action(context.action)? {
             ActionReadiness::Satisfied => return Ok(()),
             ActionReadiness::Conflict(reason) => return Err(BackendError(reason)),
@@ -242,6 +279,26 @@ impl Backend for SystemdBackend {
         }
     }
 
+    fn execute_notification(&self, context: &ActionContext<'_>) -> Result<(), NotificationError> {
+        let ActionKind::NotifyService { unit, effect } = &context.action.kind else {
+            return Err(NotificationError::Unverified(BackendError(
+                "动作类型与服务通知不符".into(),
+            )));
+        };
+        match self
+            .inspect_action(context.action)
+            .map_err(NotificationError::Unverified)?
+        {
+            ActionReadiness::Ready => notification::execute(unit, *effect),
+            ActionReadiness::Conflict(reason) => {
+                Err(NotificationError::Unverified(BackendError(reason)))
+            }
+            ActionReadiness::Satisfied => Err(NotificationError::Unverified(BackendError(
+                "尚无服务通知回执".into(),
+            ))),
+        }
+    }
+
     fn verify(&self, action: &ActionKind) -> Result<bool, BackendError> {
         match action {
             ActionKind::DeployUnit { unit, definition } => {
@@ -254,6 +311,7 @@ impl Backend for SystemdBackend {
                 ctl(&["show", "--property=Version", "--value"])
                     .map(|version| !version.trim().is_empty())
             }
+            ActionKind::NotifyService { unit, .. } => is_running(unit),
             _ => Err(BackendError("未知的系统级单元动作".into())),
         }
     }
@@ -473,6 +531,7 @@ fn ctl_output(args: &[&str]) -> Result<Output, BackendError> {
         .args(["--system", "--no-pager"])
         .args(args)
         .env("LC_ALL", "C")
+        .env("SYSTEMD_COLORS", "0")
         .output()
         .map_err(|err| BackendError(format!("无法启动 systemctl：{err}")))
 }
