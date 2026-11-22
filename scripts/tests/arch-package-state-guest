@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Feed through run-arch-vm ssh in a fresh Arch test guest.
+set -euo pipefail
+[[ "$(id -un)" == dek && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+export PATH="$1:/usr/bin"
+export LC_ALL=C
+
+base=/run/dek-package-fixture
+repo="$base/repo"
+native=/usr/bin/dek-pacman-native
+work=$(mktemp -d)
+sudo -n install -d -m 0755 "$repo"
+cfg="$base/seed.conf"
+printf '[options]\nArchitecture = auto\nLocalFileSigLevel = Required TrustedOnly\n' | sudo -n tee "$cfg"
+sync_snapshot() {
+    if [[ -d /var/lib/pacman/sync ]]; then
+        find /var/lib/pacman/sync -maxdepth 1 -type f -print0 | sort -z | xargs -0 -r sha256sum
+    fi
+}
+sync_snapshot > "$work/sync.before"
+sudo -n /usr/bin/pacman --config "$cfg" -U --noconfirm -- "$base/ripgrep.pkg.tar.zst" "$base/tree.pkg.tar.zst"
+installed=$(/usr/bin/pacman -Q ripgrep)
+tree=$(/usr/bin/pacman -Q tree)
+older=$(/usr/bin/pacman -Qp "$base/older-tree.pkg.tar.zst")
+[[ "$installed" == 'ripgrep '* && "$tree" == 'tree '* && "$older" == 'tree '* && "$tree" != "$older" ]]
+if /usr/bin/pacman -Q jq; then
+    printf 'Missing-package test requires an Arch base without jq\n' >&2
+    exit 1
+fi
+printf 'Signed fixture versions\n%s\n%s\n%s\n' "$installed" "$tree" "$older"
+
+sudo -n install -o root -g dek -m 0660 /dev/null "$base/argv"
+sudo -n tee "$base/pacman-probe" >/dev/null <<'PROBE'
+#!/usr/bin/bash
+set -euo pipefail
+base=/run/dek-package-fixture
+native=/usr/bin/dek-pacman-native
+{ printf '%q ' "$@"; printf '\n'; } >> "$base/argv"
+case "${1-}:${2-}" in
+    --query:--color|--remove:--print) ;;
+    --remove:--noconfirm)
+        if [[ -e "$base/downgrade-before-remove" ]]; then
+            rm -- "$base/downgrade-before-remove"
+            # Change the package after the final preview but before the native
+            # removal acquires its transaction lock.
+            "$native" --config "$base/seed.conf" -U --noconfirm -- "$base/older-tree.pkg.tar.zst" >&2
+        fi
+        ;;
+    *)
+        printf 'Fixture forbids source refresh, upgrades and unexpected pacman calls\n' >&2
+        exit 98
+        ;;
+esac
+exec "$native" "$@"
+PROBE
+[[ ! -e "$native" ]]
+sudo -n mv -- /usr/bin/pacman "$native"
+trap 'sudo -n mv -f -- "$native" /usr/bin/pacman' EXIT
+sudo -n install -m 0755 "$base/pacman-probe" /usr/bin/pacman
+
+put() { sudo -n tee "$repo/$1" >/dev/null; }
+put dek.json <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"entry":"entry.json","target":{"local":true}}}}
+JSON
+entry() {
+    printf '{"schemaVersion":1,"imports":[],"options":%s}\n' "$1" | put entry.json
+}
+user_dek() {
+    XDG_CACHE_HOME="$work/user-cache" /usr/local/bin/dek --repo "$repo" -H fixture "$@" --state-dir "$work/state"
+}
+root_dek() {
+    sudo -n env PATH="$PATH" XDG_CACHE_HOME="$base/root-cache" \
+        /usr/local/bin/dek --repo "$repo" -H fixture "$@" --state-dir "$base/root-state"
+}
+assert_empty() {
+    ruby -rjson -e 'abort "expected no actions" unless JSON.parse(File.read(ARGV.fetch(0), encoding: "UTF-8")).fetch("actions").empty?' "$1"
+}
+review_id() {
+    ruby -rjson -e '
+      doc = JSON.parse(File.read(ARGV.fetch(0), encoding: "UTF-8"))
+      pkg = {"source" => "official", "name" => "tree"}
+      action, extra = doc.fetch("actions")
+      expected = ARGV.fetch(1)
+      abort "wrong reviewed removal" if !action || extra || action.fetch("kind") != {"removePackage" => {"package" => pkg}}
+      abort "wrong reviewed version" unless action.fetch("preconditions") == [{"packageVersion" => {"package" => pkg, "expected" => expected}}]
+      puts doc.fetch("plan_id")
+    ' "$1" "$2"
+}
+
+entry '[{"path":"environment.systemPackages","value":["ripgrep"]}]'
+user_dek plan --json > "$work/present.json"
+assert_empty "$work/present.json"
+user_dek apply
+[[ $("$native" -Q ripgrep) == "$installed" ]]
+present_calls=$(wc -l < "$base/argv")
+[[ "$present_calls" -gt 0 ]]
+[[ $(grep -c '^--query --color never $' "$base/argv") == "$present_calls" ]]
+printf 'Already satisfied plan/apply made %s local queries, zero refreshes or upgrade checks\n' "$present_calls"
+
+entry '[]'
+user_dek apply
+[[ $("$native" -Q ripgrep) == "$installed" ]]
+
+entry '[{"path":"environment.systemPackages","value":["jq"]}]'
+if user_dek plan --json > "$work/missing.json" 2> "$work/missing.log"; then
+    printf 'A missing package unexpectedly received an offline candidate\n' >&2
+    exit 1
+fi
+[[ ! -s "$work/missing.json" ]]
+grep -F '本地未安装软件包 jq' "$work/missing.log"
+
+put dek.json <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.remove":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+put options.json <<'JSON'
+{"options":[{"path":"lab.remove.enable","type":"boolean","default":false,"description":"Remove the fixture tree package"}]}
+JSON
+put expand.rb <<'RUBY'
+resource('package', package: {source: 'official', name: 'tree'}, state: 'absent')
+RUBY
+entry '[{"path":"lab.remove.enable","value":true}]'
+root_dek plan --json > "$work/remove.json"
+first=$(review_id "$work/remove.json" "${tree#tree }")
+sudo -n touch "$base/downgrade-before-remove"
+if root_dek apply --plan "$first" > "$work/race.log" 2>&1; then
+    printf 'Removal unexpectedly accepted a changed native transaction version\n' >&2
+    exit 1
+fi
+cat "$work/race.log"
+grep -F "reviewed removal expected $tree, found $older" "$work/race.log"
+[[ $("$native" -Q tree) == "$older" ]]
+
+root_dek plan --json > "$work/reviewed.json"
+second=$(review_id "$work/reviewed.json" "${older#tree }")
+[[ "$first" != "$second" ]]
+root_dek apply --plan "$second"
+if "$native" -Q tree; then
+    printf 'Reviewed removal left tree installed\n' >&2
+    exit 1
+fi
+[[ $("$native" -Q ripgrep) == "$installed" ]]
+root_dek plan --json > "$work/absent.json"
+assert_empty "$work/absent.json"
+sync_snapshot > "$work/sync.after"
+cmp "$work/sync.before" "$work/sync.after"
+! grep -E -- '(^| )(-S[^ ]*|-Qu|--sync|--refresh|--upgrades|--sysupgrade)( |$)' "$base/argv"
+grep -F -- '--remove --print --print-format' "$base/argv"
+grep -F -- '--remove --noconfirm' "$base/argv"
+printf 'Verified signed offline seed, no-op, unmanagement, guarded removal and missing-package diagnosis.\n'
