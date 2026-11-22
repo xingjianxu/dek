@@ -87,7 +87,9 @@ pub(crate) fn description(action: &ActionKind) -> String {
             };
             format!("{verb} {}", unit_name(unit))
         }
-        ActionKind::UpdateAuthorizedKeys(keys) => format!("更新授权公钥 {}", keys.user),
+        ActionKind::UpdateAuthorizedKeys { keys, home, .. } => {
+            format!("更新 {} 的授权公钥 {home}/.ssh/authorized_keys", keys.user)
+        }
         ActionKind::DeployAgeSecret(secret) => {
             format!("部署加密文件 {} ({})", secret.path, secret.ciphertext.0)
         }

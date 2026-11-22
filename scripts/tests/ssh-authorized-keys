@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+success='Verified real OpenSSH authentication, reviewed key files, repeat no-op, omission, explicit clear, manual restrictions, per-user isolation and account/directory ordering.'
+
+if [[ "${1-}" != --guest ]]; then
+    if [[ $# != 2 ]]; then
+        printf 'Usage: %s IMAGE_ID DEK_BINARY\n' "$0" >&2
+        exit 2
+    fi
+    scripts=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+    binary=$(realpath -e -- "$2")
+    run=''
+    cleanup() {
+        if [[ -n "$run" ]]; then
+            "$scripts/run-arch-vm" finish "$run" failed || true
+        fi
+    }
+    trap cleanup EXIT
+    run=$("$scripts/run-arch-vm" start 35 "$1" "$binary")
+    printf '%s\n' "$run"
+    sum=$(sha256sum -- "$binary")
+    guest_sum=$("$scripts/run-arch-vm" ssh "$run" sha256sum /usr/local/bin/dek)
+    [[ "${sum%% *}" == "${guest_sum%% *}" ]]
+    printf 'Binary SHA-256 %s\n' "${sum%% *}"
+    "$scripts/run-arch-vm" ssh "$run" sudo bash -s -- --guest < "$0" 2>&1 | tee "$run/authorized-keys.log"
+    grep -Fqx -- "$success" "$run/authorized-keys.log"
+    "$scripts/run-arch-vm" finish "$run" passed
+    run=''
+    exit
+fi
+
+export LC_ALL=C
+[[ "$(id -u)" == 0 && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+ssh -V
+repo=/srv/dek35-fixture
+alice=/home/dek35-alice/.ssh/authorized_keys
+bob=/home/dek35-bob/.ssh/authorized_keys
+charlie_home=/home/dek35-charlie
+charlie="$charlie_home/.ssh/authorized_keys"
+export XDG_CACHE_HOME="$repo/cache"
+install -d -m 0700 "$repo"
+cat > "$repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"target":{"local":true},"entry":"host.json"}}}
+JSON
+for user in dek35-alice dek35-bob; do
+    useradd --create-home --user-group "$user"
+    install -d -m 0700 -o "$user" -g "$user" "/home/$user/.ssh"
+done
+for key in manual inline first next bob charlie; do
+    ssh-keygen -q -t ed25519 -N '' -C "$key" -f "$repo/$key"
+done
+ssh-keygen -q -t ed25519 -N '' -f "$repo/host-key"
+printf '[127.0.0.1]:22235 %s\n' "$(cat "$repo/host-key.pub")" > "$repo/known_hosts"
+cat > "$repo/sshd.conf" <<EOF
+Port 22235
+ListenAddress 127.0.0.1
+HostKey $repo/host-key
+PidFile $repo/sshd.pid
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM yes
+AllowUsers dek35-alice dek35-bob
+EOF
+/usr/bin/sshd -t -f "$repo/sshd.conf"
+/usr/bin/sshd -f "$repo/sshd.conf" -E "$repo/sshd.log"
+finish_sshd() {
+    local result=$?
+    if (( result != 0 )); then
+        cat "$repo/sshd.log" >&2
+    fi
+    kill "$(cat "$repo/sshd.pid")" || true
+}
+trap finish_sshd EXIT
+{
+    printf '# Manual bytes: \377\r\ncommand="echo a, b",restrict '
+    tr -d '\n' < "$repo/manual.pub"
+} > "$repo/manual-expected"
+install -m 0600 -o dek35-alice -g dek35-alice "$repo/manual-expected" "$alice"
+install -m 0600 -o dek35-bob -g dek35-bob "$repo/bob.pub" "$bob"
+cp -- "$bob" "$repo/bob-expected"
+bob_revision=$(stat -c '%d:%i:%s:%y' "$bob")
+cp -- "$repo/first.pub" "$repo/alice.pub"
+
+configuration() {
+    python3 - "$repo" "$1" "$charlie_home" > "$repo/host.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+repo, phase, home = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+keys = "users.users.dek35-alice.openssh.authorizedKeys"
+options = {
+    "present": {keys + ".keys": [(repo / "inline.pub").read_text().strip()], keys + ".keyFiles": ["alice.pub"]},
+    "clear": {keys + ".keys": [], keys + ".keyFiles": []},
+    "omit": {},
+    "overlap": {keys + ".keys": [(repo / "manual.pub").read_text().strip()]},
+    "bootstrap": {
+        "users.users.dek35-charlie.isNormalUser": True,
+        "users.users.dek35-charlie.home": home,
+        "users.users.dek35-charlie.openssh.authorizedKeys.keyFiles": ["charlie.pub"],
+        "systemd.tmpfiles.settings.fixture": {
+            home: {"d": {"user": "dek35-charlie", "mode": "0700"}},
+            home + "/.ssh": {"d": {"user": "dek35-charlie", "mode": "0700"}},
+        },
+    },
+}[phase]
+print(json.dumps({"schemaVersion": 1, "imports": [], "options": [
+    {"path": key, "value": value} for key, value in options.items()
+]}))
+PY
+}
+dek_command() {
+    local command=$1
+    shift
+    /usr/local/bin/dek --repo "$repo" -H fixture "$command" --state-dir "$repo/state" "$@"
+}
+assert_empty_plan() {
+    dek_command plan --json | python3 -c 'import json, sys; assert json.load(sys.stdin)["actions"] == []'
+}
+assert_keys() {
+    grep -aFx -- "$(cat "$repo/inline.pub")" "$alice"
+    grep -aFx -- "$(cat "$repo/$1.pub")" "$alice"
+    tail -c "$(stat -c '%s' "$repo/manual-expected")" "$alice" | cmp -- "$repo/manual-expected" -
+    [[ "$(stat -c '%a:%U:%G' "$alice")" == '600:dek35-alice:dek35-alice' ]]
+    cmp -- "$bob" "$repo/bob-expected"
+    [[ "$(stat -c '%d:%i:%s:%y' "$bob")" == "$bob_revision" ]]
+}
+login() {
+    local key=$1 user=$2 command=$3
+    ssh -n -F /dev/null -p 22235 -i "$repo/$key" -o IdentitiesOnly=yes -o BatchMode=yes \
+        -o "UserKnownHostsFile=$repo/known_hosts" -o StrictHostKeyChecking=yes -o ConnectTimeout=5 \
+        "$user@127.0.0.1" "$command"
+}
+
+configuration present
+approved=$(dek_command plan --json | python3 -c 'import json, sys; plan = json.load(sys.stdin); assert len(plan["actions"]) == 1; print(plan["plan_id"])')
+cp -- "$repo/next.pub" "$repo/alice.pub"
+dek_command apply --plan "$approved"
+assert_keys first
+[[ "$(login inline dek35-alice 'id -un')" == dek35-alice ]]
+[[ "$(login first dek35-alice 'id -un')" == dek35-alice ]]
+[[ "$(login manual dek35-alice 'echo replaced')" == 'a, b' ]]
+if login first dek35-bob 'id -un' > "$repo/bob-denied" 2>&1; then
+    printf 'Alice’s managed key was accepted for Bob.\n' >&2
+    exit 1
+fi
+grep -F 'Permission denied (publickey)' "$repo/bob-denied"
+dek_command apply
+assert_keys next
+if grep -aFx -- "$(cat "$repo/first.pub")" "$alice"; then
+    printf 'The superseded managed key is still present.\n' >&2
+    exit 1
+fi
+revision=$(stat -c '%d:%i:%s:%y' "$alice")
+assert_empty_plan
+dek_command apply
+[[ "$(stat -c '%d:%i:%s:%y' "$alice")" == "$revision" ]]
+
+configuration omit
+assert_empty_plan
+dek_command apply
+assert_keys next
+[[ "$(stat -c '%d:%i:%s:%y' "$alice")" == "$revision" ]]
+
+configuration clear
+dek_command apply
+cmp -- "$alice" "$repo/manual-expected"
+[[ "$(login manual dek35-alice 'echo replaced')" == 'a, b' ]]
+if login inline dek35-alice 'id -un' > "$repo/inline-denied" 2>&1; then
+    printf 'The removed inline key was accepted.\n' >&2
+    exit 1
+fi
+grep -F 'Permission denied (publickey)' "$repo/inline-denied"
+assert_empty_plan
+
+configuration overlap
+if dek_command plan --json > "$repo/overlap" 2>&1; then
+    printf 'An unrestricted copy of a manual restricted key must be rejected.\n' >&2
+    exit 1
+fi
+cat "$repo/overlap"
+cmp -- "$alice" "$repo/manual-expected"
+
+configuration present
+mv -- "$alice" "$alice.backup"
+ln -s -- "$bob" "$alice"
+if dek_command plan --json > "$repo/symlink" 2>&1; then
+    printf 'An authorized_keys symlink must be rejected.\n' >&2
+    exit 1
+fi
+cat "$repo/symlink"
+cmp -- "$bob" "$repo/bob-expected"
+[[ "$(stat -c '%d:%i:%s:%y' "$bob")" == "$bob_revision" ]]
+
+configuration bootstrap
+dek_command plan --json | python3 -c '
+import json, sys
+actions = json.load(sys.stdin)["actions"]
+assert [next(iter(item["kind"])) for item in actions] == ["ensureUser", "ensureDirectory", "ensureDirectory", "updateAuthorizedKeys"]
+assert actions[-1]["dependsOn"]
+'
+dek_command apply
+grep -aFx -- "$(cat "$repo/charlie.pub")" "$charlie"
+[[ "$(stat -c '%a:%U' "$charlie")" == '600:dek35-charlie' ]]
+assert_empty_plan
+printf '%s\n' "$success"

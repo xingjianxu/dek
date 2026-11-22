@@ -14,12 +14,31 @@ const TOOL_PATHS: [&str; 5] = [
     "/run/current-system/sw/bin",
 ];
 
-pub(super) fn tool(name: &str) -> Result<PathBuf, BackendError> {
+pub(crate) fn tool(name: &str) -> Result<PathBuf, BackendError> {
     TOOL_PATHS
         .into_iter()
         .map(|directory| Path::new(directory).join(name))
         .find(|path| path.is_file())
         .ok_or_else(|| BackendError(format!("缺少目标账户管理工具 {name}")))
+}
+
+pub(crate) fn default_home(user: &str) -> Result<PathBuf, BackendError> {
+    let output = Command::new(tool("useradd")?)
+        .arg("--defaults")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| BackendError(format!("读取 useradd 默认 home：{err}")))?;
+    if output.status.success()
+        && let Ok(settings) = std::str::from_utf8(&output.stdout)
+        && let Some(home) = settings.lines().find_map(|line| line.strip_prefix("HOME="))
+    {
+        return Ok(Path::new(home).join(user));
+    }
+    Err(BackendError(
+        "无法读取 useradd 默认 home；请声明账户 home".into(),
+    ))
 }
 
 pub(super) fn create_group(group: &GroupResource) -> Result<(), BackendError> {
