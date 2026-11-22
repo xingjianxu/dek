@@ -8,3 +8,6 @@ pub use graph::{
     collect_graph,
 };
 pub use json::JsonCollector;
+
+mod ruby;
+pub use ruby::{EvalOutput, RubyError, RubySession, TargetAnswer, TargetProvider};
