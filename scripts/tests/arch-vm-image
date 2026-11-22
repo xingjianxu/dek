@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+    printf 'Usage: %s <upstream-artifact-parent> <first-image-id> <second-image-id>\n' "$0" >&2
+    exit 2
+fi
+
+artifacts=$(realpath -- "$1")
+first=$2
+second=$3
+[[ $first != "$second" ]]
+script=$(realpath -- "$(dirname -- "$0")/../arch-vm-image")
+test_root="${TMPDIR:-${DEK_DEV_ROOT:-/data/dek-dev}/runs/22}"
+mkdir -p -- "$test_root"
+scratch=$(mktemp -d "$test_root/arch-image-test.XXXXXXXX")
+
+cleanup() {
+    local status=$?
+    if ((status != 0)); then
+        printf 'Arch image test failed; fixtures retained in %s\n' "$scratch" >&2
+    else
+        chmod -R u+w -- "$scratch"
+        rm -r -- "$scratch"
+    fi
+}
+trap cleanup EXIT
+
+export DEK_DEV_ROOT="$scratch/data"
+curl() {
+    printf 'unexpected network request during offline image verification\n' >&2
+    return 99
+}
+export -f curl
+
+image=$("$script" prepare --source-dir "$artifacts/$first" "$first")
+[[ "$image" == "$DEK_DEV_ROOT/vm/base/$first/image.qcow2" ]]
+[[ $(stat -c '%a' -- "$image") == 444 ]]
+[[ $(stat -c '%a' -- "${image%/*}") == 555 ]]
+inode=$(stat -c '%i' -- "$image")
+[[ $("$script" prepare "$first") == "$image" ]]
+[[ $(stat -c '%i' -- "$image") == "$inode" ]]
+
+name="Arch-Linux-x86_64-cloudimg-${second#v}.qcow2"
+mkdir -- "$scratch/corrupt"
+for suffix in '' .sig .SHA256 .SHA256.sig; do
+    cp --reflink=auto -- "$artifacts/$second/$name$suffix" "$scratch/corrupt/"
+done
+
+expect_failure() {
+    if "$script" prepare --source-dir "$scratch/corrupt" "$second" \
+        >"$scratch/stdout" 2>"$scratch/stderr"; then
+        printf 'Corrupt input was accepted\n' >&2
+        return 1
+    fi
+    [[ ! -s "$scratch/stdout" && ! -e "$DEK_DEV_ROOT/vm/base/$second" ]]
+    [[ $("$script" check "$first") == "$image" ]]
+}
+
+printf 'invalid signature\n' >"$scratch/corrupt/$name.SHA256.sig"
+expect_failure
+grep -F 'signature' "$scratch/stderr" >/dev/null
+cp -- "$artifacts/$second/$name.SHA256.sig" "$scratch/corrupt/"
+printf 'invalid signature\n' >"$scratch/corrupt/$name.sig"
+expect_failure
+grep -F 'signature' "$scratch/stderr" >/dev/null
+cp -- "$artifacts/$second/$name.sig" "$scratch/corrupt/"
+printf 'X' | dd of="$scratch/corrupt/$name" bs=1 count=1 conv=notrunc status=none
+expect_failure
+grep -F 'SHA-256' "$scratch/stderr" >/dev/null
+
+other=$("$script" prepare --source-dir "$artifacts/$second" "$second")
+[[ "$other" == "$DEK_DEV_ROOT/vm/base/$second/image.qcow2" ]]
+[[ $("$script" check "$second") == "$other" ]]
+[[ $("$script" check "$first") == "$image" ]]
+[[ $(stat -c '%i' -- "$image") == "$inode" ]]
+printf 'Arch image acquisition, corruption rejection, and reuse passed\n'

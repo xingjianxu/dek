@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s inherit_errexit
+export LC_ALL=C
+umask 077
+
+usage() {
+    cat <<'EOF'
+Usage: arch-vm-image prepare [--source-dir DIR] <image-id>
+       arch-vm-image check <image-id>
+
+Prepare or check an official Arch x86_64 cloud image, e.g. v20261115.625457.
+DEK_DEV_ROOT defaults to /data/dek-dev. Success prints the verified image path.
+EOF
+}
+
+fail() {
+    printf 'arch-vm-image: %s\n' "$*" >&2
+    exit 1
+}
+
+if [[ $# -eq 1 && ( $1 == --help || $1 == -h ) ]]; then
+    usage
+    exit
+fi
+if [[ $# -eq 0 || ( $1 != prepare && $1 != check ) ]]; then
+    usage >&2
+    exit 2
+fi
+action=$1
+shift
+source_dir=
+if [[ $action == prepare && $# -eq 3 && $1 == --source-dir ]]; then
+    [[ -d $2 ]] || fail "artifact directory does not exist: $2"
+    source_dir=$(realpath -- "$2")
+    shift 2
+fi
+if [[ $# -ne 1 || ! $1 =~ ^v[0-9]{8}\.[0-9]+$ ]]; then
+    usage >&2
+    exit 2
+fi
+image_id=$1
+
+for tool in gpg gpgv jq sha256sum; do
+    command -v "$tool" >/dev/null || fail "missing required tool: $tool"
+done
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+dev_root=$(realpath -m -- "${DEK_DEV_ROOT:-/data/dek-dev}")
+cache="$dev_root/cache/arch-vm"
+base="$dev_root/vm/base"
+published="$base/$image_id"
+upstream_name="Arch-Linux-x86_64-cloudimg-${image_id#v}.qcow2"
+upstream_url="https://geo.mirror.pkgbuild.com/images/$image_id/$upstream_name"
+key_source=https://github.com/archlinux/arch-boxes/blob/7f733af26fe9a0c93fdabba13e7803cbe803374a/README.md#releases
+signer_fingerprint=1B9A16984A4E8CB448712D2AE0B78BF4326C6F8F
+
+if [[ $action == check && ! -d $published ]]; then
+    fail "base image $image_id is missing; run arch-vm-image prepare $image_id"
+fi
+mkdir -p -- "$cache"
+if [[ $action == prepare ]]; then
+    command -v flock >/dev/null || fail "missing required tool: flock"
+    mkdir -p -- "$base" "$cache/locks"
+    exec {image_lock}>"$cache/locks/$image_id.lock"
+    flock --exclusive "$image_lock"
+fi
+
+scratch=$(mktemp -d "$cache/.verify-$image_id.XXXXXXXX")
+publication=
+cleanup() {
+    if [[ -n $publication && -d $publication ]]; then
+        chmod u+w -- "$publication"
+        rm -r -- "$publication"
+    fi
+    rm -r -- "$scratch"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -m 700 -- "$scratch/gnupg"
+keyring="$scratch/gnupg/arch-boxes.gpg"
+gpg --no-options --batch --homedir "$scratch/gnupg" \
+    --dearmor --output "$keyring" "$script_dir/arch-vm/arch-boxes.asc"
+
+verify_signature() {
+    local signature=$1 content=$2 signing_fingerprint
+    if ! gpgv --homedir "$scratch/gnupg" --keyring "$keyring" --status-fd=1 \
+        -- "$signature" "$content" >"$scratch/gpg.status" 2>"$scratch/gpg.log"; then
+        cat -- "$scratch/gpg.log" >&2
+        fail "signature verification failed: $signature"
+    fi
+    signing_fingerprint=$(awk -v key="$signer_fingerprint" \
+        '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $NF == key {print $3}' \
+        "$scratch/gpg.status")
+    [[ $signing_fingerprint =~ ^[0-9A-F]{40}$ ]] ||
+        fail "signature does not identify the pinned arch-boxes key: $signature"
+    printf '%s\n' "$signing_fingerprint"
+}
+
+verify_checksum() {
+    local directory=$1 line
+    checksum_signer=$(verify_signature "$directory/upstream.SHA256.sig" "$directory/upstream.SHA256")
+    line=$(<"$directory/upstream.SHA256")
+    checksum=${line%% *}
+    [[ $checksum =~ ^[0-9a-f]{64}$ && $line == "$checksum  $upstream_name" ]] ||
+        fail "signed SHA-256 does not describe $upstream_name"
+}
+
+verify_image() {
+    local directory=$1 digest
+    digest=$(sha256sum <"$directory/image.qcow2")
+    [[ ${digest%% *} == "$checksum" ]] || fail "SHA-256 mismatch for $directory/image.qcow2"
+    [[ $(head -c 4 -- "$directory/image.qcow2") == $'QFI\xfb' ]] ||
+        fail "image is not qcow2: $directory/image.qcow2"
+    image_signer=$(verify_signature "$directory/image.qcow2.sig" "$directory/image.qcow2")
+    image_size=$(stat -c '%s' -- "$directory/image.qcow2")
+}
+
+verify_published() {
+    local file
+    [[ -d $published && ! -L $published && $(stat -c '%a' -- "$published") == 555 ]] ||
+        fail "expected a read-only base directory: $published"
+    for file in image.qcow2 image.qcow2.sig upstream.SHA256 upstream.SHA256.sig metadata.json; do
+        [[ -f $published/$file && ! -L $published/$file && $(stat -c '%a' -- "$published/$file") == 444 ]] ||
+            fail "expected a read-only base file: $published/$file"
+    done
+    verify_checksum "$published"
+    verify_image "$published"
+    jq -e --arg id "$image_id" --arg sha "$checksum" --arg name "$upstream_name" \
+        --arg signer "$signer_fingerprint" --arg imageSigner "$image_signer" \
+        --arg checksumSigner "$checksum_signer" --argjson bytes "$image_size" '
+        .schemaVersion == 1 and .imageId == $id and .image == "image.qcow2"
+        and .architecture == "x86_64" and .format == "qcow2" and .sha256 == $sha
+        and .sizeBytes == $bytes and .upstreamFile == $name and .signerFingerprint == $signer
+        and .imageSigningFingerprint == $imageSigner and .checksumSigningFingerprint == $checksumSigner
+        ' "$published/metadata.json" >/dev/null || fail "base metadata mismatch: $published/metadata.json"
+}
+
+if [[ $action == check || ( -z $source_dir && ( -e $published || -L $published ) ) ]]; then
+    verify_published
+    printf '%s\n' "$published/image.qcow2"
+    exit
+fi
+
+if [[ -z $source_dir ]]; then
+    command -v curl >/dev/null || fail "missing required tool: curl"
+fi
+
+acquire() {
+    local suffix=$1 destination=$2
+    if [[ -n $source_dir ]]; then
+        local source="$source_dir/$upstream_name$suffix"
+        [[ -f $source ]] || fail "missing upstream artifact: $source"
+        cp --reflink=auto -- "$source" "$destination"
+    else
+        curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 2 --connect-timeout 15 --max-time 600 --output "$destination" "$upstream_url$suffix"
+    fi
+}
+
+acquire .SHA256 "$scratch/upstream.SHA256"
+acquire .SHA256.sig "$scratch/upstream.SHA256.sig"
+verify_checksum "$scratch"
+acquire .sig "$scratch/image.qcow2.sig"
+acquire '' "$scratch/image.qcow2"
+verify_image "$scratch"
+
+if [[ -e $published || -L $published ]]; then
+    candidate_checksum=$checksum
+    verify_published
+    [[ $checksum == "$candidate_checksum" ]] || fail "base $image_id already identifies different bytes"
+    printf '%s\n' "$published/image.qcow2"
+    exit
+fi
+
+jq -n --arg id "$image_id" --arg sha "$checksum" --arg name "$upstream_name" \
+    --arg url "$upstream_url" --arg keySource "$key_source" --arg signer "$signer_fingerprint" \
+    --arg imageSigner "$image_signer" --arg checksumSigner "$checksum_signer" \
+    --argjson bytes "$image_size" --arg verifiedAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+    {
+        schemaVersion: 1, imageId: $id, image: "image.qcow2", architecture: "x86_64", format: "qcow2",
+        sha256: $sha, sizeBytes: $bytes, upstreamFile: $name, upstreamUrl: $url, keySource: $keySource,
+        signerFingerprint: $signer, imageSigningFingerprint: $imageSigner,
+        checksumSigningFingerprint: $checksumSigner, verifiedAt: $verifiedAt
+    }' >"$scratch/metadata.json"
+
+publication=$(mktemp -d "$base/.publish-$image_id.XXXXXXXX")
+for file in image.qcow2 image.qcow2.sig upstream.SHA256 upstream.SHA256.sig metadata.json; do
+    mv -- "$scratch/$file" "$publication/"
+    chmod 444 -- "$publication/$file"
+done
+chmod 555 -- "$publication"
+mv --no-clobber --no-target-directory -- "$publication" "$published"
+[[ ! -e $publication ]] || fail "base directory already exists: $published"
+printf '%s\n' "$published/image.qcow2"
