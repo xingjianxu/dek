@@ -61,6 +61,14 @@ pub enum ActionResult {
     Failed { message: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionAttempt {
+    /// A new attempt is persisted. The backend may now be called.
+    Started(u32),
+    /// A previous attempt needs observation before the backend can be called again.
+    NeedsVerification(u32),
+}
+
 pub enum ActionReceipt {
     Verified { changed: bool },
     Failed { message: String },
@@ -156,14 +164,14 @@ impl StateGuard<'_> {
         run_id: &str,
         binding: PlanBinding<'_>,
         action_id: &str,
-    ) -> Result<u32, StateError> {
+    ) -> Result<ActionAttempt, StateError> {
         let runs = self.runs_directory()?;
         let mut run = bound_run(&runs, run_id, binding)?;
         let action = action_mut(&runs, &mut run, action_id)?;
         match action.result {
             ActionResult::Unverified => {
                 runs.sync()?;
-                return Ok(action.attempt);
+                return Ok(ActionAttempt::NeedsVerification(action.attempt));
             }
             ActionResult::Verified { .. } => {
                 return Err(StateError::invalid(
@@ -179,7 +187,7 @@ impl StateGuard<'_> {
         action.result = ActionResult::Unverified;
         let attempt = action.attempt;
         replace_run(&runs, &run)?;
-        Ok(attempt)
+        Ok(ActionAttempt::Started(attempt))
     }
 
     pub fn record_action_result(

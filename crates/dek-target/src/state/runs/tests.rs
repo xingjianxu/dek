@@ -190,7 +190,7 @@ fn record_attempt_in_child() {
         guard
             .begin_action(&run, binding(&guest()), "write")
             .unwrap(),
-        1
+        ActionAttempt::Started(1)
     );
     println!("attempt was durably recorded");
     std::io::stdout().flush().unwrap();
@@ -241,6 +241,10 @@ fn interrupted_attempt_stays_unverified_and_receipt_is_idempotent() {
     let observed = guard.load_run(&run.id, scope).unwrap();
     assert_eq!(observed.actions[0].attempt, 1);
     assert_eq!(observed.actions[0].result, ActionResult::Unverified);
+    assert_eq!(
+        guard.begin_action(&run.id, scope, "write").unwrap(),
+        ActionAttempt::NeedsVerification(1)
+    );
     for _ in 0..2 {
         guard
             .record_action_result(
@@ -276,7 +280,7 @@ fn pending_reload_survives_failed_result_and_cache_deletion() {
         let plan = save_review(&guard, &target);
         let run = guard.begin_run(&plan.id, scope, "pending-reload").unwrap();
         guard.queue_notification(&run.id, scope, "reload").unwrap();
-        let write = guard.begin_action(&run.id, scope, "write").unwrap();
+        let write = started(guard.begin_action(&run.id, scope, "write").unwrap());
         guard
             .record_action_result(
                 &run.id,
@@ -286,7 +290,7 @@ fn pending_reload_survives_failed_result_and_cache_deletion() {
                 ActionReceipt::Verified { changed: true },
             )
             .unwrap();
-        let reload = guard.begin_action(&run.id, scope, "reload").unwrap();
+        let reload = started(guard.begin_action(&run.id, scope, "reload").unwrap());
         guard
             .record_action_result(
                 &run.id,
@@ -309,7 +313,7 @@ fn pending_reload_survives_failed_result_and_cache_deletion() {
     assert_eq!(failed.pending_notifications[0].action_id, "reload");
     assert_eq!(failed.pending_notifications[0].depends_on, ["write"]);
     assert!(guard.finish_run(&run.id, scope).is_err());
-    let reload = guard.begin_action(&run.id, scope, "reload").unwrap();
+    let reload = started(guard.begin_action(&run.id, scope, "reload").unwrap());
     guard
         .record_action_result(
             &run.id,
@@ -323,4 +327,11 @@ fn pending_reload_survives_failed_result_and_cache_deletion() {
     let recovered = guard.load_run(&run.id, scope).unwrap();
     assert!(recovered.finished);
     assert!(recovered.pending_notifications.is_empty());
+}
+
+fn started(attempt: ActionAttempt) -> u32 {
+    let ActionAttempt::Started(number) = attempt else {
+        panic!("unexpected unresolved attempt {attempt:?}");
+    };
+    number
 }

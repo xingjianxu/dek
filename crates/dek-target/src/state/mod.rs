@@ -3,7 +3,7 @@
 mod fs;
 mod runs;
 
-pub use runs::{ActionReceipt, ActionResult, RunAction, RunNotification, RunRecord};
+pub use runs::{ActionAttempt, ActionReceipt, ActionResult, RunAction, RunNotification, RunRecord};
 
 use std::{
     cell::Cell,
