@@ -375,7 +375,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             }
 
             let backend = self.backend(action)?;
-            let attempt = match &item.result {
+            match &item.result {
                 ActionResult::Pending => {
                     let no_trigger = matches!(action.kind, ActionKind::NotifyService { .. })
                         && !live.contains(action.id.as_str())
@@ -392,17 +392,15 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                         self.record(run, binding, action, attempt, &Ok(false))?;
                         continue;
                     }
-                    self.begin(run, binding, action)?
                 }
                 ActionResult::Failed { .. } | ActionResult::Unverified => {
-                    let Some(attempt) = self.recover_attempt(run, binding, item, backend)? else {
+                    if !self.recover_attempt(run, binding, item, backend)? {
                         triggered.insert(action.id.as_str());
                         continue;
-                    };
-                    attempt
+                    }
                 }
                 ActionResult::Verified { .. } => unreachable!("verified actions were handled"),
-            };
+            }
             let readiness = backend
                 .inspect_action(action)
                 .map_err(|error| ExecutionError::action(action, error.0));
@@ -417,6 +415,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             } else {
                 readiness
             };
+            let attempt = self.begin(run, binding, action)?;
             let outcome = self.dispatch(run, binding, reviewed, action, backend, readiness);
             self.record(run, binding, action, attempt, &outcome.as_ref().copied())?;
             if outcome? {
@@ -432,7 +431,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         binding: PlanBinding<'_>,
         item: &RunAction,
         backend: &dyn Backend,
-    ) -> Result<Option<u32>, ExecutionError> {
+    ) -> Result<bool, ExecutionError> {
         let action = &item.action;
         let unverified = item.result == ActionResult::Unverified;
         let prior = if unverified {
@@ -453,7 +452,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                     self.begin(run, binding, action)?
                 };
                 self.record(run, binding, action, attempt, &Ok(false))?;
-                Ok(None)
+                Ok(false)
             }
             RecoveryReadiness::Retry => {
                 if unverified {
@@ -467,7 +466,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                         },
                     )?;
                 }
-                Ok(Some(self.begin(run, binding, action)?))
+                Ok(true)
             }
             RecoveryReadiness::Conflict(reason) | RecoveryReadiness::Indeterminate(reason) => {
                 self.store.lock()?.record_recovery_diagnostic(

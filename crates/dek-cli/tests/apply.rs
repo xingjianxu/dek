@@ -151,6 +151,9 @@ impl Backend for Probe {
             return Ok(ActionReadiness::Ready);
         }
         let (path, content) = write_action(&action.kind);
+        if self.mode == "interrupt-during-inspection" {
+            std::process::exit(76);
+        }
         if self.mode == "observe-first" && Path::new(path).ends_with("first") {
             self.events.borrow_mut().push(format!("observe {path}"));
         }
@@ -962,4 +965,22 @@ fn later_plan_surfaces_the_original_queued_notice_and_recovery_completes_it() {
         status_for(&fixture, Some(id))["pending_notifications"],
         json!([])
     );
+}
+
+#[test]
+fn interruption_during_read_only_inspection_leaves_the_action_pending() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan();
+    let (child, _) = fixture.launch("interrupt-during-inspection", &["apply", "--plan", &plan]);
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(76));
+    let pending = status_for(&fixture, None);
+    assert_eq!(pending["actions"][0]["result"], "pending");
+    assert_eq!(pending["actions"][0]["attempt"], 0);
+    assert!(!Path::new(&fixture.target("first")).exists());
+
+    let resumed = fixture.run("", &["apply"]);
+    assert!(resumed["error"].is_null(), "{resumed}");
+    assert_eq!(run_id(&resumed), pending["run_id"].as_str().unwrap());
+    assert_eq!(events(&resumed).len(), 4);
+    assert_eq!(status_for(&fixture, None)["actions"][0]["attempt"], 1);
 }
