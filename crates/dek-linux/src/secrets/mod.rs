@@ -1,6 +1,5 @@
 //! Plan age resources from ciphertext metadata and target-local verification markers.
 
-mod accounts;
 mod marker;
 mod path;
 
@@ -15,6 +14,7 @@ use dek_core::{
 };
 use dek_target::backend::{Backend, BackendError, PlannedAction};
 
+use crate::accounts;
 use path::CheckedPath;
 
 pub use marker::verification_marker;

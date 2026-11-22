@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use dek_core::{
     Action, ActionKind, ContentDigest, DesiredResource, Precondition, ResourceCapability,
-    ResourceId, ResourceKind, ServiceNotification, TargetCapabilities, TargetIdentity,
+    ResourceId, ResourceKind, ResourceSet, ServiceNotification, TargetCapabilities, TargetIdentity,
 };
 use thiserror::Error;
 
@@ -73,6 +73,15 @@ pub trait Backend {
         _managed: &[ResourceId],
     ) -> Result<(), BackendError> {
         Ok(())
+    }
+
+    /// Validate related declarations and report prerequisites inferred on this target.
+    fn resource_dependencies(
+        &self,
+        _resource: &DesiredResource,
+        _managed: &ResourceSet,
+    ) -> Result<Vec<ResourceId>, BackendError> {
+        Ok(Vec::new())
     }
 
     /// Observe actual state in the same typed form used for reviewed preconditions.

@@ -145,10 +145,13 @@ fn run_command<'target>(
         dek_linux::secrets::SecretBackend::new(root)
     };
     #[cfg(target_os = "linux")]
+    let accounts = dek_linux::accounts::AccountBackend::default();
+    #[cfg(target_os = "linux")]
     let local_target = || {
         let mut registry = local_target()?;
         if _production {
             registry.register(&secrets)?;
+            registry.register(&accounts)?;
         }
         Ok::<_, Box<dyn Error>>(registry)
     };
