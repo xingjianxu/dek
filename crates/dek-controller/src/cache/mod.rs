@@ -1,5 +1,7 @@
 //! 管理机按工作副本和求值单元保存的可重建缓存。
 
+#[cfg(feature = "benchmark-cache")]
+mod benchmark;
 mod digest;
 mod http;
 
@@ -18,6 +20,8 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
+#[cfg(feature = "benchmark-cache")]
+pub use benchmark::compare_cache_records;
 pub use digest::{CacheDigest, canonical_set, semantic_digest};
 pub use http::{CachedHttpInputs, RefreshHttpInputs, RefreshStats};
 
@@ -110,6 +114,13 @@ pub enum CacheError {
         #[source]
         source: rmp_serde::encode::Error,
     },
+    #[cfg(feature = "benchmark-cache")]
+    #[error("无法编码基准 JSON 缓存 {path}: {source}")]
+    EncodeBenchmark {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("无法复核求值缓存的依赖 {path}: {source}")]
     Recheck {
         path: PathBuf,
@@ -134,6 +145,8 @@ impl CacheError {
 pub struct CacheStore {
     repository: PathBuf,
     units: PathBuf,
+    #[cfg(feature = "benchmark-cache")]
+    benchmark_json: bool,
 }
 
 impl CacheStore {
@@ -162,6 +175,9 @@ impl CacheStore {
         Ok(Self {
             repository: repo,
             units: cache_home.join("dek").join(repo_id).join("units"),
+            #[cfg(feature = "benchmark-cache")]
+            benchmark_json: env::var_os("DEK_BENCH_CACHE_ENCODING")
+                .is_some_and(|value| value == "json"),
         })
     }
 
@@ -178,7 +194,16 @@ impl CacheStore {
     pub fn record_path(&self, key: &UnitKey) -> PathBuf {
         let key = serde_json::to_value(key).expect("unit keys contain JSON values");
         let digest = semantic_digest(&key).to_string();
-        self.units.join(&digest[..2]).join(format!("{digest}.mpk"))
+        let extension = "mpk";
+        #[cfg(feature = "benchmark-cache")]
+        let extension = if self.benchmark_json {
+            "json"
+        } else {
+            extension
+        };
+        self.units
+            .join(&digest[..2])
+            .join(format!("{digest}.{extension}"))
     }
 
     /// Read a single record and capture its revision before evaluation.
@@ -192,7 +217,13 @@ impl CacheStore {
         let revision = data.as_deref().map(CacheDigest::of_bytes);
         let entry = data
             .as_deref()
-            .and_then(decode_record::<T>)
+            .and_then(|data| {
+                #[cfg(feature = "benchmark-cache")]
+                if self.benchmark_json {
+                    return serde_json::from_slice(data).ok();
+                }
+                decode_messagepack::<OwnedRecord<T>>(data)
+            })
             .filter(|record| {
                 record.format_version == FORMAT_VERSION
                     && record.key == *key
@@ -240,10 +271,7 @@ impl CacheStore {
             evaluator_signature: &lookup.evaluator_signature,
             entry,
         };
-        let data = rmp_serde::to_vec(&record).map_err(|source| CacheError::Encode {
-            path: path.clone(),
-            source,
-        })?;
+        let data = self.encode_for_publication(path, &record)?;
 
         let parent = path.parent().expect("unit record path has a parent");
         fs::create_dir_all(parent)
@@ -274,6 +302,24 @@ impl CacheStore {
             .map_err(|err| CacheError::io("缓存已替换但无法同步目录", parent, err))?;
         Ok((Publication::Published, Some(CacheDigest::of_bytes(&data))))
     }
+
+    fn encode_for_publication(
+        &self,
+        path: &Path,
+        record: &impl Serialize,
+    ) -> Result<Vec<u8>, CacheError> {
+        #[cfg(feature = "benchmark-cache")]
+        if self.benchmark_json {
+            return serde_json::to_vec(record).map_err(|source| CacheError::EncodeBenchmark {
+                path: path.to_owned(),
+                source,
+            });
+        }
+        rmp_serde::to_vec(record).map_err(|source| CacheError::Encode {
+            path: path.to_owned(),
+            source,
+        })
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -286,7 +332,7 @@ struct WireRecord<K, S, E> {
 
 type OwnedRecord<T> = WireRecord<UnitKey, String, CacheEntry<T>>;
 
-fn decode_record<T: DeserializeOwned>(data: &[u8]) -> Option<OwnedRecord<T>> {
+fn decode_messagepack<T: DeserializeOwned>(data: &[u8]) -> Option<T> {
     let mut reader = Cursor::new(data);
     let record = rmp_serde::from_read(&mut reader).ok()?;
     (reader.position() == data.len() as u64).then_some(record)

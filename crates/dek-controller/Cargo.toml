@@ -3,6 +3,9 @@ name = "dek-controller"
 version.workspace = true
 edition.workspace = true
 
+[features]
+benchmark-cache = []
+
 [dependencies]
 dek-core.workspace = true
 rmp-serde = "1"
@@ -14,3 +17,8 @@ sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[[bin]]
+name = "dek-cache-benchmark"
+path = "src/bin/cache_benchmark.rs"
+required-features = ["benchmark-cache"]
