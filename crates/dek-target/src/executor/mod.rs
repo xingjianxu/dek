@@ -20,6 +20,7 @@ use crate::{
         ActionAttempt, ActionReceipt, ActionResult, PlanBinding, ReviewedPlan, RunAction,
         RunRecord, StateError, StateGuard, StateStore,
     },
+    terminal::{TERMINAL_REQUIRED, TerminalRunner},
 };
 
 use scope::{Scope, match_scope, validate_order};
@@ -120,11 +121,21 @@ enum Application<'a> {
 pub struct Executor<'a, 'backend> {
     store: &'a StateStore,
     registry: &'a BackendRegistry<'backend>,
+    terminal: Option<&'a TerminalRunner<'a>>,
 }
 
 impl<'a, 'backend> Executor<'a, 'backend> {
     pub fn new(store: &'a StateStore, registry: &'a BackendRegistry<'backend>) -> Self {
-        Self { store, registry }
+        Self {
+            store,
+            registry,
+            terminal: None,
+        }
+    }
+
+    pub(crate) fn with_terminal(mut self, terminal: &'a TerminalRunner<'a>) -> Self {
+        self.terminal = Some(terminal);
+        self
     }
 
     pub fn apply(
@@ -470,6 +481,12 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             } else {
                 readiness
             };
+            if self.terminal.is_none()
+                && matches!(readiness, Ok(ActionReadiness::Ready))
+                && backend.requires_terminal(action)
+            {
+                return Err(ExecutionError::action(action, TERMINAL_REQUIRED));
+            }
             let attempt = self.begin(run, binding, action)?;
             let outcome = self.dispatch(run, binding, reviewed, action, backend, readiness);
             self.record(run, binding, action, attempt, &outcome.as_ref().copied())?;
@@ -579,7 +596,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             Self::queue_dependent_notifications(store, run, binding, action, content_changed)
                 .map_err(|error| BackendError(error.to_string()))
         };
-        let context = ActionContext::new(action, &reviewed.contents);
+        let context = ActionContext::new(action, &reviewed.contents).with_terminal(self.terminal);
         let context = if runtime_content_check(&action.kind) {
             context.with_content_change(&queue)
         } else {

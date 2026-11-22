@@ -3,6 +3,7 @@
 use std::{
     cell::RefCell,
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -17,8 +18,8 @@ use dek_core::{
     Action, ActionKind, DesiredResource, Precondition, ResourceCapability, ResourceKind,
 };
 use dek_target::backend::{
-    ActionContext, ActionReadiness, Backend, BackendError, BackendRegistry, PlannedAction,
-    PlannedNotification,
+    ActionContext, ActionReadiness, Backend, BackendError, BackendRegistry, NotificationError,
+    PlannedAction, PlannedNotification,
 };
 use serde_json::{Value, json};
 use tempfile::{NamedTempFile, TempDir};
@@ -39,6 +40,22 @@ struct Probe {
 }
 
 impl Probe {
+    fn remote_trace(&self, event: std::fmt::Arguments<'_>) -> Result<(), BackendError> {
+        if self.mode == "remote-probe" {
+            let mut log = fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(self.root.join("events"))
+                .map_err(|error| BackendError(error.to_string()))?;
+            writeln!(log, "{event}").map_err(|error| BackendError(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn package_present(&self, name: &str) -> bool {
+        self.mode == "remote-probe" && self.root.join(format!("package-{name}")).is_file()
+    }
+
     fn registry(&self) -> BackendRegistry<'_> {
         // Reuse the production planner's target identity. Only execution is injected.
         let mut identity = local_registry(&LocalFileBackend).unwrap().target().clone();
@@ -57,14 +74,14 @@ impl Backend for Probe {
             return Vec::new();
         }
         let mut capabilities = LocalFileBackend.capabilities();
-        if self.mode.starts_with("notice-") {
+        if self.mode.starts_with("notice-") || self.mode == "remote-probe" {
             capabilities.push(ResourceCapability {
                 kind: ResourceKind::SystemdUnit,
                 version: 1,
                 attributes: ["reload".to_owned()].into(),
             });
         }
-        if self.mode == "package-probe" {
+        if matches!(self.mode.as_str(), "package-probe" | "remote-probe") {
             capabilities.push(ResourceCapability {
                 kind: ResourceKind::Package,
                 version: 1,
@@ -82,7 +99,9 @@ impl Backend for Probe {
     }
 
     fn validate(&self, resource: &DesiredResource) -> Result<(), BackendError> {
-        if self.mode == "package-probe" && matches!(resource, DesiredResource::Package(_)) {
+        if matches!(self.mode.as_str(), "package-probe" | "remote-probe")
+            && matches!(resource, DesiredResource::Package(_))
+        {
             return Ok(());
         }
         LocalFileBackend.validate(resource)
@@ -92,7 +111,9 @@ impl Backend for Probe {
         if let DesiredResource::Package(package) = resource {
             return Ok(vec![Precondition::PackageVersion {
                 package: package.package.clone(),
-                expected: None,
+                expected: self
+                    .package_present(&package.package.name)
+                    .then(|| "1.0".into()),
             }]);
         }
         LocalFileBackend.observe(resource)
@@ -104,6 +125,9 @@ impl Backend for Probe {
         observed: &[Precondition],
     ) -> Result<Vec<PlannedAction>, BackendError> {
         if let DesiredResource::Package(package) = resource {
+            if self.package_present(&package.package.name) {
+                return Ok(Vec::new());
+            }
             return Ok(vec![PlannedAction {
                 kind: ActionKind::InstallPackage {
                     package: package.package.clone(),
@@ -151,7 +175,11 @@ impl Backend for Probe {
             self.events
                 .borrow_mut()
                 .push(format!("observe {}", package.name));
-            return Ok(ActionReadiness::Ready);
+            return Ok(if self.package_present(&package.name) {
+                ActionReadiness::Satisfied
+            } else {
+                ActionReadiness::Ready
+            });
         }
         let (path, content) = write_action(&action.kind);
         if self.mode == "interrupt-during-inspection" {
@@ -176,15 +204,43 @@ impl Backend for Probe {
         }
     }
 
+    fn requires_terminal(&self, action: &Action) -> bool {
+        self.mode == "remote-probe"
+            && matches!(
+                &action.kind,
+                ActionKind::InstallPackage { package, .. } if package.name == "terminal-probe"
+            )
+    }
+
     fn execute(&self, context: &ActionContext<'_>) -> Result<(), BackendError> {
         if let ActionKind::NotifyService { unit, .. } = &context.action.kind {
             self.events
                 .borrow_mut()
                 .push(format!("notify {}", unit.name));
+            self.remote_trace(format_args!("notify {}", unit.name))?;
+            if self.mode == "remote-probe" && self.root.join("fail-notice").exists() {
+                fs::remove_file(self.root.join("fail-notice"))
+                    .map_err(|error| BackendError(error.to_string()))?;
+                return Err(BackendError("远端测试服务首次失败".into()));
+            }
             if self.mode == "notice-loses-receipt" {
                 return Err(BackendError("probe lost notification receipt".into()));
             }
             return Ok(());
+        }
+        if let ActionKind::InstallPackage { package, .. } = &context.action.kind
+            && self.mode == "remote-probe"
+        {
+            if package.name == "terminal-probe" {
+                let command = dek_target::terminal::TerminalCommand::new(
+                    self.root.join("terminal-helper").into_os_string(),
+                    std::iter::empty::<String>(),
+                );
+                context.run_interactive(&command)?;
+            }
+            self.remote_trace(format_args!("install {}", package.name))?;
+            return fs::write(self.root.join(format!("package-{}", package.name)), "1.0")
+                .map_err(|error| BackendError(error.to_string()));
         }
         let (path, content) = write_action(&context.action.kind);
         assert_eq!(Path::new(path).parent(), Some(self.root.as_path()));
@@ -196,6 +252,10 @@ impl Backend for Probe {
             .open(&active)
             .map_err(|error| BackendError(format!("overlapping execution: {error}")))?;
         let _active = Active(active);
+        self.remote_trace(format_args!("begin {path}"))?;
+        if self.mode == "remote-probe" && path.contains("/slow-") {
+            thread::sleep(Duration::from_millis(800));
+        }
         if self.mode == "hold" {
             wait_for(&self.root.join("release"));
         }
@@ -207,13 +267,25 @@ impl Backend for Probe {
             std::process::exit(75);
         }
         self.events.borrow_mut().push(format!("write {path}"));
+        self.remote_trace(format_args!("write {path}"))?;
         fs::write(path, context.content(&content.digest)?)
             .map_err(|error| BackendError(error.to_string()))?;
         if self.mode == "interrupt-after-write" || self.root.join("interrupt").exists() {
             drop(_active);
             std::process::exit(75);
         }
+        self.remote_trace(format_args!("end {path}"))?;
         Ok(())
+    }
+
+    fn execute_notification(&self, context: &ActionContext<'_>) -> Result<(), NotificationError> {
+        self.execute(context).map_err(|error| {
+            if self.mode == "remote-probe" {
+                NotificationError::JobFailed(error)
+            } else {
+                NotificationError::Unverified(error)
+            }
+        })
     }
 
     fn verify(&self, action: &ActionKind) -> Result<bool, BackendError> {
@@ -223,8 +295,12 @@ impl Backend for Probe {
                 .push(format!("verify {}", unit.name));
             return Ok(true);
         }
+        if let ActionKind::InstallPackage { package, .. } = action {
+            return Ok(self.package_present(&package.name));
+        }
         let (path, content) = write_action(action);
         self.events.borrow_mut().push(format!("verify {path}"));
+        self.remote_trace(format_args!("verify {path}"))?;
         if self.mode == "fail-verify" {
             return Ok(false);
         }
@@ -389,6 +465,24 @@ fn events(report: &Value) -> Vec<&str> {
         .iter()
         .map(|value| value.as_str().unwrap())
         .collect()
+}
+
+#[test]
+fn serve_remote_probe() {
+    let Some(root) = env::var_os("DEK_TEST_SSH_PROBE_ROOT") else {
+        return;
+    };
+    let probe = Probe {
+        root: root.into(),
+        mode: "remote-probe".into(),
+        events: RefCell::new(Vec::new()),
+    };
+    // The SSH wrapper directs the test harness's own stdout to stderr.
+    let output = fs::OpenOptions::new()
+        .write(true)
+        .open("/proc/self/fd/3")
+        .unwrap();
+    command::run(["dek", "__target-stdio"], output, || Ok(probe.registry())).unwrap();
 }
 
 #[test]

@@ -5,9 +5,9 @@ mod remote_plan;
 mod retention;
 mod runs;
 
-pub use dek_core::{ActionResult, PendingRunNotification, RunNotification};
+pub use dek_core::{ActionResult, PendingRunNotification, RunAction, RunNotification};
 pub use remote_plan::PlanSession;
-pub use runs::{ActionAttempt, ActionReceipt, RunAction, RunRecord};
+pub use runs::{ActionAttempt, ActionReceipt, RunRecord};
 
 use std::{
     cell::Cell,

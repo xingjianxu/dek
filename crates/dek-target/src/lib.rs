@@ -7,4 +7,6 @@ pub mod inputs;
 pub mod planner;
 #[cfg(target_os = "linux")]
 pub mod state;
+#[cfg(target_os = "linux")]
+pub mod terminal;
 pub mod transport;

@@ -4,8 +4,8 @@ use std::{
 };
 
 use dek_core::{
-    Action, ActionKind, ActionResult, PendingRunNotification, RunNotification, ServiceEffect,
-    TargetIdentity,
+    ActionKind, ActionResult, PendingRunNotification, RunAction, RunNotification, RunStatus,
+    ServiceEffect, TargetIdentity,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,6 +32,20 @@ pub struct RunRecord {
 }
 
 impl RunRecord {
+    pub fn into_status(self) -> RunStatus {
+        RunStatus {
+            id: self.id,
+            plan_id: self.plan_id,
+            logical_host: self.logical_host,
+            target: self.target,
+            request_id: self.request_id,
+            created_at: self.created_at,
+            actions: self.actions,
+            pending_notifications: self.pending_notifications,
+            finished: self.finished,
+        }
+    }
+
     fn binding(&self) -> PlanBinding<'_> {
         PlanBinding {
             repository_id: &self.repository_id,
@@ -45,18 +59,6 @@ impl RunRecord {
             && self.logical_host == binding.logical_host
             && self.target == *binding.target
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RunAction {
-    pub action: Action,
-    pub attempt: u32,
-    pub result: ActionResult,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_notification_effect: Option<ServiceEffect>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recovery_diagnostic: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

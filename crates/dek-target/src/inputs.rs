@@ -6,7 +6,10 @@ use std::{
     path::Path,
 };
 
-use dek_core::{Observation, protocol::TargetQueryKind, target_protocol::MAX_FRAME_BYTES};
+use dek_core::{
+    InputKind, InputObservation, Observation, protocol::TargetQueryKind,
+    target_protocol::MAX_FRAME_BYTES,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -157,4 +160,20 @@ fn ensure_regular(metadata: &Metadata) -> io::Result<()> {
             "expected a regular file",
         ))
     }
+}
+
+/// Reobserve a saved plan's target input under the executing account.
+pub fn reobserve(
+    registry: &BackendRegistry<'_>,
+    input: &InputObservation,
+) -> Result<Observation, String> {
+    let kind = match input.kind {
+        InputKind::TargetFact => TargetQueryKind::Fact,
+        InputKind::TargetCapability => TargetQueryKind::Capability,
+        InputKind::TargetFile => TargetQueryKind::ReadText,
+        _ => return Err("已审阅计划包含非目标端输入".into()),
+    };
+    observe(registry, kind, &input.id)
+        .map(|(_, observation)| observation)
+        .map_err(|error| error.to_string())
 }

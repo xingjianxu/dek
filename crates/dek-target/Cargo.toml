@@ -11,7 +11,7 @@ thiserror = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rmp-serde = "1"
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "net", "process"] }
 serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]

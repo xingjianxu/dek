@@ -371,7 +371,7 @@ dek hosts
 | `dek refresh -H server` | 更新主机配置显式引用的外部输入（如通过 SDK 拉取的 HTTP 内容），供下一次规划使用。 |
 | `dek status -H server [--run <执行ID>]` | 查看最近一次或指定 ID 的执行结果，包括已完成、失败及待重试项；SSH 重连后仍可查询。 |
 
-本机 `apply --plan` 可带 `--request-id <标识>`。同一标识重发使用原执行，且绑定原计划。目标记录无法确认曾尝试的包事务或服务动作时，`status` 保留结果待核验及诊断。`plan` 也显示目标记录中的待续办通知和其原执行 ID。
+`apply --plan` 可带 `--request-id <标识>`。同一标识重发使用原执行，且绑定原计划。SSH 目标的 `apply --interactive` 允许受审阅动作使用独立终端完成 helper 交互。目标记录无法确认曾尝试的包事务或服务动作时，`status` 保留结果待核验及诊断。`plan` 也显示目标记录中的待续办通知和其原执行 ID。
 
 主机参数的完整写法为 `--host server`。首版中 `hosts`、`show`、`plan` 和 `status` 均支持 `--json` 输出，便于脚本集成（例如将升级预览输出的 `plan_id` 直接传给 `apply --plan`）。`apply` 与 `upgrade` 开始执行时会输出 `run_id` 供后续追踪。所有子命令均支持 `--help`。
 

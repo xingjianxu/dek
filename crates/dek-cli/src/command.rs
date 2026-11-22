@@ -88,7 +88,14 @@ enum Command {
         #[arg(long, value_name = "目录")]
         state_dir: Option<PathBuf>,
     },
-    /// 执行当次规划或指定的本机已审阅计划。
+    #[cfg(target_os = "linux")]
+    #[command(name = "__target-terminal", hide = true)]
+    TargetTerminal {
+        token: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// 执行当次规划或指定的已审阅计划。
     #[cfg(target_os = "linux")]
     Apply {
         /// 已审阅的计划 ID。
@@ -100,11 +107,14 @@ enum Command {
         /// 同一计划可重发的请求标识。
         #[arg(long, value_name = "标识", requires = "plan")]
         request_id: Option<String>,
+        /// 允许目标动作按需开启独立 SSH 终端。
+        #[arg(long)]
+        interactive: bool,
         /// 使用指定的私有目标状态目录。默认 /var/lib/dek。
         #[arg(long, value_name = "目录")]
         state_dir: Option<PathBuf>,
     },
-    /// 查看最近或指定的本机执行记录。
+    /// 查看最近或指定的执行记录。
     #[cfg(target_os = "linux")]
     Status {
         /// 指定执行 ID。默认显示最近执行。
@@ -141,7 +151,7 @@ enum Language {
 /// Parse a dek invocation and run it with the local target registry supplied by the caller.
 pub fn run<'target>(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
-    out: impl Write,
+    out: impl Write + Send,
     local_target: impl FnOnce() -> Result<BackendRegistry<'target>, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     run_command(args, out, local_target, false)
@@ -150,7 +160,7 @@ pub fn run<'target>(
 /// Run with the installed binary's local resource backends.
 pub fn run_local(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
-    out: impl Write,
+    out: impl Write + Send,
 ) -> Result<(), Box<dyn Error>> {
     use crate::local_target::local_registry;
     #[cfg(target_os = "linux")]
@@ -162,7 +172,7 @@ pub fn run_local(
 
 fn run_command<'target>(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
-    mut out: impl Write,
+    mut out: impl Write + Send,
     local_target: impl FnOnce() -> Result<BackendRegistry<'target>, Box<dyn Error>>,
     _production: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -321,44 +331,77 @@ fn run_command<'target>(
             {
                 use dek_target::{
                     state::{DEFAULT_ROOT, PlanSession},
-                    transport::{dispatch, serve_with},
+                    transport::{dispatch, dispatch_execution, serve_events},
                 };
 
                 let root = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
                 let mut planning = PlanSession::new(&root);
-                serve_with(&registry, &mut io::stdin().lock(), &mut out, |operation| {
-                    planning
-                        .dispatch(&registry, operation)
-                        .unwrap_or_else(|operation| dispatch(&registry, operation))
-                })?;
+                serve_events(
+                    &registry,
+                    &mut io::stdin().lock(),
+                    &mut out,
+                    |operation, event| {
+                        planning
+                            .dispatch(&registry, operation)
+                            .or_else(|operation| {
+                                dispatch_execution(&registry, &root, operation, event)
+                            })
+                            .unwrap_or_else(|operation| dispatch(&registry, operation))
+                    },
+                )?;
             }
             #[cfg(not(target_os = "linux"))]
             dek_target::transport::serve(&registry, &mut io::stdin().lock(), &mut out)?;
+        }
+        #[cfg(target_os = "linux")]
+        Command::TargetTerminal { token, state_dir } => {
+            if cli.repo.is_some() || cli.host.is_some() {
+                return Err("目标端入口无需 --repo 或 --host".into());
+            }
+            let root = state_dir.unwrap_or_else(|| PathBuf::from(dek_target::state::DEFAULT_ROOT));
+            dek_target::terminal::attach(&root, &token)?;
         }
         #[cfg(target_os = "linux")]
         Command::Apply {
             plan,
             run,
             request_id,
+            interactive,
             state_dir,
         } => {
             use dek_target::state::DEFAULT_ROOT;
 
             let repo = discover_repo(cli.repo.as_deref())?;
             let selection = HostSelection::from_arg(cli.host)?;
+            let selector = selection.selector();
+            let (name, host) = repo.select_host(selector)?;
+            let selection = crate::applying::ApplySelection {
+                plan: plan.as_deref(),
+                run: run.as_deref(),
+                request_id: request_id.as_deref(),
+            };
+            if let Target::Ssh(alias) = &host.target {
+                if state_dir.is_some() {
+                    return Err("远程 apply 的状态目录由目标端配置，请省略 --state-dir".into());
+                }
+                let target_id = host.target_id.as_deref().unwrap_or(name);
+                return crate::remote_execution::apply_remote(
+                    &mut out,
+                    &repo,
+                    name,
+                    alias,
+                    target_id,
+                    selection,
+                    interactive,
+                );
+            }
+            if interactive {
+                return Err("--interactive 用于 SSH 目标".into());
+            }
             let registry = local_target()?;
             let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
             crate::applying::apply_local(
-                &mut out,
-                &repo,
-                selection.selector(),
-                &registry,
-                &state_dir,
-                crate::applying::ApplySelection {
-                    plan: plan.as_deref(),
-                    run: run.as_deref(),
-                    request_id: request_id.as_deref(),
-                },
+                &mut out, &repo, selector, &registry, &state_dir, selection,
             )?;
         }
         #[cfg(target_os = "linux")]
@@ -371,6 +414,22 @@ fn run_command<'target>(
 
             let repo = discover_repo(cli.repo.as_deref())?;
             let selection = HostSelection::from_arg(cli.host)?;
+            let (name, host) = repo.select_host(selection.selector())?;
+            if let Target::Ssh(alias) = &host.target {
+                if state_dir.is_some() {
+                    return Err("远程 status 的状态目录由目标端配置，请省略 --state-dir".into());
+                }
+                let target_id = host.target_id.as_deref().unwrap_or(name);
+                return crate::remote_execution::status_remote(
+                    &mut out,
+                    &repo,
+                    name,
+                    alias,
+                    target_id,
+                    run.as_deref(),
+                    json,
+                );
+            }
             let registry = local_target()?;
             let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
             crate::status::show_status(

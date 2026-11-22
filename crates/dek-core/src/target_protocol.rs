@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::{
     ContentDigest, InputObservation, Observation, PendingRunNotification, Plan, PlanMode,
-    ResourceSet, TargetCapabilities, protocol::TargetQueryKind,
+    ResourceSet, RunStatus, TargetCapabilities, protocol::TargetQueryKind,
 };
 
 pub const TARGET_PROTOCOL_VERSION: u32 = 1;
@@ -29,6 +29,7 @@ pub enum ServerFrame {
     Hello { capabilities: TargetCapabilities },
     Incompatible { versions: Vec<u32> },
     Response { id: u64, result: TargetResult },
+    Event { id: u64, event: TargetEvent },
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -51,6 +52,24 @@ pub enum TargetRequest {
         complete: bool,
     },
     FinishPlan,
+    ApplyPlan {
+        host: ExecutionHost,
+        #[serde(rename = "planId")]
+        plan_id: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        interactive: bool,
+    },
+    ResumeRun {
+        host: ExecutionHost,
+        #[serde(rename = "runId")]
+        run_id: String,
+        interactive: bool,
+    },
+    RunStatus {
+        host: ExecutionHost,
+        query: RunQuery,
+    },
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,6 +88,12 @@ pub enum TargetResult {
     },
     ContentAccepted,
     Planned(Box<RemotePlan>),
+    ExecutionFinished(Box<RunStatus>),
+    ExecutionStatus(Option<Box<RunStatus>>),
+    ReviewRequired {
+        reason: String,
+        replacement: Option<Box<Plan>>,
+    },
     Error {
         message: String,
     },
@@ -94,6 +119,41 @@ fn is_normal_plan(mode: &PlanMode) -> bool {
 pub struct RemotePlan {
     pub plan: Plan,
     pub pending_notifications: Vec<PendingRunNotification>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionHost {
+    pub repository_id: String,
+    pub logical_host: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum RunQuery {
+    Latest,
+    Run(String),
+    Request(String),
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum TargetEvent {
+    RunStarted {
+        #[serde(rename = "runId")]
+        run_id: String,
+    },
+    TerminalRequired {
+        token: String,
+    },
+}
+
+/// Attachment IDs may appear in a fixed SSH command and a Unix socket name.
+pub fn valid_terminal_token(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 mod content_chunk {

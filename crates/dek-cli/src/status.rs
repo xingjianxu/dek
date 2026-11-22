@@ -3,14 +3,14 @@
 use std::{error::Error, io::Write, path::Path};
 
 use dek_controller::repo::{HostSelector, Repository, Target};
-use dek_core::{ActionKind, TargetIdentity};
+use dek_core::{ActionKind, RunStatus, TargetIdentity};
 use dek_target::state::{ActionResult, PlanBinding, StateStore};
 use serde_json::json;
 
 use crate::{plan_output::description, planning::repository_id};
 
 pub(crate) fn show_status(
-    mut out: impl Write,
+    out: impl Write,
     repo: &Repository,
     selector: HostSelector<'_>,
     target: &TargetIdentity,
@@ -37,6 +37,15 @@ pub(crate) fn show_status(
         None => guard.latest_run(binding)?,
     };
     drop(guard);
+    write_status(out, record.map(|run| run.into_status()), None, json_output)
+}
+
+pub(crate) fn write_status(
+    mut out: impl Write,
+    record: Option<RunStatus>,
+    alias: Option<&str>,
+    json_output: bool,
+) -> Result<(), Box<dyn Error>> {
     let Some(run) = record else {
         writeln!(
             out,
@@ -66,7 +75,15 @@ pub(crate) fn show_status(
         return Ok(());
     }
 
-    writeln!(out, "主机 {}（本机 {}）", run.logical_host, run.target.id)?;
+    if let Some(alias) = alias {
+        writeln!(
+            out,
+            "主机 {}（SSH：{alias}，目标 {}）",
+            run.logical_host, run.target.id
+        )?;
+    } else {
+        writeln!(out, "主机 {}（本机 {}）", run.logical_host, run.target.id)?;
+    }
     writeln!(out, "执行 {}", run.id)?;
     writeln!(out, "计划 {}", run.plan_id)?;
     for item in &run.actions {
