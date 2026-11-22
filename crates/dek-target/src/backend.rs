@@ -115,6 +115,11 @@ pub trait Backend {
         Err(BackendError("后端未提供此动作的执行能力".into()))
     }
 
+    /// Validate reviewed inputs that must be checked together before any action runs.
+    fn validate_batch(&self, _: &ResourceSet, _: &[ActionContext<'_>]) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Compare the action goal and reviewed preconditions with live state.
     /// Return Satisfied only for effects that the backend can actually verify.
     fn inspect_action(&self, _: &Action) -> Result<ActionReadiness, BackendError> {

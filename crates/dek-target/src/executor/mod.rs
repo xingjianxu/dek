@@ -2,7 +2,10 @@
 
 mod scope;
 
-use std::{collections::BTreeSet, io};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+};
 
 use dek_core::{Action, ActionKind, InputObservation, Observation, Plan, ResourceKind};
 use thiserror::Error;
@@ -169,6 +172,10 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                 .map_err(|error| ExecutionError::action(action, error.0))?;
         }
 
+        if conflict.is_none() {
+            self.validate_batches(&reviewed, &live)?;
+        }
+
         let run =
             self.store
                 .lock()?
@@ -209,6 +216,31 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         Ok(ExecutionOutcome::Finished(Box::new(
             guard.load_run(&run.id, request.binding)?,
         )))
+    }
+
+    fn validate_batches(
+        &self,
+        reviewed: &ReviewedPlan,
+        live: &BTreeSet<&str>,
+    ) -> Result<(), ExecutionError> {
+        let mut batches = BTreeMap::<ResourceKind, Vec<_>>::new();
+        for action in &reviewed.plan.actions {
+            if !live.contains(action.id.as_str()) {
+                continue;
+            }
+            batches
+                .entry(action_kind(&action.kind))
+                .or_default()
+                .push(ActionContext::new(action, &reviewed.contents));
+        }
+        for contexts in batches.values() {
+            if let Some(first) = contexts.first() {
+                self.backend(first.action)?
+                    .validate_batch(&reviewed.resources, contexts)
+                    .map_err(|err| ExecutionError::action(first.action, err.0))?;
+            }
+        }
+        Ok(())
     }
 
     fn run_actions(
@@ -254,6 +286,17 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                 backend
                     .inspect_action(action)
                     .map_err(|error| ExecutionError::action(action, error.0))
+            };
+            // File writes excluded from the fresh scope did not reach batch validation.
+            let readiness = if matches!(readiness, Ok(ActionReadiness::Ready))
+                && matches!(action.kind, ActionKind::WriteFile { .. })
+                && !live.contains(action.id.as_str())
+            {
+                Ok(ActionReadiness::Conflict(
+                    "目标文件在范围复核后发生变化，请重新规划".into(),
+                ))
+            } else {
+                readiness
             };
             let attempt = self
                 .store
