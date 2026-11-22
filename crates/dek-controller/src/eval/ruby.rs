@@ -24,6 +24,9 @@ const EVALUATOR: &str = concat!(
     include_str!("../../../../sdk/ruby/declarations.rb"),
     "\n",
     include_str!("../../../../sdk/ruby/evaluator.rb"),
+    "\n",
+    include_str!("../../../../sdk/ruby/expansion.rb"),
+    "\nDekEvaluator.start\n",
 );
 
 pub trait TargetProvider {
@@ -41,7 +44,7 @@ pub struct RubyProviders<'a> {
 }
 
 impl RubyProviders<'_> {
-    pub(super) fn reborrow(&mut self) -> RubyProviders<'_> {
+    pub fn reborrow(&mut self) -> RubyProviders<'_> {
         RubyProviders {
             target: &mut *self.target,
             http: self

@@ -16,9 +16,15 @@ pub use expansion::{
     ExpandContext, ExpansionError, ModuleDefinition, ModuleExpansion, ModuleRegistry,
 };
 pub use resources::{
-    DeclaredResource, ExpandedResources, FileSource, ModuleOutput, ResourceDraft,
+    DeclaredResource, ExpandedResources, FileSource, ModuleOutput, RepositoryFile, ResourceDraft,
     assemble_resources,
 };
 
 mod builtin_system;
 pub use builtin_system::{register_system_modules, register_system_schemas};
+
+mod builtin_keys;
+pub use builtin_keys::{register_key_modules, register_key_schemas};
+
+mod repository_modules;
+pub use repository_modules::{RepositoryModuleError, RepositoryModules};

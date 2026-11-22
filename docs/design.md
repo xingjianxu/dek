@@ -316,20 +316,18 @@ directory "/srv/research", owner: "alice", group: "research", mode: "0750"
 ```ruby
 configure "users.users.alice",
   isNormalUser: true,
-  extraGroups: ["research"],
-  openssh: { authorizedKeys: { keyFiles: ["../../keys/alice.pub"] } }
+  extraGroups: ["research"]
+
+configure "users.users.alice.openssh.authorizedKeys",
+  keyFiles: ["../../keys/alice.pub"]
 
 directory "/home/alice/.ssh", owner: "alice", group: "research", mode: "0700"
 
-configure "age",
-  identityPaths: ["/etc/dek/identities/server.agekey"],
-  secrets: {
-    gitDeploy: {
-      file: "../../secrets/gitDeploy.age",
-      path: "/home/alice/.ssh/id_git_deploy",
-      owner: "alice", group: "research", mode: "0600"
-    }
-  }
+configure "age", identityPaths: ["/etc/dek/identities/server.agekey"]
+configure "age.secrets.gitDeploy",
+  file: "../../secrets/gitDeploy.age",
+  path: "/home/alice/.ssh/id_git_deploy",
+  owner: "alice", group: "research", mode: "0600"
 ```
 
 1. **加密入库**：首版采用 age 格式，使用目标机解密私钥对应的收件人公钥离线加密。例如在仓库根目录执行 `age -R keys/server-recipients.txt -o secrets/gitDeploy.age /secure/input/id_git_deploy`。收件人列表可提交入库，明文私钥始终保存在仓库之外。同一份密文可加密给多台主机，每台主机各自持有自己的解密私钥。
