@@ -99,24 +99,17 @@ impl Backend for SecretBackend {
         managed: &[ResourceId],
     ) -> Result<(), BackendError> {
         let secret = age_secret(resource)?;
+        let output = CheckedPath::inspect(&secret.path)?;
+        if let Some(path) = conflicting_path(&output, managed, Some(&secret.path))? {
+            return Err(BackendError(format!(
+                "受管路径 {path:?} 与加密文件落点 {:?} 冲突",
+                secret.path
+            )));
+        }
         for identity_path in &secret.identity_paths {
             let identity = CheckedPath::identity(identity_path)?;
-            for resource in managed {
-                let ResourceId::Path(path) = resource else {
-                    continue;
-                };
-                if Path::new(path) == identity.normalized {
-                    return Err(identity_collision(path, identity_path));
-                }
-                let Some(file) = &identity.file else { continue };
-                match fs::metadata(path) {
-                    Ok(metadata) if file.matches_metadata(&metadata) => {
-                        return Err(identity_collision(path, identity_path));
-                    }
-                    Ok(_) => {}
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(BackendError(format!("检查受管路径 {path:?}：{err}"))),
-                }
+            if let Some(path) = conflicting_path(&identity, managed, None)? {
+                return Err(identity_collision(path, identity_path));
             }
         }
         Ok(())
@@ -202,6 +195,35 @@ impl Backend for SecretBackend {
             }
         ) && attribute_drift(secret, &observed)?.is_empty())
     }
+}
+
+fn conflicting_path<'a>(
+    protected: &CheckedPath,
+    managed: &'a [ResourceId],
+    own_path: Option<&str>,
+) -> Result<Option<&'a str>, BackendError> {
+    for resource in managed {
+        let ResourceId::Path(path) = resource else {
+            continue;
+        };
+        if own_path == Some(path) {
+            // The planner already rejects duplicate declarations of the same path.
+            continue;
+        }
+        if Path::new(path) == protected.normalized {
+            return Ok(Some(path));
+        }
+        let Some(file) = &protected.file else {
+            continue;
+        };
+        match fs::metadata(path) {
+            Ok(metadata) if file.matches_metadata(&metadata) => return Ok(Some(path)),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(BackendError(format!("检查受管路径 {path:?}：{err}"))),
+        }
+    }
+    Ok(None)
 }
 
 fn age_secret(resource: &DesiredResource) -> Result<&AgeSecretResource, BackendError> {

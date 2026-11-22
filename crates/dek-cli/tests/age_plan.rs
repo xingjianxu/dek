@@ -289,6 +289,18 @@ fn plan_protects_identities_from_other_resources_and_allows_a_missing_parent() {
         "{error}"
     );
     assert_no_secret(error.as_bytes());
+
+    fs::remove_file(&alias).unwrap();
+    fs::hard_link(&output, &alias).unwrap();
+    let Err(error) = plan_resources(&registry, "repo", &resources, &[]) else {
+        panic!("ordinary file resources must not expose a managed secret through a hard link");
+    };
+    let error = error.to_string();
+    assert!(
+        error.contains("age.json") && error.contains("加密文件落点"),
+        "{error}"
+    );
+    assert_no_secret(error.as_bytes());
 }
 
 fn resource(output: &Path, identity: &Path) -> AgeSecretResource {
