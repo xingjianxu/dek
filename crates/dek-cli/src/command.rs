@@ -96,10 +96,48 @@ enum Language {
 /// Parse a dek invocation and run it with the local target registry supplied by the caller.
 pub fn run<'target>(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
-    mut out: impl Write,
+    out: impl Write,
     local_target: impl FnOnce() -> Result<BackendRegistry<'target>, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
+    run_command(args, out, local_target, false)
+}
+
+/// Run with the installed binary's local resource backends.
+pub fn run_local(
+    args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+    out: impl Write,
+) -> Result<(), Box<dyn Error>> {
+    use crate::local_target::{LocalFileBackend, local_registry};
+    run_command(args, out, || local_registry(&LocalFileBackend), true)
+}
+
+fn run_command<'target>(
+    args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+    mut out: impl Write,
+    local_target: impl FnOnce() -> Result<BackendRegistry<'target>, Box<dyn Error>>,
+    _production: bool,
+) -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse_from(args);
+    #[cfg(target_os = "linux")]
+    let secrets = {
+        use dek_target::state::DEFAULT_ROOT;
+        let root = match &cli.command {
+            Command::Plan {
+                state_dir: Some(root),
+                ..
+            } => root.clone(),
+            _ => PathBuf::from(DEFAULT_ROOT),
+        };
+        dek_linux::secrets::SecretBackend::new(root)
+    };
+    #[cfg(target_os = "linux")]
+    let local_target = || {
+        let mut registry = local_target()?;
+        if _production {
+            registry.register(&secrets)?;
+        }
+        Ok::<_, Box<dyn Error>>(registry)
+    };
     match cli.command {
         Command::Init { directory, lang } => {
             if cli.host.is_some() {

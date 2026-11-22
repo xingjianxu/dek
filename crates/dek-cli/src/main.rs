@@ -1,14 +1,9 @@
 use std::{env, io, process::ExitCode};
 
-use dek_cli::{
-    command::run,
-    local_target::{LocalFileBackend, local_registry},
-};
+use dek_cli::command::run_local;
 
 fn main() -> ExitCode {
-    match run(env::args_os(), io::stdout().lock(), || {
-        local_registry(&LocalFileBackend)
-    }) {
+    match run_local(env::args_os(), io::stdout().lock()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("dek: {err}");

@@ -78,7 +78,12 @@ fn description(action: &ActionKind) -> String {
             format!("{verb} {}", unit_name(unit))
         }
         ActionKind::UpdateAuthorizedKeys(keys) => format!("更新授权公钥 {}", keys.user),
-        ActionKind::DeployAgeSecret(secret) => format!("部署加密文件 {}", secret.path),
+        ActionKind::DeployAgeSecret(secret) => {
+            format!("部署加密文件 {} ({})", secret.path, secret.ciphertext.0)
+        }
+        ActionKind::SetAgeSecretAttributes(secret) => {
+            format!("调整加密文件属性 {} ({})", secret.path, secret.ciphertext.0)
+        }
     }
 }
 
