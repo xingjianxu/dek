@@ -1,0 +1,5 @@
+{"options":[
+  {"path":"lab.platform.enable","type":"boolean","description":"Enable the platform fixture"},
+  {"path":"lab.platform.path","type":"string","description":"Destination on the selected target"},
+  {"path":"lab.platform.alias","type":"string","description":"Alternative spelling of the destination"}
+]}
