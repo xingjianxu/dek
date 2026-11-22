@@ -39,6 +39,7 @@ pub enum ActionReadiness {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PriorAttempt {
     Failed,
+    NotificationJobFailed,
     Unverified,
 }
 
@@ -49,6 +50,15 @@ pub enum RecoveryReadiness {
     Retry,
     Conflict(String),
     Indeterminate(String),
+}
+
+/// Disposition of a service job reported by its manager.
+#[derive(Debug, Error)]
+pub enum NotificationError {
+    #[error(transparent)]
+    JobFailed(BackendError),
+    #[error(transparent)]
+    Unverified(BackendError),
 }
 
 /// A reviewed action and the verified content available to its backend.
@@ -152,15 +162,15 @@ pub trait Backend {
     fn inspect_recovery(
         &self,
         action: &Action,
-        _prior: PriorAttempt,
+        prior: PriorAttempt,
     ) -> Result<RecoveryReadiness, BackendError> {
-        let ambiguous = matches!(
-            action.kind,
+        let ambiguous = match action.kind {
             ActionKind::InstallPackage { .. }
-                | ActionKind::RemovePackage { .. }
-                | ActionKind::ReloadManager(_)
-                | ActionKind::NotifyService { .. }
-        );
+            | ActionKind::RemovePackage { .. }
+            | ActionKind::ReloadManager(_) => true,
+            ActionKind::NotifyService { .. } => prior != PriorAttempt::NotificationJobFailed,
+            _ => false,
+        };
         Ok(match self.inspect_action(action)? {
             ActionReadiness::Conflict(reason) => RecoveryReadiness::Conflict(reason),
             _ if ambiguous => RecoveryReadiness::Indeterminate(
@@ -174,6 +184,11 @@ pub trait Backend {
     /// Apply the reviewed action. Backends check the supplied preconditions at
     /// their mutation boundary and use only the reviewed bytes from context.
     fn execute(&self, context: &ActionContext<'_>) -> Result<(), BackendError>;
+
+    /// Return a retryable failure only with a definitive service job receipt.
+    fn execute_notification(&self, context: &ActionContext<'_>) -> Result<(), NotificationError> {
+        self.execute(context).map_err(NotificationError::Unverified)
+    }
 
     /// Observe the result after the execution hook succeeds.
     fn verify(&self, action: &ActionKind) -> Result<bool, BackendError>;

@@ -57,7 +57,7 @@ impl Backend for Probe {
             return Vec::new();
         }
         let mut capabilities = LocalFileBackend.capabilities();
-        if self.mode == "notice-probe" {
+        if self.mode.starts_with("notice-") {
             capabilities.push(ResourceCapability {
                 kind: ResourceKind::SystemdUnit,
                 version: 1,
@@ -142,6 +142,9 @@ impl Backend for Probe {
 
     fn inspect_action(&self, action: &Action) -> Result<ActionReadiness, BackendError> {
         if matches!(action.kind, ActionKind::NotifyService { .. }) {
+            if self.mode == "notice-file-drift" {
+                fs::write(self.root.join("first"), b"drift").unwrap();
+            }
             return Ok(ActionReadiness::Ready);
         }
         if let ActionKind::InstallPackage { package, .. } = &action.kind {
@@ -178,6 +181,9 @@ impl Backend for Probe {
             self.events
                 .borrow_mut()
                 .push(format!("notify {}", unit.name));
+            if self.mode == "notice-loses-receipt" {
+                return Err(BackendError("probe lost notification receipt".into()));
+            }
             return Ok(());
         }
         let (path, content) = write_action(&context.action.kind);
@@ -195,6 +201,10 @@ impl Backend for Probe {
         }
         if self.mode == "fail-second" && Path::new(path).ends_with("second") {
             return Err(BackendError("probe second write failed".into()));
+        }
+        if self.mode == "notice-interrupt-before-write" {
+            drop(_active);
+            std::process::exit(75);
         }
         self.events.borrow_mut().push(format!("write {path}"));
         fs::write(path, context.content(&content.digest)?)
@@ -924,13 +934,18 @@ fn an_uncertain_package_attempt_stays_unverified_and_is_not_dispatched() {
     assert!(!Path::new(&fixture.target("first")).exists());
 }
 
-#[test]
-fn later_plan_surfaces_the_original_queued_notice_and_recovery_completes_it() {
+fn notice_fixture() -> Fixture {
     let fixture = Fixture::new();
     let path = fixture.target("first");
     fixture.write("expand.rb", format!(
         "file_resource {path:?}, source: 'source', notifications: [{{unit: {{scope: 'system', name: 'probe.service'}}, when: 'contentChanged', effect: 'reload'}}]\n"
     ));
+    fixture
+}
+
+#[test]
+fn later_plan_surfaces_the_original_queued_notice_and_recovery_completes_it() {
+    let fixture = notice_fixture();
     let plan = fixture.plan_mode("notice-probe");
     let interrupt = fixture.root.path().join("interrupt");
     fs::write(&interrupt, b"exit before receipt").unwrap();
@@ -959,12 +974,91 @@ fn later_plan_surfaces_the_original_queued_notice_and_recovery_completes_it() {
     assert_eq!(run_id(&resumed), id);
     assert_eq!(
         events(&resumed),
-        ["notify probe.service", "verify probe.service"]
+        [
+            format!("verify {}", fixture.target("first")),
+            "notify probe.service".into(),
+            "verify probe.service".into(),
+        ]
     );
     assert_eq!(
         status_for(&fixture, Some(id))["pending_notifications"],
         json!([])
     );
+}
+
+#[test]
+fn queued_notification_waits_for_the_reviewed_file_after_interruption_before_replacement() {
+    let fixture = notice_fixture();
+    fs::write(fixture.target("first"), b"old").unwrap();
+    let plan = fixture.plan_mode("notice-probe");
+    let (child, _) = fixture.launch("notice-interrupt-before-write", &["apply", "--plan", &plan]);
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(75));
+    let before = status_for(&fixture, None);
+    let id = before["run_id"].as_str().unwrap();
+    assert_eq!(before["actions"][0]["result"], "unverified");
+    assert_eq!(before["actions"][1]["attempt"], 0);
+    assert_eq!(before["pending_notifications"].as_array().unwrap().len(), 1);
+    assert_eq!(fs::read(fixture.target("first")).unwrap(), b"old");
+
+    let resumed = fixture.run("notice-probe", &["apply"]);
+    assert!(resumed["error"].is_null(), "{resumed}");
+    assert_eq!(run_id(&resumed), id);
+    assert_eq!(fs::read(fixture.target("first")).unwrap(), b"A");
+    assert_eq!(
+        events(&resumed).first().unwrap(),
+        &format!("write {}", fixture.target("first"))
+    );
+    assert_eq!(
+        events(&resumed)
+            .iter()
+            .filter(|event| event.starts_with("notify "))
+            .count(),
+        1
+    );
+    assert_eq!(
+        status_for(&fixture, Some(id))["pending_notifications"],
+        json!([])
+    );
+}
+
+#[test]
+fn notification_remains_pending_when_a_previously_verified_file_drifts() {
+    let fixture = notice_fixture();
+    let plan = fixture.plan_mode("notice-probe");
+    let interrupted = fixture.run("notice-file-drift", &["apply", "--plan", &plan]);
+    assert!(
+        error(&interrupted).contains(&fixture.target("first")),
+        "{interrupted}"
+    );
+    assert!(
+        events(&interrupted)
+            .iter()
+            .all(|event| !event.starts_with("notify "))
+    );
+    let status = status_for(&fixture, None);
+    assert_eq!(status["actions"][1]["attempt"], 0);
+    assert_eq!(status["pending_notifications"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_lost_notification_receipt_stays_unverified_without_replay() {
+    let fixture = notice_fixture();
+    let plan = fixture.plan_mode("notice-probe");
+    let attempted = fixture.run("notice-loses-receipt", &["apply", "--plan", &plan]);
+    assert!(error(&attempted).contains("lost notification receipt"));
+    let status = status_for(&fixture, None);
+    assert_eq!(status["actions"][1]["result"], "unverified");
+
+    let resumed = fixture.run("notice-probe", &["apply"]);
+    assert!(error(&resumed).contains("无法从当前状态确认"));
+    assert!(
+        events(&resumed)
+            .iter()
+            .all(|event| !event.starts_with("notify "))
+    );
+    let status = status_for(&fixture, None);
+    assert_eq!(status["actions"][1]["attempt"], 1);
+    assert_eq!(status["pending_notifications"].as_array().unwrap().len(), 1);
 }
 
 #[test]
