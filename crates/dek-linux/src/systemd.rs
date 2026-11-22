@@ -280,6 +280,10 @@ impl Backend for SystemdBackend {
             ActionKind::DeployUnit { unit, definition } => deploy(unit, definition, context),
             ActionKind::ReloadManager(scope) => ctl(scope, false, &["daemon-reload"]).map(|_| ()),
             ActionKind::SetUnitEnabled { unit, enabled } => {
+                if *enabled && let UnitScope::User { user } = &unit.scope {
+                    let account = unit_account(user)?;
+                    ensure_account_home(&account)?;
+                }
                 let action = if *enabled { "enable" } else { "disable" };
                 ctl(
                     &unit.scope,
@@ -485,11 +489,8 @@ fn deploy(
     match &unit.scope {
         UnitScope::System => deploy_at(Path::new(UNIT_ROOT), unit, definition, context),
         UnitScope::User { user: name } => {
-            let account = user::resolve(name)?
-                .ok_or_else(|| BackendError(format!("缺少用户单元所属账户 {name:?}")))?;
-            required_target(&account.home)?
-                .create_home(Uid::from_raw(account.uid), Gid::from_raw(account.gid))
-                .map_err(|err| file_error(&account.home, err))?;
+            let account = unit_account(name)?;
+            ensure_account_home(&account)?;
             user::with_permissions(&account, || {
                 let root = user::config_dir(&account);
                 for directory in [
@@ -506,6 +507,16 @@ fn deploy(
         }
         UnitScope::UserGlobal => unreachable!("validated unit scope"),
     }
+}
+
+fn unit_account(name: &str) -> Result<crate::accounts::UserAccount, BackendError> {
+    user::resolve(name)?.ok_or_else(|| BackendError(format!("缺少用户单元所属账户 {name:?}")))
+}
+
+fn ensure_account_home(account: &crate::accounts::UserAccount) -> Result<(), BackendError> {
+    required_target(&account.home)?
+        .create_home(Uid::from_raw(account.uid), Gid::from_raw(account.gid))
+        .map_err(|err| file_error(&account.home, err))
 }
 
 fn deploy_at(
