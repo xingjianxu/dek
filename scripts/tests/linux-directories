@@ -76,10 +76,13 @@ assert set(directory["dependsOn"]) == {group["id"], user["id"]}
 print(plan["plan_id"])
 PY
 )
-        if dek_command apply --plan "$approved" 2> "$repo/creation-error"; then
+        if dek_command apply --plan "$approved" > "$repo/failed-apply" 2> "$repo/creation-error"; then
             printf 'Expected the missing parent to stop the directory action.\n' >&2
             exit 1
         fi
+        cat "$repo/failed-apply"
+        failed_run=$(awk '$1 == "run_id" { print $2 }' "$repo/failed-apply")
+        [[ -n "$failed_run" ]]
         grep -F '目标父目录尚未创建' "$repo/creation-error"
         [[ ! -e "$pending_parent" ]]
         uid_before=$(id -u "$alice")
@@ -89,7 +92,8 @@ PY
 
         install -d -m 0755 "$pending_parent"
         plan | python3 -c 'import json,sys; [action] = json.load(sys.stdin)["actions"]; assert list(action["kind"]) == ["ensureDirectory"]'
-        dek_command apply
+        dek_command apply | tee "$repo/resumed-apply"
+        grep -Fx "run_id $failed_run" "$repo/resumed-apply"
         [[ "$(stat -c '%u:%g:%a' "$pending")" == "$uid_before:$gid_before:750" ]]
         [[ "$(id -u "$alice"):$(id -g "$alice")" == "$uid_before:$gid_before" ]]
         assert_empty_plan

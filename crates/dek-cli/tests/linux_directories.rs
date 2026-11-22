@@ -159,9 +159,10 @@ fn a_replaced_directory_requires_a_fresh_plan_even_with_the_same_metadata() {
     assert!(!result.status.success());
     assert_eq!(mode(&saved), 0o777);
     assert_eq!(mode(&path), 0o777);
-    assert_ne!(fixture.plan()["plan_id"], approved["plan_id"]);
+    let fresh = fixture.plan();
+    assert_ne!(fresh["plan_id"], approved["plan_id"]);
 
-    require_success(&fixture.command(&["apply"]));
+    require_success(&fixture.command(&["apply", "--plan", fresh["plan_id"].as_str().unwrap()]));
     assert_eq!(mode(&saved), 0o777);
     assert_eq!(mode(&path), 0o750);
 }
