@@ -131,13 +131,12 @@ fn create_plan(
     let cache = normal_cache(repo)?;
     let mut provider = LocalEvaluationTarget(registry);
     let planned = plan_host_with_cache(repo, selector, registry, &mut provider, cache.as_ref())?;
-    store.lock()?.save_plan(
+    Ok(store.lock()?.save_plan(
         &planned.name,
         &planned.plan,
         &planned.expanded.resources,
         &planned.expanded.contents,
-    )?;
-    Ok(planned.plan)
+    )?)
 }
 
 fn observe(

@@ -605,3 +605,37 @@ fn a_changed_tracked_target_input_requires_review_of_a_fresh_plan() {
     assert!(events(&report).is_empty());
     assert!(!Path::new(&fixture.target("first")).exists());
 }
+
+#[test]
+fn expired_approval_returns_the_newly_issued_id_even_when_desired_state_is_identical() {
+    let fixture = Fixture::new();
+    let expired_id = fixture.plan();
+    let path = fixture
+        .state()
+        .join("plans")
+        .join(format!("{expired_id}.mpk"));
+    let mut record: Value = rmp_serde::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["createdAt"] = json!(1);
+    fs::write(path, rmp_serde::to_vec_named(&record).unwrap()).unwrap();
+
+    let report = fixture.run("", &["apply", "--plan", &expired_id]);
+    let out = stdout(&report);
+    assert!(out.contains("已审阅计划过期"), "{report}");
+    let fresh_id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("计划 "))
+        .unwrap();
+    assert_ne!(fresh_id, expired_id);
+    assert!(
+        fixture
+            .state()
+            .join("plans")
+            .join(format!("{fresh_id}.mpk"))
+            .exists()
+    );
+    assert!(events(&report).is_empty());
+
+    let report = fixture.run("", &["apply", "--plan", fresh_id]);
+    assert!(report["error"].is_null(), "{report}");
+    assert_eq!(events(&report).len(), 4);
+}

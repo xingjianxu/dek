@@ -21,9 +21,10 @@ pub(super) fn prepare<'a>(
 ) -> Result<(ResourceGraph<'a>, Vec<ResourceCapability>), PlanError> {
     let mut graph = ResourceGraph::new();
     let mut used = BTreeMap::new();
+    let managed: Vec<_> = resources.resources.iter().map(Resource::id).collect();
 
-    for resource in &resources.resources {
-        let id = normalize_id(registry, resource, resource.id())?;
+    for (resource, id) in resources.resources.iter().zip(&managed) {
+        let id = normalize_id(registry, resource, id.clone())?;
         if let Some(previous) = graph.get(&id) {
             return Err(resource_error(
                 registry,
@@ -41,6 +42,7 @@ pub(super) fn prepare<'a>(
             require_backend(registry, resource, resource.desired.kind(), &attributes)?;
         backend
             .validate(&resource.desired)
+            .and_then(|()| backend.validate_managed_paths(&resource.desired, &managed))
             .map_err(|err| resource_error(registry, resource, format!("validate: {err}")))?;
         record_capability(&mut used, capability, attributes);
 

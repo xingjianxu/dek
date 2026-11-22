@@ -287,6 +287,22 @@ impl StateGuard<'_> {
         replace_run(&runs, &run)
     }
 
+    pub(super) fn active_runs(&self) -> Result<Vec<RunRecord>, StateError> {
+        let mut active = Vec::new();
+        let Some(runs) = self.store.root.existing_private_child("runs")? else {
+            return Ok(active);
+        };
+        for name in runs.file_names()? {
+            if name.ends_with(".mpk")
+                && let Some(record) = read_run(&runs, &name)?
+                && !record.finished
+            {
+                active.push(record);
+            }
+        }
+        Ok(active)
+    }
+
     fn runs_directory(&self) -> Result<Directory, StateError> {
         self.store.root.private_child("runs")
     }

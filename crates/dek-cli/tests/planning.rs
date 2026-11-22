@@ -712,3 +712,75 @@ fn copied_cli_runs_embedded_ruby_outside_checkout_and_json_without_ruby() {
         assert_eq!(fs::read(&target).unwrap(), b"new source");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_prints_the_newly_issued_plan_id_after_expiry() {
+    use dek_cli::local_target::{LocalFileBackend, local_registry};
+    use dek_target::state::{PlanBinding, StateError, StateStore};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    write(
+        root,
+        "dek.json",
+        r#"{"schemaVersion":1,"hosts":{"server":{"entry":"server.json","target":{"local":true}}}}"#,
+    );
+    write_json(root, "server.json", &[], json!([]));
+    let repo = Repository::load(root).unwrap();
+    let registry = local_registry(&LocalFileBackend).unwrap();
+    let candidate = plan_host(
+        &repo,
+        HostSelector::Named("server"),
+        &registry,
+        &mut NoTargetQueries,
+    )
+    .unwrap();
+    let state = root.join("target-state");
+    let previous = StateStore::open_with_clock(&state, || 100)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .save_plan(
+            &candidate.name,
+            &candidate.plan,
+            &candidate.expanded.resources,
+            &candidate.expanded.contents,
+        )
+        .unwrap();
+    let plan = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dek"));
+        command
+            .args(["plan", "-H", "server", "--repo"])
+            .arg(root)
+            .arg("--state-dir")
+            .arg(&state)
+            .env("XDG_CACHE_HOME", root.join("cache"));
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    let output: Value = serde_json::from_slice(&plan(true)).unwrap();
+    let id = output["plan_id"].as_str().unwrap();
+    assert_ne!(id, previous.id);
+    assert!(String::from_utf8(plan(false)).unwrap().contains(id));
+    let store = StateStore::open(&state).unwrap();
+    let state = store.lock().unwrap();
+    let binding = PlanBinding {
+        repository_id: &previous.repository_id,
+        logical_host: "server",
+        target: &previous.target,
+    };
+    assert!(matches!(
+        state.load_plan(&previous.id, binding),
+        Err(StateError::ExpiredPlan { .. })
+    ));
+    assert_eq!(state.load_plan(id, binding).unwrap().plan.id, id);
+}

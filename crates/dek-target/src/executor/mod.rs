@@ -152,7 +152,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             &reviewed.plan.used_inputs,
         )?;
         let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh) else {
-            self.store.lock()?.save_plan(
+            let fresh = self.store.lock()?.save_plan(
                 request.binding.logical_host,
                 &fresh,
                 &reviewed.resources,
@@ -172,7 +172,13 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         let run =
             self.store
                 .lock()?
-                .begin_run(request.plan_id, request.binding, request.request_id)?;
+                .begin_run(request.plan_id, request.binding, request.request_id);
+        let run = match run {
+            Err(StateError::ExpiredPlan { .. }) => {
+                return Ok(ExecutionOutcome::review(ReviewReason::Expired));
+            }
+            result => result?,
+        };
         if !run
             .actions
             .iter()
@@ -374,7 +380,9 @@ fn action_kind(action: &ActionKind) -> ResourceKind {
         | ActionKind::SetUnitRunning { .. }
         | ActionKind::NotifyService { .. } => ResourceKind::SystemdUnit,
         ActionKind::UpdateAuthorizedKeys(_) => ResourceKind::AuthorizedKeys,
-        ActionKind::DeployAgeSecret(_) => ResourceKind::AgeSecret,
+        ActionKind::DeployAgeSecret(_) | ActionKind::SetAgeSecretAttributes(_) => {
+            ResourceKind::AgeSecret
+        }
     }
 }
 
@@ -384,7 +392,9 @@ pub fn load_plan_for_execution(
     id: &str,
     binding: PlanBinding<'_>,
 ) -> Result<LoadedPlan, StateError> {
-    guard
-        .load_plan(id, binding)
-        .map(|plan| LoadedPlan::Approved(Box::new(plan)))
+    match guard.load_plan(id, binding) {
+        Ok(plan) => Ok(LoadedPlan::Approved(Box::new(plan))),
+        Err(StateError::ExpiredPlan { .. }) => Ok(LoadedPlan::Expired),
+        Err(error) => Err(error),
+    }
 }
