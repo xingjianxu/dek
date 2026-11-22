@@ -9,6 +9,7 @@ use dek_core::{Origin, Priority, UnitSpec};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::cache::CacheDigest;
 use crate::repo::{HostSelector, InputPolicy, RepoError, Repository, Target};
 
 /// 一次声明采集的上下文。入口 ID 使用仓库内的规范相对路径。
@@ -32,6 +33,11 @@ impl CollectRequest<'_> {
 /// 语言适配器采集单个单元，并报告该次采集观察到的输入。
 pub trait Collector {
     fn collect(&mut self, request: &CollectRequest<'_>) -> Result<UnitSpec, CollectError>;
+
+    /// Revision of the record returned by the most recent successful collection.
+    fn last_cache_revision(&self) -> Option<CacheDigest> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -91,6 +97,7 @@ pub struct CollectedUnit {
     pub params: BTreeMap<String, Value>,
     pub input_policy: Option<InputPolicy>,
     pub spec: UnitSpec,
+    pub cache_revision: Option<CacheDigest>,
     /// 每条 `spec.imports` 对应的 `DeclarationGraph::profiles` 下标。
     pub dependencies: Vec<usize>,
 }
@@ -263,6 +270,7 @@ impl GraphBuilder<'_> {
             params,
             input_policy,
             spec,
+            cache_revision: self.collector.last_cache_revision(),
             dependencies: Vec::new(),
         })
     }

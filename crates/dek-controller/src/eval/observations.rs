@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cache::CacheDependency;
 
-use super::{CollectError, LanguageCollector};
+use super::CollectError;
 
 pub(super) fn digest(bytes: &[u8]) -> Observation {
     Observation::Digest(format!("sha256:{:x}", Sha256::digest(bytes)))
@@ -22,48 +22,68 @@ pub(super) fn is_target(kind: InputKind) -> bool {
     )
 }
 
-pub(super) fn unchanged(
-    language: &mut LanguageCollector<'_>,
+pub(crate) fn unchanged(
     root: &Path,
     dependencies: &[CacheDependency],
+    observe_provider: impl FnMut(&InputObservation) -> Result<Observation, String>,
+) -> Result<bool, CollectError> {
+    let inputs = || {
+        dependencies
+            .iter()
+            .filter_map(|dependency| match dependency {
+                CacheDependency::Input(input) => Some(input),
+                _ => None,
+            })
+    };
+    if inputs().count() != dependencies.len() {
+        return Ok(false);
+    }
+
+    // A local edit can remove a previously used provider dependency altogether.
+    Ok(local_unchanged(root, inputs())?
+        && inputs_match(
+            inputs().filter(|input| !is_local(input.kind)),
+            observe_provider,
+        )?)
+}
+
+pub(crate) fn local_unchanged<'a>(
+    root: &Path,
+    inputs: impl Iterator<Item = &'a InputObservation>,
+) -> Result<bool, CollectError> {
+    inputs_match(inputs.filter(|input| is_local(input.kind)), |input| {
+        observe_local(root, input).map_err(|error| error.to_string())
+    })
+}
+
+fn is_local(kind: InputKind) -> bool {
+    matches!(
+        kind,
+        InputKind::File | InputKind::Directory | InputKind::Environment
+    )
+}
+
+fn inputs_match<'a>(
+    inputs: impl Iterator<Item = &'a InputObservation>,
+    mut observe: impl FnMut(&InputObservation) -> Result<Observation, String>,
 ) -> Result<bool, CollectError> {
     let mut current = HashMap::new();
-    // A local edit can remove a previously used provider dependency altogether.
-    for provided in [false, true] {
-        for dependency in dependencies {
-            let CacheDependency::Input(input) = dependency else {
-                return Ok(false);
-            };
-            if (is_target(input.kind) || input.kind == InputKind::Http) != provided {
-                continue;
+    for input in inputs {
+        let observed = match current.entry((input.kind, input.id.as_str())) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let observation = observe(input).map_err(|message| CollectError {
+                    origin: input.origin.clone(),
+                    message: format!("recheck {:?} {:?}: {message}", input.kind, input.id),
+                })?;
+                entry.insert(observation)
             }
-            let observed = match current.entry((input.kind, input.id.as_str())) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => entry.insert(observe(language, root, input, provided)?),
-            };
-            if *observed != input.observation {
-                return Ok(false);
-            }
+        };
+        if *observed != input.observation {
+            return Ok(false);
         }
     }
     Ok(true)
-}
-
-fn observe(
-    language: &mut LanguageCollector<'_>,
-    root: &Path,
-    input: &InputObservation,
-    provided: bool,
-) -> Result<Observation, CollectError> {
-    let result = if provided {
-        language.reobserve_provider_input(input)
-    } else {
-        observe_local(root, input).map_err(|error| error.to_string())
-    };
-    result.map_err(|message| CollectError {
-        origin: input.origin.clone(),
-        message: format!("recheck {:?} {:?}: {message}", input.kind, input.id),
-    })
 }
 
 fn observe_local(root: &Path, input: &InputObservation) -> io::Result<Observation> {

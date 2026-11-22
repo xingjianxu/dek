@@ -34,7 +34,7 @@ pub fn register_system_modules(registry: &mut ModuleRegistry<'_>) -> Result<(), 
     .map(|prefix| prefix.parse().expect("built-in option paths"))
     .collect();
 
-    registry.register(
+    registry.register_builtin(
         ModuleDefinition {
             name: NAME.into(),
             origin: Origin::Json {

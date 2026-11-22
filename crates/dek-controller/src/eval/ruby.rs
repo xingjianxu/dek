@@ -126,7 +126,7 @@ impl RubySession {
         }
     }
 
-    pub(super) fn runtime_signature(&self) -> Option<String> {
+    pub(crate) fn runtime_signature(&self) -> Option<String> {
         let current = ruby_runtime::signature(self.program(), EVALUATOR)?;
         if self.process.is_some() && self.started_signature.as_deref() != Some(current.as_str()) {
             return None;
@@ -268,7 +268,7 @@ impl RubySession {
 }
 
 impl RubyProviders<'_> {
-    pub(super) fn reobserve(&mut self, input: &InputObservation) -> Result<Observation, String> {
+    pub(crate) fn reobserve(&mut self, input: &InputObservation) -> Result<Observation, String> {
         let kind = match input.kind {
             InputKind::TargetFact => QueryKind::Target(TargetQueryKind::Fact),
             InputKind::TargetCapability => QueryKind::Target(TargetQueryKind::Capability),

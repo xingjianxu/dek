@@ -22,7 +22,7 @@ pub fn register_key_modules(registry: &mut ModuleRegistry<'_>) -> Result<(), Exp
         .map(|prefix| prefix.parse().expect("built-in option path"))
         .collect();
 
-    registry.register(
+    registry.register_builtin(
         ModuleDefinition {
             name: NAME.into(),
             origin: Origin::Json {
