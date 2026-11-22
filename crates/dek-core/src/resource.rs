@@ -19,24 +19,10 @@ pub struct ResourceSet {
 impl ResourceSet {
     /// Digests of all content objects the target may need for this set.
     pub fn content_digests(&self) -> BTreeSet<&ContentDigest> {
-        let mut digests = BTreeSet::new();
-        for resource in &self.resources {
-            match &resource.desired {
-                DesiredResource::File(FileResource {
-                    state: FileState::Present(content),
-                    ..
-                }) => {
-                    digests.insert(&content.digest);
-                }
-                DesiredResource::SystemdUnit(unit) => unit.definition.add_digests(&mut digests),
-                DesiredResource::AuthorizedKeys(keys) => digests.extend(&keys.key_files),
-                DesiredResource::AgeSecret(secret) => {
-                    digests.insert(&secret.ciphertext);
-                }
-                _ => {}
-            }
-        }
-        digests
+        self.resources
+            .iter()
+            .flat_map(Resource::content_digests)
+            .collect()
     }
 }
 
@@ -55,6 +41,26 @@ pub struct Resource {
 impl Resource {
     pub fn id(&self) -> ResourceId {
         self.desired.id()
+    }
+
+    /// Digests of content referenced by this resource.
+    pub fn content_digests(&self) -> BTreeSet<&ContentDigest> {
+        let mut digests = BTreeSet::new();
+        match &self.desired {
+            DesiredResource::File(FileResource {
+                state: FileState::Present(content),
+                ..
+            }) => {
+                digests.insert(&content.digest);
+            }
+            DesiredResource::SystemdUnit(unit) => unit.definition.add_digests(&mut digests),
+            DesiredResource::AuthorizedKeys(keys) => digests.extend(&keys.key_files),
+            DesiredResource::AgeSecret(secret) => {
+                digests.insert(&secret.ciphertext);
+            }
+            _ => {}
+        }
+        digests
     }
 }
 
