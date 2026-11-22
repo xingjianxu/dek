@@ -1,6 +1,7 @@
 //! Arch package state, read-only native transaction planning and reviewed removals.
 
 mod alpm;
+mod aur;
 mod removal;
 mod upgrade;
 
@@ -189,7 +190,7 @@ impl Backend for PacmanBackend {
                 Err(BackendError("当前 pacman 后端仅预览仓库事务".into()))
             }
             ActionKind::BuildAurPackage { .. } => {
-                Err(BackendError("AUR 候选版本和构建环境待核查".into()))
+                Err(BackendError("当前后端只支持 AUR 规划".into()))
             }
             _ => reviewed_removal(action).map(|_| ()),
         }

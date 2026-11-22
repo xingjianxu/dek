@@ -30,7 +30,6 @@ mkpkg installed dek-fixture-update 1-1
 mkpkg installed dek-fixture-obsolete 1-1
 mkpkg installed dek-fixture-conflict 1-1
 mkpkg installed dek-fixture-ahead 2-1
-mkpkg installed dek-fixture-aur 1-1
 cp -- "$base/installed/"{dek-fixture-update,dek-fixture-obsolete,dek-fixture-conflict}-1-1-any.pkg.tar.zst "$base/a/"
 mkpkg a dek-fixture-ahead 1-1
 mkpkg a dek-fixture-required 1-1
@@ -76,7 +75,6 @@ RUBY
 cat > "$base/repo/entry.json" <<'JSON'
 {"schemaVersion":1,"imports":[],"options":[
   {"path":"environment.systemPackages","value":["dek-fixture-required"]},
-  {"path":"dek.arch.aurPackages","value":["dek-fixture-aur","dek-fixture-aur-missing"]},
   {"path":"lab.upgrade.enable","value":true}
 ]}
 JSON
@@ -149,10 +147,6 @@ assert plan['plan_id'] in text
 assert all(action['id'] in step['dependsOn'] for step in configuration), configuration
 assert any('writeFile' in step['kind'] for step in configuration), configuration
 assert any('setUnitRunning' in step['kind'] for step in configuration), configuration
-builds = {step['kind']['buildAurPackage']['package']['name']: step for step in configuration if 'buildAurPackage' in step['kind']}
-assert builds.keys() == {'dek-fixture-aur', 'dek-fixture-aur-missing'}, builds
-assert builds['dek-fixture-aur']['preconditions'][0]['packageVersion']['expected'] == '1-1'
-assert builds['dek-fixture-aur-missing']['preconditions'][0]['packageVersion']['expected'] is None
 print(f"Verified terminal and JSON {source} plan {plan['plan_id']}")
 PY
     check_unchanged

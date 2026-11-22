@@ -31,6 +31,17 @@ pub fn write_plan(
         } else {
             writeln!(out, "{label}  [{}]", action.id)?;
         }
+        if let ActionKind::BuildAurPackage { dependencies, .. } = &action.kind {
+            for (label, packages) in [
+                ("运行依赖", &dependencies.runtime),
+                ("构建依赖", &dependencies.build),
+                ("检查依赖", &dependencies.check),
+            ] {
+                if !packages.is_empty() {
+                    writeln!(out, "  {label} {}", packages.join(", "))?;
+                }
+            }
+        }
         writeln!(out, "  原因 {}", action.reason)?;
         if !action.depends_on.is_empty() {
             writeln!(out, "  依赖 {}", action.depends_on.join(", "))?;
@@ -75,6 +86,7 @@ pub(crate) fn description(action: &ActionKind) -> String {
         ActionKind::BuildAurPackage {
             package,
             candidate_version,
+            ..
         } => format!(
             "构建 AUR 软件包 {} ({})",
             package.name,

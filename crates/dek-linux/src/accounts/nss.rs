@@ -78,11 +78,24 @@ pub fn group_id(name: &str) -> Result<Option<u32>, BackendError> {
 }
 
 pub(crate) fn user_account(name: &str) -> Result<Option<UserAccount>, BackendError> {
-    let name = lookup_name(Key::Name(name))?;
+    lookup_user_account(Key::Name(name))
+}
+
+pub(crate) fn user_account_by_uid(uid: u32) -> Result<Option<UserAccount>, BackendError> {
+    lookup_user_account(Key::Id(uid))
+}
+
+fn lookup_user_account(key: Key<'_>) -> Result<Option<UserAccount>, BackendError> {
+    let name = lookup_name(key)?;
     lookup(
         |entry: *mut libc::passwd, buf, size, found| {
             // NSS keeps these pointers valid while extracting the account below.
-            unsafe { libc::getpwnam_r(name.as_ptr(), entry, buf, size, found) }
+            unsafe {
+                match key {
+                    Key::Name(_) => libc::getpwnam_r(name.as_ptr(), entry, buf, size, found),
+                    Key::Id(uid) => libc::getpwuid_r(uid, entry, buf, size, found),
+                }
+            }
         },
         |entry| {
             if entry.pw_dir.is_null() {
@@ -95,7 +108,10 @@ pub(crate) fn user_account(name: &str) -> Result<Option<UserAccount>, BackendErr
                 uid: identity.id,
                 gid: entry.pw_gid,
                 home: PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())),
-                groups: supplementary_groups(&name, entry.pw_gid)?,
+                groups: supplementary_groups(
+                    unsafe { CStr::from_ptr(entry.pw_name) },
+                    entry.pw_gid,
+                )?,
             })
         },
     )

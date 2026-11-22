@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fixture=$(cd -- "$(dirname -- "$0")" && pwd -P)
+cache="${DEK_DEV_ROOT:-/data/dek-dev}/cache/arch-packages"
+archives="$cache/aur-build-20261115/pkg"
+paru="$cache/paru-v2.2.1"
+mkdir -p -- "$archives" "$paru"
+
+download() {
+    local digest=$1 url=$2 dir=$3 dest
+    dest="$dir/${url##*/}"
+    if [[ ! -f "$dest" ]]; then
+        curl --fail --silent --show-error --location --retry 2 --output "$dest.part" "$url"
+        printf '%s  %s\n' "$digest" "$dest.part" | sha256sum --quiet --check -
+        mv -- "$dest.part" "$dest"
+    fi
+    printf '%s  %s\n' "$digest" "$dest" | sha256sum --quiet --check -
+}
+
+while read -r digest url; do
+    download "$digest" "$url" "$archives"
+done < "$fixture/archives.txt"
+download dca66fdd2b7c8e0ceff1133dbf5ba552cfa486af88f807170dd9b6ca0909d745 \
+    https://github.com/Morganamilo/paru/releases/download/v2.2.1/paru-v2.2.1-x86_64.tar.zst "$paru"

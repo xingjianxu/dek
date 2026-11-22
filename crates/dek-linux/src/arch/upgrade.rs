@@ -6,7 +6,7 @@ use dek_core::{
 };
 use dek_target::backend::{Backend, BackendError, PlannedAction, PlannedPackages};
 
-use super::{PacmanBackend, alpm, package_rows, pacman_text};
+use super::{PacmanBackend, alpm, aur, package_rows, pacman_text};
 
 impl PacmanBackend {
     pub(super) fn plan_package_set(
@@ -62,6 +62,28 @@ impl PacmanBackend {
         let full = resolved
             .as_ref()
             .is_some_and(|(tx, _)| tx.scope == dek_core::RepositoryTransactionScope::Upgrade);
+        let aur_queries = packages
+            .iter()
+            .filter_map(|desired| {
+                let name = desired.package.name.as_str();
+                (desired.package.source == PackageSource::Aur
+                    && desired.state == Presence::Present
+                    && (full || !installed.contains_key(name)))
+                .then_some(name)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut aur_candidates = if aur_queries.is_empty() {
+            Default::default()
+        } else {
+            aur::BuildEnvironment::discover()
+                .and_then(|environment| environment.candidates(&aur_queries))
+                .map_err(|error| {
+                    BackendError(format!(
+                        "受管 AUR 包 {}：{error}",
+                        aur_queries.iter().copied().collect::<Vec<_>>().join(", ")
+                    ))
+                })?
+        };
         for desired in packages {
             let package = &desired.package;
             let name = package.name.as_str();
@@ -90,13 +112,31 @@ impl PacmanBackend {
                 (PackageSource::Official, _) => {
                     self.plan(&DesiredResource::Package(desired.clone()), &preconditions)?
                 }
-                (PackageSource::Aur, Presence::Present) if full || version.is_none() => {
+                (PackageSource::Aur, Presence::Present) => {
+                    let Some(candidate) = aur_candidates.remove(name) else {
+                        planned.actions.insert(id, Vec::new());
+                        continue;
+                    };
+                    if let Some(version) = version
+                        && !aur::installed_is_older(version, &candidate.version)?
+                    {
+                        planned.actions.insert(id, Vec::new());
+                        continue;
+                    }
+                    let reason = match version {
+                        Some(version) => format!(
+                            "受管 AUR 包 {name} 已安装 {version}，候选为 {}",
+                            candidate.version
+                        ),
+                        None => format!("受管 AUR 包 {name} 尚未安装"),
+                    };
                     vec![PlannedAction {
                         kind: ActionKind::BuildAurPackage {
                             package: package.clone(),
-                            candidate_version: None,
+                            candidate_version: Some(candidate.version),
+                            dependencies: candidate.dependencies,
                         },
-                        reason: format!("受管 AUR 目标 {name}，候选版本和构建环境待核查"),
+                        reason,
                         preconditions,
                         content_changed: false,
                     }]
