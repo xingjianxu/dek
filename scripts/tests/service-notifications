@@ -125,6 +125,8 @@ cat "$repo/first-attempt.log"
 [[ $(wc -l < "$repo/attempts") == 2 && $(wc -l < "$repo/successes") == 1 ]]
 status
 plan
+cp -- "$repo/status.json" "$repo/reload-failed-status.json"
+cp -- "$repo/plan.json" "$repo/reload-pending-plan.json"
 run_id=$(python3 - "$repo/status.json" "$repo/plan.json" <<'PY'
 import json
 import sys
@@ -152,6 +154,7 @@ grep -F "run_id $run_id" "$repo/retried.log"
 [[ $(wc -l < "$repo/attempts") == 3 && $(wc -l < "$repo/successes") == 2 ]]
 diff -u <(printf 'a-retry\nb-retry\nUpdated notice fixture\n') "$repo/received"
 status
+cp -- "$repo/status.json" "$repo/reload-resumed-status.json"
 python3 - "$repo/status.json" "$run_id" <<'PY'
 import json
 import sys
