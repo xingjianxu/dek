@@ -20,5 +20,8 @@ pub use resources::{
     assemble_resources,
 };
 
+mod builtin_system;
+pub use builtin_system::{register_system_modules, register_system_schemas};
+
 mod repository_modules;
 pub use repository_modules::{RepositoryModuleError, RepositoryModules};

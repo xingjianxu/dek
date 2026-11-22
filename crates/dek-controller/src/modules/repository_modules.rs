@@ -1,14 +1,11 @@
 use std::{cell::RefCell, collections::BTreeMap, fs, num::NonZeroU32, path::PathBuf, rc::Rc};
 
-use dek_core::{
-    InputKind, InputObservation, Observation, OptionPath, Origin, protocol::EvalOperation,
-};
+use dek_core::{OptionPath, Origin, protocol::EvalOperation};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    eval::{RubySession, TargetProvider},
+    eval::{RubyProviders, RubySession},
     repo::{InputPolicy, Repository},
 };
 
@@ -118,13 +115,13 @@ impl RepositoryModules {
         &self,
         registry: &mut ModuleRegistry<'a>,
         ruby: &'a mut RubySession,
-        target: &'a mut dyn TargetProvider,
+        providers: RubyProviders<'a>,
     ) -> Result<(), ExpansionError> {
-        let runtime = Rc::new(RefCell::new((ruby, target)));
+        let runtime = Rc::new(RefCell::new((ruby, providers)));
         for module in &self.entries {
             let runtime = Rc::clone(&runtime);
-            let entry = self.repo_root.join(&module.entry);
-            let relative_entry = module.entry.to_string_lossy().into_owned();
+            let repo_root = self.repo_root.clone();
+            let entry = repo_root.join(&module.entry);
             registry.register(module.definition.clone(), move |context| {
                 let options: BTreeMap<_, _> = context
                     .options
@@ -132,27 +129,34 @@ impl RepositoryModules {
                     .iter()
                     .map(|(path, option)| (path, &option.value))
                     .collect();
-                let (ruby, target) = &mut *runtime.borrow_mut();
-                let bytes = fs::read(&entry)
-                    .map_err(|err| format!("cannot read {}: {err}", entry.display()))?;
+                let option_origins: BTreeMap<_, _> = context
+                    .options
+                    .options
+                    .iter()
+                    .filter_map(|(path, option)| {
+                        option
+                            .effective_definitions
+                            .first()
+                            .map(|definition| (path, &definition.origin))
+                    })
+                    .collect();
+                let (ruby, providers) = &mut *runtime.borrow_mut();
                 let evaluated = ruby
-                    .evaluate(
+                    .evaluate_with_sdk(
                         EvalOperation::Expand,
+                        &repo_root,
                         &entry,
-                        json!({ "options": options }),
-                        &mut **target,
+                        json!({ "options": options, "optionOrigins": option_origins }),
+                        providers.reborrow(),
                     )
                     .map_err(|err| err.to_string())?;
+                if !evaluated.result.is_object() {
+                    return Err("module output must be a JSON object".into());
+                }
                 let mut output: ModuleOutput =
                     serde_path_to_error::deserialize(evaluated.result)
                         .map_err(|err| format!("invalid module output: {err}"))?;
                 output.inputs.extend(evaluated.inputs);
-                output.inputs.push(InputObservation {
-                    kind: InputKind::File,
-                    id: relative_entry.clone(),
-                    observation: Observation::Digest(format!("sha256:{:x}", Sha256::digest(bytes))),
-                    origin: None,
-                });
                 Ok(output)
             })?;
         }

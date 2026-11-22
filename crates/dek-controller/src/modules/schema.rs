@@ -81,6 +81,7 @@ pub(super) enum MergeStrategy {
     Replace,
     Set,
     Ordered,
+    Map,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +196,11 @@ impl RegisteredOption {
             return Err(invalid(
                 "set and ordered merge strategies require a list type".into(),
             ));
+        }
+        if matches!(schema.merge, MergeStrategy::Map)
+            && !matches!(schema.value_type, ValueType::Map { .. })
+        {
+            return Err(invalid("map merge strategy requires a map type".into()));
         }
         let default = if let Some(value) = schema.default.take() {
             if let Some(mismatch) = schema.value_type.mismatch(&value) {

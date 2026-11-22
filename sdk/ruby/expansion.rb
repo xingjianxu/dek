@@ -2,12 +2,23 @@ require "digest"
 
 module DekEvaluator
   module Expansion
+    OptionSource = Struct.new(:path, :origin)
+
     def options
       context.fetch("options")
     end
 
     def option(path)
       options[path.to_s]
+    end
+
+    def option_source(path)
+      path = path.to_s
+      value = option(path)
+      raise ArgumentError, "option #{path.inspect} does not specify a source file" unless value.is_a?(String)
+
+      origin = context.fetch("optionOrigins").fetch(path)
+      OptionSource.new(value, origin)
     end
 
     def resource(kind, depends_on: [], notifications: [], **attributes)
@@ -19,10 +30,14 @@ module DekEvaluator
       raise ArgumentError, "file_resource requires exactly one of content and source" if content.nil? == source.nil?
 
       location = caller_locations(1, 1).first
-      value = if source
-        { relative: { path: String(source), origin: resource_origin(location) } }
+      value = if source.is_a?(OptionSource)
+        { relative: { path: source.path, origin: source.origin } }
+      elsif source.is_a?(String)
+        { relative: { path: source, origin: resource_origin(location) } }
+      elsif content.is_a?(String)
+        { inline: content.bytes }
       else
-        { inline: String(content).bytes }
+        raise ArgumentError, "file resource content and source paths require strings"
       end
       record_resource({ file: { path: path, attributes: attributes, content: value } }, location,
         depends_on, notifications)
@@ -57,9 +72,9 @@ module DekEvaluator
     end
 
     def resource_origin(location)
-      { file: location.path, line: location.lineno }
+      @inputs.location_origin(location)
     end
   end
 
-  Context.prepend(Expansion)
+  SdkContext.prepend(Expansion)
 end
