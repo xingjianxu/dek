@@ -138,6 +138,22 @@ impl StateStore {
         path: &Path,
         id: &str,
     ) -> Result<Option<SecretVerification>, StateError> {
+        Self::read_secret_marker(path, id, "marker")
+    }
+
+    /// Read publication's protected verification checkpoint, if one exists.
+    pub fn read_secret_candidate(
+        path: &Path,
+        id: &str,
+    ) -> Result<Option<SecretVerification>, StateError> {
+        Self::read_secret_marker(path, id, "candidate")
+    }
+
+    fn read_secret_marker(
+        path: &Path,
+        id: &str,
+        suffix: &str,
+    ) -> Result<Option<SecretVerification>, StateError> {
         if !valid_hash(id) {
             return Err(StateError::invalid(path, "无效的验证标记 ID"));
         }
@@ -147,7 +163,7 @@ impl StateStore {
         let Some(secrets) = root.existing_private_child("secrets")? else {
             return Ok(None);
         };
-        let Some(marker) = secrets.read(&format!("{id}.marker"))? else {
+        let Some(marker) = secrets.read(&format!("{id}.{suffix}"))? else {
             return Ok(None);
         };
         Ok(secrets
@@ -195,6 +211,55 @@ impl StateStore {
 }
 
 impl StateGuard<'_> {
+    /// Return an existing target-local key or initialize it once under the state lock.
+    pub fn secret_verification_key(&self) -> Result<[u8; 32], StateError> {
+        use std::{fs::File, io::Read};
+
+        let secrets = self.store.root.private_child("secrets")?;
+        let name = "verification.key";
+        if let Some(key) = secrets.read(name)? {
+            return key
+                .try_into()
+                .map_err(|_| StateError::invalid(&secrets.path.join(name), "验证密钥长度不符"));
+        }
+        let mut key = [0; 32];
+        let device = Path::new("/dev/urandom");
+        File::open(device)
+            .and_then(|mut file| file.read_exact(&mut key))
+            .map_err(|err| StateError::io("生成验证密钥", device, err))?;
+        secrets.publish(name, &key)?;
+        Ok(key)
+    }
+
+    /// Persist the verified bytes' marker before their atomic publication.
+    pub fn stage_secret_verification(&self, id: &str, marker: &[u8]) -> Result<(), StateError> {
+        self.secret_marker_directory(id)?
+            .replace(&format!("{id}.candidate"), marker)
+    }
+
+    /// Certify the destination and clear its publication checkpoint.
+    pub fn write_secret_verification(&self, id: &str, marker: &[u8]) -> Result<(), StateError> {
+        let secrets = self.secret_marker_directory(id)?;
+        secrets.replace(&format!("{id}.marker"), marker)?;
+        match secrets.remove(&format!("{id}.candidate")) {
+            Ok(()) => secrets.sync(),
+            Err(StateError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn secret_marker_directory(&self, id: &str) -> Result<Directory, StateError> {
+        if !valid_hash(id) {
+            return Err(StateError::invalid(
+                &self.store.root.path,
+                "无效的验证标记 ID",
+            ));
+        }
+        self.store.root.private_child("secrets")
+    }
+
     pub fn has_object(&self, digest: &ContentDigest) -> Result<bool, StateError> {
         self.object(digest).map(|object| object.is_some())
     }

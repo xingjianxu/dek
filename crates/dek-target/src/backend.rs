@@ -65,12 +65,34 @@ pub enum NotificationError {
 pub struct ActionContext<'a> {
     pub action: &'a Action,
     contents: &'a BTreeMap<ContentDigest, Vec<u8>>,
+    before_content_change: Option<&'a dyn Fn() -> Result<(), BackendError>>,
 }
 
 impl<'a> ActionContext<'a> {
     #[cfg(target_os = "linux")]
     pub(crate) fn new(action: &'a Action, contents: &'a BTreeMap<ContentDigest, Vec<u8>>) -> Self {
-        Self { action, contents }
+        Self {
+            action,
+            contents,
+            before_content_change: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_content_change(
+        mut self,
+        before: &'a dyn Fn() -> Result<(), BackendError>,
+    ) -> Self {
+        self.before_content_change = Some(before);
+        self
+    }
+
+    /// Persist dependent notices immediately before publishing verified changed content.
+    pub fn before_content_change(&self) -> Result<(), BackendError> {
+        match self.before_content_change {
+            Some(before) => before(),
+            None => Ok(()),
+        }
     }
 
     pub fn content(&self, digest: &ContentDigest) -> Result<&[u8], BackendError> {
@@ -179,6 +201,11 @@ pub trait Backend {
     /// Apply the reviewed action. Backends check the supplied preconditions at
     /// their mutation boundary and use only the reviewed bytes from context.
     fn execute(&self, context: &ActionContext<'_>) -> Result<(), BackendError>;
+
+    /// Whether the action made a visible change after execution.
+    fn execute_changed(&self, context: &ActionContext<'_>) -> Result<bool, BackendError> {
+        self.execute(context).map(|()| true)
+    }
 
     /// Return a retryable failure only with a definitive service job receipt.
     fn execute_notification(&self, context: &ActionContext<'_>) -> Result<(), NotificationError> {

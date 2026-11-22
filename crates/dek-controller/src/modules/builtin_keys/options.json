@@ -7,6 +7,8 @@
     {"path":"age.secrets.<name>.path", "type":"string", "description":"Target path for decrypted contents"},
     {"path":"age.secrets.<name>.owner", "type":"string", "description":"Owner on the target"},
     {"path":"age.secrets.<name>.group", "type":"string", "description":"Group on the target"},
-    {"path":"age.secrets.<name>.mode", "type":"string", "description":"Permission mode string on the target"}
+    {"path":"age.secrets.<name>.mode", "type":"string", "description":"Permission mode string on the target"},
+    {"path":"age.secrets.<name>.reloadUnits", "type":{"list":"string"}, "merge":"set", "description":"System services to reload when decrypted bytes change"},
+    {"path":"age.secrets.<name>.restartUnits", "type":{"list":"string"}, "merge":"set", "description":"System services to restart when decrypted bytes change"}
   ]
 }

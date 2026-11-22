@@ -14,9 +14,9 @@ pub use config::{
 pub use origin::{InvalidJsonPointer, JsonPointer, Origin};
 
 pub use plan::{
-    Action, ActionKind, AgeSecretObservation, AgeSecretVerification, DirectoryObservation,
-    FileObservation, Plan, PlanVersion, Precondition, ResourceCapability, TargetCapabilities,
-    TargetIdentity, UnsupportedPlanVersion, UserObservation,
+    Action, ActionKind, AgeSecretObservation, AgeSecretRevision, AgeSecretVerification,
+    DirectoryObservation, FileObservation, Plan, PlanVersion, Precondition, ResourceCapability,
+    TargetCapabilities, TargetIdentity, UnsupportedPlanVersion, UserObservation,
 };
 pub use resource::{
     AgeSecretResource, AuthorizedKeysResource, ContentDigest, DesiredResource, DirectoryResource,

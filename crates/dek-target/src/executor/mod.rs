@@ -376,7 +376,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         for item in &run.actions {
             let action = &item.action;
             if let ActionResult::Verified { changed } = item.result {
-                if changed {
+                if changed && !runtime_content_check(&action.kind) {
                     triggered.insert(action.id.as_str());
                 }
                 continue;
@@ -385,17 +385,9 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             let backend = self.backend(action)?;
             match &item.result {
                 ActionResult::Pending => {
-                    let no_trigger = matches!(action.kind, ActionKind::NotifyService { .. })
-                        && !live.contains(action.id.as_str())
-                        && !run
-                            .pending_notifications
-                            .iter()
-                            .any(|notice| notice.action_id == action.id)
-                        && action
-                            .depends_on
-                            .iter()
-                            .all(|id| !triggered.contains(id.as_str()));
-                    if no_trigger {
+                    if matches!(action.kind, ActionKind::NotifyService { .. })
+                        && !self.notification_triggered(run, binding, action, live, &triggered)?
+                    {
                         let attempt = self.begin(run, binding, action)?;
                         self.record(run, binding, action, attempt, &Ok(false))?;
                         continue;
@@ -403,7 +395,9 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                 }
                 ActionResult::Failed { .. } | ActionResult::Unverified => {
                     if !self.recover_attempt(run, binding, item, backend)? {
-                        triggered.insert(action.id.as_str());
+                        if !runtime_content_check(&action.kind) {
+                            triggered.insert(action.id.as_str());
+                        }
                         continue;
                     }
                 }
@@ -440,7 +434,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             let attempt = self.begin(run, binding, action)?;
             let outcome = self.dispatch(run, binding, reviewed, action, backend, readiness);
             self.record(run, binding, action, attempt, &outcome.as_ref().copied())?;
-            if outcome? {
+            if outcome? && !runtime_content_check(&action.kind) {
                 triggered.insert(action.id.as_str());
             }
         }
@@ -541,6 +535,40 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             ActionReadiness::Ready => {}
         }
 
+        let queue = || {
+            self.queue_dependent_notifications(run, binding, action)
+                .map_err(|error| BackendError(error.to_string()))
+        };
+        let context = ActionContext::new(action, &reviewed.contents);
+        let context = if runtime_content_check(&action.kind) {
+            context.with_content_change(&queue)
+        } else {
+            self.queue_dependent_notifications(run, binding, action)?;
+            context
+        };
+        if let ActionKind::NotifyService { unit, .. } = &action.kind {
+            return backend
+                .execute_notification(&context)
+                .and_then(|()| verify(backend, action).map_err(NotificationError::Unverified))
+                .map(|()| true)
+                .map_err(|error| ExecutionError::Notification {
+                    id: action.id.clone(),
+                    unit: unit.clone(),
+                    error,
+                });
+        }
+        backend
+            .execute_changed(&context)
+            .and_then(|changed| verify(backend, action).map(|()| changed))
+            .map_err(|error| ExecutionError::action(action, error.0))
+    }
+
+    fn queue_dependent_notifications(
+        &self,
+        run: &RunRecord,
+        binding: PlanBinding<'_>,
+        action: &Action,
+    ) -> Result<(), StateError> {
         let notices = run
             .actions
             .iter()
@@ -558,23 +586,43 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             }
         }
 
-        let context = ActionContext::new(action, &reviewed.contents);
-        if let ActionKind::NotifyService { unit, .. } = &action.kind {
-            return backend
-                .execute_notification(&context)
-                .and_then(|()| verify(backend, action).map_err(NotificationError::Unverified))
-                .map(|()| true)
-                .map_err(|error| ExecutionError::Notification {
-                    id: action.id.clone(),
-                    unit: unit.clone(),
-                    error,
-                });
+        Ok(())
+    }
+
+    fn notification_triggered(
+        &self,
+        run: &RunRecord,
+        binding: PlanBinding<'_>,
+        notice: &Action,
+        live: &BTreeSet<&str>,
+        triggered: &BTreeSet<&str>,
+    ) -> Result<bool, StateError> {
+        if notice
+            .depends_on
+            .iter()
+            .any(|id| triggered.contains(id.as_str()))
+        {
+            return Ok(true);
         }
-        backend
-            .execute(&context)
-            .and_then(|()| verify(backend, action))
-            .map_err(|error| ExecutionError::action(action, error.0))?;
-        Ok(true)
+        let runtime = run.actions.iter().any(|item| {
+            runtime_content_check(&item.action.kind) && notice.depends_on.contains(&item.action.id)
+        });
+        let pending = if runtime {
+            // Runtime checks may have queued this notice after this run was loaded.
+            self.store
+                .lock()?
+                .load_run(&run.id, binding)?
+                .pending_notifications
+        } else {
+            if live.contains(notice.id.as_str()) {
+                return Ok(true);
+            }
+            return Ok(run
+                .pending_notifications
+                .iter()
+                .any(|pending| pending.action_id == notice.id));
+        };
+        Ok(pending.iter().any(|pending| pending.action_id == notice.id))
     }
 
     fn verify_notification_files(
@@ -584,8 +632,10 @@ impl<'a, 'backend> Executor<'a, 'backend> {
     ) -> Result<(), ExecutionError> {
         for item in &run.actions {
             let source = &item.action;
-            if action_kind(&source.kind) == ResourceKind::File
-                && notice.depends_on.contains(&source.id)
+            if matches!(
+                action_kind(&source.kind),
+                ResourceKind::File | ResourceKind::AgeSecret
+            ) && notice.depends_on.contains(&source.id)
                 && !self
                     .backend(source)?
                     .verify(&source.kind)
@@ -669,6 +719,13 @@ fn validate_run(run: &RunRecord, reviewed: &ReviewedPlan) -> Result<(), Executio
     } else {
         Err(ExecutionError::RunMismatch(run.id.clone()))
     }
+}
+
+fn runtime_content_check(kind: &ActionKind) -> bool {
+    matches!(
+        kind,
+        ActionKind::DeployAgeSecret(_) | ActionKind::SetAgeSecretAttributes(_)
+    )
 }
 
 fn action_kind(action: &ActionKind) -> ResourceKind {

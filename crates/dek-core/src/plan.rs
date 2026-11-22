@@ -250,10 +250,22 @@ pub enum AgeSecretObservation {
     Missing,
     Present {
         verification: AgeSecretVerification,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<AgeSecretRevision>,
         uid: Option<u32>,
         gid: Option<u32>,
         mode: u32,
     },
+}
+
+/// Filesystem identity and change time for reviewed target bytes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgeSecretRevision {
+    pub device: u64,
+    pub inode: u64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
