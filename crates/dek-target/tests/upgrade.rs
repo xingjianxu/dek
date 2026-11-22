@@ -123,6 +123,7 @@ impl Backend for Target {
         &self,
         _: &ResourceSet,
         mode: PlanMode,
+        _reviewed: Option<&[Action]>,
     ) -> Result<Option<PlannedPackages>, BackendError> {
         if mode == PlanMode::Normal {
             return Ok(None);

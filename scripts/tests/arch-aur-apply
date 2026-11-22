@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+if [[ $# != 3 ]]; then
+    printf 'Usage: %s IMAGE_ID MANAGER_DEK GUEST_DEK\n' "$0" >&2
+    exit 2
+fi
+image=$1
+manager=$(realpath -e -- "$2")
+binary=$(realpath -e -- "$3")
+scripts=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+fixture="$scripts/tests/arch-aur-fixture"
+vm="$scripts/run-arch-vm"
+tty="$scripts/tests/arch-aur-apply-tty.py"
+run_root="${DEK_DEV_ROOT:-/data/dek-dev}/runs/49"
+mkdir -p -- "$run_root"
+evidence=$(mktemp -d "$run_root/aur-apply.XXXXXXXX")
+printf 'Evidence %s\n' "$evidence"
+sha256sum -- "$manager" "$binary" > "$evidence/binaries.sha256"
+
+root=/var/tmp/dek-aur-apply
+guest_command="$root/fixture"
+managed=dek-aur-fixture
+failing=dek-aur-missing
+library=dek-fixture-aur-lib
+build_attempts=/home/dek/aur-vm-fixture/build-attempts
+run=''
+cleanup() {
+    if [[ -n "$run" && ! -e "$run/result" ]]; then
+        "$vm" ssh "$run" sudo -n cat "$build_attempts" > "$evidence/last-build-attempts" 2>/dev/null || true
+        "$vm" ssh "$run" sudo -n cat /var/log/pacman.log > "$evidence/last-pacman.log" 2>/dev/null || true
+        "$vm" finish "$run" failed || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+run=$("$vm" start 49 "$image" "$binary")
+printf '%s\n' "$run" > "$evidence/guest"
+grep -F 'restrict=on' "$run/qemu.command" > "$evidence/offline-network"
+
+export DEK_AUR_TEST_SSH_CONFIG DEK_AUR_TEST_REAL_SSH DEK_AUR_TEST_CHANNELS
+DEK_AUR_TEST_SSH_CONFIG=$("$vm" config "$run")
+DEK_AUR_TEST_REAL_SSH=$(command -v ssh)
+DEK_AUR_TEST_CHANNELS="$evidence/ssh-channels"
+guest() { "$vm" ssh "$run" "$@"; }
+local_dek() { guest sudo -n env "XDG_CACHE_HOME=$root/cache" /usr/local/bin/dek --repo "$root/repo" -H arch "$@" --state-dir "$root/state"; }
+local_tty() {
+    python3 "$tty" "$DEK_AUR_TEST_REAL_SSH" -tt -F "$DEK_AUR_TEST_SSH_CONFIG" dek-vm \
+        sudo -n env "XDG_CACHE_HOME=$root/cache" /usr/local/bin/dek --repo "$root/repo" -H arch "$@" --state-dir "$root/state"
+}
+
+local_digest=$(sha256sum -- "$binary")
+remote_digest=$(guest sha256sum /usr/local/bin/dek)
+[[ ${local_digest%% *} == "${remote_digest%% *}" ]]
+printf '%s\n' "$remote_digest" > "$evidence/guest-binary.sha256"
+"$fixture/setup" "$run" > "$evidence/setup.log" 2>&1
+guest "sudo -n install -d -m 0755 $root && sudo -n install -m 0755 /dev/stdin $guest_command" \
+    < "$scripts/tests/arch-aur-apply-guest"
+guest sudo -n "$guest_command" initialize > "$evidence/initialize.log" 2>&1
+guest id -u > "$evidence/build-user.uid"
+uid=$(<"$evidence/build-user.uid")
+[[ "$uid" =~ ^[1-9][0-9]*$ ]]
+
+run_id() {
+    local id
+    id=$(awk '/^run_id / && !found { sub(/\r$/, "", $2); print $2; found = 1 }' "$1")
+    [[ "$id" =~ ^[0-9a-f]{64}$ ]]
+    printf '%s\n' "$id"
+}
+package_state() {
+    local name=$1 version=$2 linked=$3
+    guest pacman -Q "$name" | grep -Fx "$name $version"
+    guest cat "/usr/share/$name/build.uid" | grep -Fx "$uid"
+    guest cat "/usr/share/$name/library.version" | grep -Fx "$linked"
+}
+plan_has_build() {
+    local json=$1 name=$2 version=$3 prior=$4 rebuild=$5
+    jq -e --arg name "$name" --arg version "$version" --argjson prior "$prior" --argjson rebuild "$rebuild" --arg lib "$library" '
+        def build: .kind.rebuildAurPackage // .kind.buildAurPackage;
+        [.actions[] | select((build | .package.name) == $name)] as $actions
+        | ($actions | length) == 1
+          and ($actions[0].kind | has("rebuildAurPackage") == $rebuild)
+          and ($actions[0] | build | .package.source == "aur" and .candidateVersion == $version
+              and (.dependencies.runtime | index($lib)) != null
+              and (has("rebuildFrom") == $rebuild))
+          and ($actions[0].preconditions | any(.packageVersion.package.name == $name and .packageVersion.expected == $prior))
+    ' "$json" >/dev/null
+}
+review_signature() {
+    local log=$1 source=$2
+    grep -Fq 'Proceed to review?' "$log"
+    grep -Fq 'PKGBUILD' "$log"
+    grep -Fq 'Accept changes?' "$log"
+    awk -v source="$source" '
+        /Verifying source file signatures with gpg/ { verifying = 1; next }
+        verifying && index($0, source " ... Passed") { passed = 1; exit }
+        END { exit !passed }
+    ' "$log"
+}
+
+local_dek plan --json > "$evidence/install-plan.json"
+plan_has_build "$evidence/install-plan.json" "$managed" 1-1 null false
+guest sudo -n "$guest_command" snapshot > "$evidence/before-no-tty"
+if local_dek apply > "$evidence/no-tty.log" 2>&1; then
+    printf 'Expected a pending AUR action when no terminal was supplied\n' >&2
+    exit 1
+fi
+no_tty_run=$(run_id "$evidence/no-tty.log")
+grep -Fq '交互终端' "$evidence/no-tty.log"
+local_dek status --run "$no_tty_run" --json > "$evidence/no-tty-status.json"
+jq -e --arg run "$no_tty_run" --arg name "$managed" '
+    .run_id == $run and (.finished | not) and (.actions | length) == 1
+    and (.actions[0] | .action.kind.buildAurPackage.package.name == $name and .result == "pending" and .attempt == 0)
+' "$evidence/no-tty-status.json" >/dev/null
+guest sudo -n "$guest_command" snapshot > "$evidence/after-no-tty"
+cmp "$evidence/before-no-tty" "$evidence/after-no-tty"
+
+# The ordinary command picks up the pending run once it can present a real terminal.
+local_tty apply > "$evidence/install.log" 2>&1
+[[ $(run_id "$evidence/install.log") == "$no_tty_run" ]]
+review_signature "$evidence/install.log" "$managed-1.c"
+package_state "$managed" 1-1 1-1
+local_dek status --run "$no_tty_run" --json > "$evidence/install-status.json"
+jq -e '.finished and .actions[0].result == {verified:{changed:true}} and .actions[0].attempt == 1' \
+    "$evidence/install-status.json" >/dev/null
+
+guest "$guest_command" publish "$managed" 2 > "$evidence/publish-version-2.log"
+local_dek plan --upgrade --json > "$evidence/aur-upgrade-plan.json"
+plan_has_build "$evidence/aur-upgrade-plan.json" "$managed" 2-1 '"1-1"' false
+upgrade_id=$(jq -er '.plan_id' "$evidence/aur-upgrade-plan.json")
+local_tty apply --plan "$upgrade_id" > "$evidence/aur-upgrade.log" 2>&1
+review_signature "$evidence/aur-upgrade.log" "$managed-2.c"
+package_state "$managed" 2-1 1-1
+
+# New metadata has an official upgrade. Exercise both preflight failures before
+# making the new remote review or allowing any package transaction.
+guest sudo -n ln -sfn "$root/official/b" "$root/official/current"
+guest sudo -n "$guest_command" snapshot > "$evidence/before-preflight"
+reject_missing() {
+    local label=$1 tool=$2 text=$3 result=0
+    guest sudo -n mv -- "$tool" "$tool.dek-fixture"
+    local_dek plan --upgrade --rebuild-aur --json > "$evidence/$label.json" 2> "$evidence/$label.log" || result=$?
+    guest sudo -n mv -- "$tool.dek-fixture" "$tool"
+    [[ "$result" -ne 0 && ! -s "$evidence/$label.json" ]]
+    grep -F -- "$text" "$evidence/$label.log"
+}
+reject_missing missing-helper /usr/local/bin/paru '缺少 AUR helper paru'
+reject_missing missing-tool /usr/bin/make 'AUR 构建工具：make'
+guest sudo -n "$guest_command" snapshot > "$evidence/after-preflight"
+cmp "$evidence/before-preflight" "$evidence/after-preflight"
+
+# The independent SSH terminal must use the same privileged account as the
+# execution endpoint. Only this disposable guest grants the fixture endpoint sudo.
+guest sudo -n "$guest_command" remote-endpoint
+mkdir -- "$evidence/bin" "$evidence/repo"
+cat > "$evidence/bin/ssh" <<'SH'
+#!/bin/sh
+printf '%s\n' "$1" >> "$DEK_AUR_TEST_CHANNELS"
+exec "$DEK_AUR_TEST_REAL_SSH" -F "$DEK_AUR_TEST_SSH_CONFIG" "$@"
+SH
+chmod 0700 "$evidence/bin/ssh"
+target_id=$(<"$run/instance")
+jq -n --arg target "$target_id" '{
+    schemaVersion:1, hosts:{arch:{entry:"entry.json",target:{ssh:"dek-vm"},targetId:$target}}
+}' > "$evidence/repo/dek.json"
+jq -n --arg first "$managed" --arg second "$failing" '{
+    schemaVersion:1, imports:[], options:[{path:"dek.arch.aurPackages",value:[$first,$second]}]
+}' > "$evidence/repo/entry.json"
+remote=(env "XDG_CACHE_HOME=$evidence/cache" "PATH=$evidence/bin:$PATH" "$manager" --repo "$evidence/repo" -H arch)
+"${remote[@]}" plan --upgrade --rebuild-aur --json > "$evidence/rebuild-plan.json"
+plan_has_build "$evidence/rebuild-plan.json" "$managed" 2-1 '"2-1"' true
+plan_has_build "$evidence/rebuild-plan.json" "$failing" 1-1 null false
+jq -e --arg lib "$library" '
+    .actions[0].kind.repositoryTransaction | .scope == "upgrade" and (.changes | length) == 1
+    and (.changes[0].upgrade | .installedVersion == "1-1" and .candidate.name == $lib and .candidate.version == "2-1")
+' "$evidence/rebuild-plan.json" >/dev/null
+rebuild_id=$(jq -er '.plan_id' "$evidence/rebuild-plan.json")
+guest sudo -n touch "/tmp/$failing.fail-build"
+if python3 "$tty" "${remote[@]}" apply --plan "$rebuild_id" --interactive > "$evidence/rebuild-failure.log" 2>&1; then
+    printf 'Expected the second AUR build to fail after the official upgrade\n' >&2
+    exit 1
+fi
+grep -Fq "fixture build failure for $failing" "$evidence/rebuild-failure.log"
+failed_run=$(run_id "$evidence/rebuild-failure.log")
+"${remote[@]}" status --run "$failed_run" --json > "$evidence/rebuild-failed-status.json"
+package_state "$managed" 2-1 2-1
+! guest pacman -Q "$failing"
+guest pacman -Q "$library" | grep -Fx "$library 2-1"
+guest sudo -n cat "$root/repository-commits" > "$evidence/repository-commits.failed"
+[[ $(<"$evidence/repository-commits.failed") == "$library 2-1" ]]
+guest cat "$build_attempts" > "$evidence/build-attempts.failed"
+printf '%s\n' "$managed 1-1 $uid" "$managed 2-1 $uid" "$managed 2-1 $uid" "$failing 1-1 $uid" \
+    > "$evidence/build-attempts.expected"
+cmp "$evidence/build-attempts.expected" "$evidence/build-attempts.failed"
+
+jq -e --arg run "$failed_run" --arg plan "$rebuild_id" --arg first "$managed" --arg second "$failing" '
+    .run_id == $run and .plan_id == $plan and (.finished | not) and (.actions | length) == 3
+    and (.actions[0] | .action.kind.repositoryTransaction.scope == "upgrade" and .attempt == 1 and .result == {verified:{changed:true}})
+    and (.actions[1] | .action.kind.rebuildAurPackage.package.name == $first and .attempt == 1 and .result == {verified:{changed:true}})
+    and (.actions[2] | .action.kind.buildAurPackage.package.name == $second and .attempt == 1 and (.result.failed.message | contains($second)))
+' "$evidence/rebuild-failed-status.json" >/dev/null
+
+guest sudo -n rm -- "/tmp/$failing.fail-build"
+python3 "$tty" "${remote[@]}" apply --run "$failed_run" --interactive > "$evidence/resume.log" 2>&1
+[[ $(run_id "$evidence/resume.log") == "$failed_run" ]]
+"${remote[@]}" status --run "$failed_run" --json > "$evidence/resumed-status.json"
+jq -e --arg run "$failed_run" --arg plan "$rebuild_id" '
+    .run_id == $run and .plan_id == $plan and .finished and (.actions | map(.attempt)) == [1,1,2]
+    and all(.actions[]; .result == {verified:{changed:true}})
+' "$evidence/resumed-status.json" >/dev/null
+package_state "$failing" 1-1 2-1
+guest cat "$build_attempts" > "$evidence/build-attempts.resumed"
+printf '%s\n' "$failing 1-1 $uid" >> "$evidence/build-attempts.expected"
+cmp "$evidence/build-attempts.expected" "$evidence/build-attempts.resumed"
+guest sudo -n cat "$root/repository-commits" > "$evidence/repository-commits.resumed"
+cmp "$evidence/repository-commits.failed" "$evidence/repository-commits.resumed"
+[[ $(grep -c -x -- '-tt' "$DEK_AUR_TEST_CHANNELS") == 3 ]]
+guest sudo -n cat /var/log/pacman.log > "$evidence/pacman.log"
+guest sudo -n journalctl -u aur-vm-fixture --output=short-precise > "$evidence/aur-http.log"
+[[ $(grep -c -F "[ALPM] upgraded $library (1-1 -> 2-1)" "$evidence/pacman.log") == 1 ]]
+
+printf '%s\n' '{"schemaVersion":1,"imports":[],"options":[]}' > "$evidence/repo/entry.json"
+"${remote[@]}" plan --json > "$evidence/unmanaged-plan.json"
+jq -e '.actions == []' "$evidence/unmanaged-plan.json" >/dev/null
+"${remote[@]}" apply > "$evidence/unmanaged-apply.log"
+package_state "$managed" 2-1 2-1
+package_state "$failing" 1-1 2-1
+guest cat "$build_attempts" > "$evidence/build-attempts.unmanaged"
+cmp "$evidence/build-attempts.resumed" "$evidence/build-attempts.unmanaged"
+printf 'Verified signed sources, non-root builds, upgrade and rebuild, missing tools, SSH replay and unmanagement.\n'
+"$vm" finish "$run" passed
+run=''

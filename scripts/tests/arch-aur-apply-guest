@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Entry points for the disposable signed AUR execution fixture.
+set -euo pipefail
+grep -qx 'ID=arch' /etc/os-release
+[[ -e /run/cloud-init/instance-data.json ]]
+export LC_ALL=C SOURCE_DATE_EPOCH=1700000000
+
+root=/var/tmp/dek-aur-apply
+aur=/home/dek/aur-vm-fixture
+library=dek-fixture-aur-lib
+
+publish() {
+    [[ $(id -un) == dek ]]
+    local name=$1 version=$2
+    "$aur/publish" "$name" "$version"
+    local checkout="$aur/work/$name" served="$aur/http/$name"
+    python3 - "$checkout/PKGBUILD" "$aur/http/$name.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+pkgbuild, rpc = map(Path, sys.argv[1:])
+text = pkgbuild.read_text()
+start = '    id -u > "$srcdir/build.uid"\n'
+assert text.count(start) == 1
+text = text.replace(start, start + '''    printf '%s %s %s\\n' "$pkgname" "$pkgver-$pkgrel" "$(id -u)" >> "$HOME/aur-vm-fixture/build-attempts"
+    printf '%s\\n' '#include <stdio.h>' 'extern const char *dek_aur_fixture_version(void);' \\
+        'int main(void) { puts(dek_aur_fixture_version()); }' > "$srcdir/library-probe.c"
+    gcc -o "$srcdir/library-probe" "$srcdir/library-probe.c" -ldek_aur_fixture
+    "$srcdir/library-probe" > "$srcdir/library.version"
+''')
+receipt = '    install -Dm644 "$srcdir/build.uid" "$pkgdir/usr/share/$pkgname/build.uid"\n'
+assert text.count(receipt) == 1
+text = text.replace(receipt, receipt + '''    install -Dm644 "$srcdir/library.version" "$pkgdir/usr/share/$pkgname/library.version"
+''')
+pkgbuild.write_text(text + "\ndepends+=('dek-fixture-aur-lib')\n")
+metadata = json.loads(rpc.read_text())
+metadata['Depends'].append('dek-fixture-aur-lib')
+new = rpc.with_suffix('.json.new')
+new.write_text(json.dumps(metadata))
+new.replace(rpc)
+PY
+    (cd "$checkout" && makepkg --printsrcinfo > .SRCINFO)
+    git -C "$checkout" add PKGBUILD .SRCINFO
+    git -C "$checkout" commit --quiet -m "Link $name $version against the repository fixture"
+    git -C "$checkout" push --quiet "$served" master
+    git -C "$served" update-server-info
+    git -C "$served" rev-parse HEAD
+}
+
+fixture_archive() {
+    local source=$1 directory=$2 version=$3
+    local archive="$directory/$library-$version-x86_64.pkg.tar.zst"
+    install -d -m 0755 "$source/usr/lib"
+    printf 'const char *dek_aur_fixture_version(void) { return "%s"; }\n' "$version" > "$source/library.c"
+    gcc -c -o "$source/library.o" "$source/library.c"
+    ar rcs "$source/usr/lib/libdek_aur_fixture.a" "$source/library.o"
+    {
+        printf 'pkgname = %s\npkgver = %s\npkgdesc = dek AUR fixture static library\n' "$library" "$version"
+        printf 'url = https://example.invalid\nbuilddate = %s\nsize = 1\narch = x86_64\n' "$SOURCE_DATE_EPOCH"
+    } > "$source/.PKGINFO"
+    tar --mtime="@$SOURCE_DATE_EPOCH" --sort=name --owner=0 --group=0 --numeric-owner \
+        -cf - -C "$source" .PKGINFO usr | zstd -q -o "$archive"
+    gpg --batch --local-user "$signer" --detach-sign "$archive"
+}
+
+initialize() {
+    [[ $(id -u) == 0 ]]
+    install -d -m 0755 "$root"/{official/a,official/b,hooks,repo} /etc/dek
+    install -d -m 0700 "$root"/{source,signing,state,cache} /var/lib/dek
+    export GNUPGHOME="$root/signing"
+    gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-generate-key 'Dek AUR Official Fixture <aur-official@example.invalid>' ed25519 sign 0
+    signer=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+    gpg --batch --export "$signer" > "$root/source/official-key.gpg"
+    pacman-key --add "$root/source/official-key.gpg"
+    pacman-key --lsign-key "$signer"
+
+    fixture_archive "$root/source" "$root/official/a" 1-1
+    fixture_archive "$root/source" "$root/official/b" 2-1
+    for stage in a b; do
+        (cd "$root/official/$stage" && repo-add --sign --key "$signer" fixture.db.tar.gz ./*.pkg.tar.zst &&
+            sha256sum -- fixture.db{,.sig} ./*.pkg.tar.zst{,.sig})
+    done
+    unset GNUPGHOME
+    ln -s "$root/official/a" "$root/official/current"
+    cat > /etc/pacman.conf <<CONF
+[options]
+Architecture = auto
+SigLevel = Required TrustedOnly
+LocalFileSigLevel = Optional TrustedOnly
+HookDir = $root/hooks
+DownloadUser = alpm
+[fixture]
+Server = file://$root/official/current
+CONF
+    pacman -Syy --noconfirm
+    sed 's/^LocalFileSigLevel.*/LocalFileSigLevel = Required TrustedOnly/' /etc/pacman.conf > "$root/source/seed.conf"
+    pacman --config "$root/source/seed.conf" -U --noconfirm "$root/official/a/$library-1-1-x86_64.pkg.tar.zst"
+    printf 'dek\n' > /etc/dek/aur-build-user
+    chmod 0644 /etc/dek/aur-build-user
+
+    cat > "$root/hooks/97-dek-aur-official-upgrade.hook" <<HOOK
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = $library
+
+[Action]
+Description = Recording the fixture library upgrade under the live lock
+When = PostTransaction
+Exec = /usr/bin/bash $root/official-receipt
+HOOK
+    cat > "$root/official-receipt" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -e /var/lib/pacman/db.lck ]]
+pacman -Q dek-fixture-aur-lib >> /var/tmp/dek-aur-apply/repository-commits
+SH
+    : > "$root/repository-commits"
+    runuser -u dek -- touch "$aur/build-attempts"
+    runuser -u dek -- "$0" publish dek-aur-fixture 1
+    runuser -u dek -- "$0" publish dek-aur-missing 1
+    cat > "$root/repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"arch":{"entry":"entry.json","target":{"local":true}}}}
+JSON
+    printf '%s\n' '{"schemaVersion":1,"imports":[],"options":[{"path":"dek.arch.aurPackages","value":["dek-aur-fixture"]}]}' > "$root/repo/entry.json"
+}
+
+snapshot() {
+    [[ ! -e /var/lib/pacman/db.lck ]]
+    find /var/lib/pacman/local /var/lib/pacman/sync -type f -print0 | sort -z | xargs -0r sha256sum
+    sha256sum "$root/repository-commits" "$aur/build-attempts"
+}
+
+remote_endpoint() {
+    [[ $(id -u) == 0 ]]
+    mv /usr/local/bin/dek /usr/local/bin/dek-native
+    cat > /usr/local/bin/dek <<'SH'
+#!/bin/sh
+exec sudo -n /usr/local/bin/dek-native "$@"
+SH
+    chmod 0755 /usr/local/bin/dek
+}
+
+case "$1" in
+    initialize) initialize ;;
+    publish) shift; publish "$@" ;;
+    snapshot) snapshot ;;
+    remote-endpoint) remote_endpoint ;;
+    *) exit 2 ;;
+esac

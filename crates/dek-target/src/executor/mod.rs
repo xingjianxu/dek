@@ -8,7 +8,8 @@ use std::{
 };
 
 use dek_core::{
-    Action, ActionKind, InputObservation, Observation, Plan, PlanMode, ResourceKind, UnitId,
+    Action, ActionKind, DesiredResource, InputObservation, Observation, PackageSource, Plan,
+    PlanMode, Presence, ResourceKind, UnitId,
 };
 use thiserror::Error;
 
@@ -144,6 +145,14 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         }
     }
 
+    pub fn with_local_terminal(self) -> Self {
+        if crate::terminal::available() {
+            self.with_terminal(&crate::terminal::run_locally)
+        } else {
+            self
+        }
+    }
+
     pub(crate) fn with_terminal(mut self, terminal: &'a TerminalRunner<'a>) -> Self {
         self.terminal = Some(terminal);
         self
@@ -259,7 +268,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         planner::check_compatibility(self.registry, &reviewed.plan)?;
         validate_order(&reviewed.plan)?;
 
-        let upgrade = (reviewed.plan.mode() == PlanMode::Upgrade)
+        let upgrade = (reviewed.plan.mode().repository_upgrade())
             .then(|| reviewed.plan.actions.first().expect("upgrade transaction"));
         let already_upgraded = if let Some(action) = upgrade
             && let Application::Resume(run) = &mut application
@@ -278,7 +287,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                     .verify(&action.kind)
                     .map_err(|error| ExecutionError::action(action, error.0))?
                 {
-                    let fresh = self.replan(binding, reviewed, PlanMode::Upgrade)?;
+                    let fresh = self.replan(binding, reviewed, reviewed.plan.mode())?;
                     return self.replacement(
                         binding,
                         reviewed,
@@ -293,8 +302,18 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         } else {
             false
         };
-        let mode = if already_upgraded {
+        let managed_aur = reviewed.resources.resources.iter().any(|resource| {
+            matches!(&resource.desired, DesiredResource::Package(package)
+                if package.package.source == PackageSource::Aur
+                    && package.state == Presence::Present)
+        });
+        let post_upgrade = if managed_aur {
+            reviewed.plan.mode().after_repository_upgrade()
+        } else {
             PlanMode::Normal
+        };
+        let mode = if already_upgraded {
+            post_upgrade
         } else {
             reviewed.plan.mode()
         };
@@ -310,7 +329,10 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             Application::New { .. } => None,
         };
         let (live, conflict) = match match_scope(&reviewed.plan, &fresh, resumed) {
-            Scope::Reviewed { live, conflict } if upgrade.is_none() || conflict.is_none() => {
+            Scope::Reviewed { live, conflict }
+                if (upgrade.is_none() || conflict.is_none())
+                    && self.dropped_aur_actions_satisfied(&reviewed.plan, &live)? =>
+            {
                 (live, conflict)
             }
             _ => {
@@ -430,10 +452,10 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             if let Some(input) = changed_input(&reviewed.plan, &mut observe_input)? {
                 return Ok(ExecutionOutcome::review(ReviewReason::InputChanged {
                     input,
-                    mode: PlanMode::Normal,
+                    mode: post_upgrade,
                 }));
             }
-            let fresh = self.replan(binding, reviewed, PlanMode::Normal)?;
+            let fresh = self.replan(binding, reviewed, post_upgrade)?;
             let Scope::Reviewed {
                 live,
                 conflict: None,
@@ -441,6 +463,9 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             else {
                 return self.replacement_after_upgrade(binding, reviewed, &fresh, &run);
             };
+            if !self.dropped_aur_actions_satisfied(&reviewed.plan, &live)? {
+                return self.replacement_after_upgrade(binding, reviewed, &fresh, &run);
+            }
             self.validate_batches(reviewed, &live)?;
             self.run_actions(&run, binding, reviewed, &live, None, None)?;
         } else {
@@ -453,21 +478,37 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         )))
     }
 
+    /// An omitted build can also mean the repository now advertises an older
+    /// candidate. Only drop it from the approved scope if the local goal holds.
+    fn dropped_aur_actions_satisfied(
+        &self,
+        plan: &Plan,
+        live: &BTreeSet<&str>,
+    ) -> Result<bool, ExecutionError> {
+        for action in &plan.actions {
+            if matches!(
+                action.kind,
+                ActionKind::BuildAurPackage { .. } | ActionKind::RebuildAurPackage { .. }
+            ) && !live.contains(action.id.as_str())
+                && self
+                    .backend(action)?
+                    .inspect_action(action)
+                    .map_err(|error| ExecutionError::action(action, error.0))?
+                    != ActionReadiness::Satisfied
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn replan(
         &self,
         binding: PlanBinding<'_>,
         reviewed: &ReviewedPlan,
         mode: PlanMode,
     ) -> Result<Plan, PlanError> {
-        planner::plan_for_host_with_contents_mode(
-            self.registry,
-            binding.repository_id,
-            binding.logical_host,
-            &reviewed.resources,
-            &reviewed.plan.used_inputs,
-            &reviewed.contents,
-            mode,
-        )
+        planner::recheck_plan(self.registry, binding.logical_host, reviewed, mode)
     }
 
     fn replacement(
@@ -1033,7 +1074,8 @@ fn action_kind(action: &ActionKind) -> ResourceKind {
         ActionKind::InstallPackage { .. }
         | ActionKind::RemovePackage { .. }
         | ActionKind::RepositoryTransaction(_)
-        | ActionKind::BuildAurPackage { .. } => ResourceKind::Package,
+        | ActionKind::BuildAurPackage { .. }
+        | ActionKind::RebuildAurPackage { .. } => ResourceKind::Package,
         ActionKind::DeployUnit { .. }
         | ActionKind::ReloadManager(_)
         | ActionKind::SetUnitEnabled { .. }

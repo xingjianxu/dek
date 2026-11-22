@@ -31,7 +31,9 @@ pub fn write_plan(
         } else {
             writeln!(out, "{label}  [{}]", action.id)?;
         }
-        if let ActionKind::BuildAurPackage { dependencies, .. } = &action.kind {
+        if let ActionKind::BuildAurPackage { dependencies, .. }
+        | ActionKind::RebuildAurPackage { dependencies, .. } = &action.kind
+        {
             for (label, packages) in [
                 ("运行依赖", &dependencies.runtime),
                 ("构建依赖", &dependencies.build),
@@ -92,6 +94,11 @@ pub(crate) fn description(action: &ActionKind) -> String {
             package.name,
             candidate_version.as_deref().unwrap_or("候选版本待核查"),
         ),
+        ActionKind::RebuildAurPackage {
+            package,
+            candidate_version,
+            ..
+        } => format!("重建 AUR 软件包 {} ({candidate_version})", package.name),
         ActionKind::DeployUnit { unit, .. } => format!("部署 unit {}", unit_name(unit)),
         ActionKind::ReloadManager(scope) => format!("重载 systemd manager {}", scope_name(scope)),
         ActionKind::SetUnitEnabled { unit, enabled } => {

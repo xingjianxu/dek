@@ -84,7 +84,7 @@ pub fn apply_local_with_loader(
         None
     };
 
-    let executor = Executor::new(&store, registry);
+    let executor = Executor::new(&store, registry).with_local_terminal();
     let started = |id: &str| {
         if resume.is_some() {
             writeln!(out, "恢复已审阅的执行 {id}")?;
@@ -135,9 +135,6 @@ pub fn apply_local_with_loader(
         } => {
             let plan = match replacement {
                 Some(plan) => *plan,
-                None if resume.is_some() => {
-                    return Err(format!("{reason}。请运行 dek plan 重新审阅").into());
-                }
                 None => crate::applying::create_plan(
                     repo,
                     selector,
@@ -210,7 +207,7 @@ pub(crate) fn write_finished(
 }
 
 pub(crate) fn needs_upgrade_review(plan: &Plan) -> bool {
-    plan.mode() == PlanMode::Upgrade
+    plan.mode().repository_upgrade()
 }
 
 pub(crate) fn write_upgrade_review(

@@ -139,6 +139,9 @@ enum Command {
         /// 预览完整的 Arch 滚动升级。
         #[arg(long)]
         upgrade: bool,
+        /// 重新构建已安装的受管 AUR 包。
+        #[arg(long)]
+        rebuild_aur: bool,
         /// 本机模式使用指定的私有状态目录。默认 /var/lib/dek。
         #[cfg(target_os = "linux")]
         #[arg(long, value_name = "目录")]
@@ -405,9 +408,6 @@ fn run_command<'target>(
                     interactive,
                 );
             }
-            if interactive {
-                return Err("--interactive 用于 SSH 目标".into());
-            }
             let registry = local_target()?;
             let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
             crate::applying::apply_local(
@@ -511,6 +511,7 @@ fn run_command<'target>(
         Command::Plan {
             json,
             upgrade,
+            rebuild_aur,
             #[cfg(target_os = "linux")]
             state_dir,
         } => {
@@ -518,10 +519,11 @@ fn run_command<'target>(
             let selection = HostSelection::from_arg(cli.host)?;
             let (host, entry) = repo.select_host(selection.selector())?;
             let cache = normal_cache(&repo)?;
-            let mode = if upgrade {
-                PlanMode::Upgrade
-            } else {
-                PlanMode::Normal
+            let mode = match (upgrade, rebuild_aur) {
+                (false, false) => PlanMode::Normal,
+                (true, false) => PlanMode::Upgrade,
+                (false, true) => PlanMode::RebuildAur,
+                (true, true) => PlanMode::UpgradeRebuildAur,
             };
             if let Target::Ssh(alias) = &entry.target {
                 #[cfg(target_os = "linux")]

@@ -220,6 +220,7 @@ pub trait Backend {
         &self,
         _resources: &ResourceSet,
         _mode: PlanMode,
+        _reviewed: Option<&[Action]>,
     ) -> Result<Option<PlannedPackages>, BackendError> {
         Ok(None)
     }
@@ -280,7 +281,6 @@ pub trait Backend {
             ActionKind::InstallPackage { .. }
             | ActionKind::RemovePackage { .. }
             | ActionKind::RepositoryTransaction(_)
-            | ActionKind::BuildAurPackage { .. }
             | ActionKind::ReloadManager(_) => true,
             ActionKind::NotifyService { .. } => prior != PriorAttempt::NotificationJobFailed,
             _ => false,

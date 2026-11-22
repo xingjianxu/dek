@@ -180,8 +180,9 @@ impl Backend for PacmanBackend {
         &self,
         resources: &ResourceSet,
         mode: PlanMode,
+        reviewed: Option<&[Action]>,
     ) -> Result<Option<PlannedPackages>, BackendError> {
-        self.plan_package_set(resources, mode)
+        self.plan_package_set(resources, mode, reviewed)
     }
 
     fn validate_action(&self, action: &Action) -> Result<(), BackendError> {
@@ -189,8 +190,8 @@ impl Backend for PacmanBackend {
             ActionKind::RepositoryTransaction(_) => {
                 transaction::reviewed_transaction(action).map(|_| ())
             }
-            ActionKind::BuildAurPackage { .. } => {
-                Err(BackendError("当前后端只支持 AUR 规划".into()))
+            ActionKind::BuildAurPackage { .. } | ActionKind::RebuildAurPackage { .. } => {
+                aur::reviewed_build(action).map(|_| ())
             }
             _ => reviewed_removal(action).map(|_| ()),
         }
@@ -214,6 +215,12 @@ impl Backend for PacmanBackend {
                 self.inspect_repository(transaction)
             };
         }
+        if matches!(
+            action.kind,
+            ActionKind::BuildAurPackage { .. } | ActionKind::RebuildAurPackage { .. }
+        ) {
+            return self.inspect_aur(action);
+        }
         let (package, version) = reviewed_removal(action)?;
         Ok(match self.installed(package)? {
             None => ActionReadiness::Satisfied,
@@ -225,7 +232,20 @@ impl Backend for PacmanBackend {
         })
     }
 
+    fn requires_terminal(&self, action: &Action) -> bool {
+        matches!(
+            action.kind,
+            ActionKind::BuildAurPackage { .. } | ActionKind::RebuildAurPackage { .. }
+        )
+    }
+
     fn execute(&self, context: &ActionContext<'_>) -> Result<(), BackendError> {
+        if matches!(
+            context.action.kind,
+            ActionKind::BuildAurPackage { .. } | ActionKind::RebuildAurPackage { .. }
+        ) {
+            return self.execute_aur(context).map(|_| ());
+        }
         let (package, version) = reviewed_removal(context.action)?;
         self.preview_removal(package, version)?;
         let guard = removal::prepare(package, version)?;
@@ -249,11 +269,26 @@ impl Backend for PacmanBackend {
         Ok(())
     }
 
+    fn execute_changed(&self, context: &ActionContext<'_>) -> Result<bool, BackendError> {
+        match context.action.kind {
+            ActionKind::BuildAurPackage { .. } | ActionKind::RebuildAurPackage { .. } => {
+                self.execute_aur(context)
+            }
+            _ => self.execute(context).map(|()| true),
+        }
+    }
+
     fn verify(&self, action: &ActionKind) -> Result<bool, BackendError> {
         if let ActionKind::RepositoryTransaction(transaction) = action {
             return self
                 .inspect_repository(transaction)
                 .map(|result| result == ActionReadiness::Satisfied);
+        }
+        if matches!(
+            action,
+            ActionKind::BuildAurPackage { .. } | ActionKind::RebuildAurPackage { .. }
+        ) {
+            return self.verify_aur(action);
         }
         self.installed(removal_package(action)?)
             .map(|version| version.is_none())

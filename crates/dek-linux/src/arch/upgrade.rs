@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use dek_core::{
-    ActionKind, DesiredResource, PackageId, PackageSource, PlanMode, Precondition, Presence,
-    RepositoryPackageChange, RepositoryTransaction, ResourceId, ResourceSet,
+    Action, ActionKind, DesiredResource, PackageId, PackageSource, PlanMode, Precondition,
+    Presence, RepositoryPackageChange, RepositoryTransaction, ResourceId, ResourceSet,
 };
 use dek_target::backend::{Backend, BackendError, PlannedAction, PlannedPackages};
 
@@ -13,6 +13,7 @@ impl PacmanBackend {
         &self,
         resources: &ResourceSet,
         mode: PlanMode,
+        reviewed: Option<&[Action]>,
     ) -> Result<Option<PlannedPackages>, BackendError> {
         let packages = resources
             .resources
@@ -39,13 +40,13 @@ impl PacmanBackend {
             })
             .map(|desired| desired.package.name.clone())
             .collect::<BTreeSet<_>>();
-        let resolved = if targets.is_empty() && mode == PlanMode::Normal {
+        let resolved = if targets.is_empty() && !mode.repository_upgrade() {
             None
         } else {
             let targets = targets.into_iter().collect::<Vec<_>>();
             let requested = targets.join(", ");
             Some(
-                alpm::preview(&installed, targets, mode == PlanMode::Upgrade).map_err(|error| {
+                alpm::preview(&installed, targets, mode.repository_upgrade()).map_err(|error| {
                     if requested.is_empty() {
                         error
                     } else {
@@ -68,7 +69,7 @@ impl PacmanBackend {
                 let name = desired.package.name.as_str();
                 (desired.package.source == PackageSource::Aur
                     && desired.state == Presence::Present
-                    && (full || !installed.contains_key(name)))
+                    && (full || mode != PlanMode::Normal || !installed.contains_key(name)))
                 .then_some(name)
             })
             .collect::<BTreeSet<_>>();
@@ -117,29 +118,16 @@ impl PacmanBackend {
                         planned.actions.insert(id, Vec::new());
                         continue;
                     };
-                    if let Some(version) = version
-                        && !aur::installed_is_older(version, &candidate.version)?
-                    {
-                        planned.actions.insert(id, Vec::new());
-                        continue;
-                    }
-                    let reason = match version {
-                        Some(version) => format!(
-                            "受管 AUR 包 {name} 已安装 {version}，候选为 {}",
-                            candidate.version
-                        ),
-                        None => format!("受管 AUR 包 {name} 尚未安装"),
-                    };
-                    vec![PlannedAction {
-                        kind: ActionKind::BuildAurPackage {
-                            package: package.clone(),
-                            candidate_version: Some(candidate.version),
-                            dependencies: candidate.dependencies,
-                        },
-                        reason,
+                    aur::plan_build(
+                        package,
+                        version,
+                        candidate,
+                        mode.rebuild_aur(),
+                        reviewed,
                         preconditions,
-                        content_changed: false,
-                    }]
+                    )?
+                    .into_iter()
+                    .collect()
                 }
                 (PackageSource::Aur, _) => Vec::new(),
             };
