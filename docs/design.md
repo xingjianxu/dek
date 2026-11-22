@@ -311,6 +311,8 @@ directory "/srv/research", owner: "alice", group: "research", mode: "0750"
 
 用户 SSH 登录公钥可通过 `users.users.<name>.openssh.authorizedKeys.keys` 直接声明，也可通过 `keyFiles` 引用仓库中的公钥文件。目标端仅维护该用户的受管授权条目，保留手工添加的其他条目；显式配置空列表会清除受管集合，省略整个资源则遵循停止管理规则。若需让 Alice 持有客户端私钥以连接其他机器，则将该私钥作为加密文件管理；SSH 服务端自身的主机密钥另对应 `services.openssh.hostKeys`。
 
+Linux 后端按本地账户的 home 管理 `~/.ssh/authorized_keys`，用一对 dek 标记界定受管块。计划从已审阅的 `keyFiles` 内容和内联公钥生成受管块摘要，核对手工条目和路径，再由执行阶段使用同一批字节原子发布。标记外的内容保留原字节。标记损坏、文件路径不安全或公钥与手工条目重复时需先修正冲突，避免在保留手工条目时绕过其 OpenSSH 授权选项。
+
 **配置示例：** 仓库根目录存放 `keys/alice.pub` 和 `secrets/gitDeploy.age`，以下相对路径以 `hosts/server/default.rb` 为基准。目标机需预先存放管理员指定的解密私钥（age identity）。示例假定用户 `alice` 与组 `research` 已按 6.2 节声明。
 
 ```ruby

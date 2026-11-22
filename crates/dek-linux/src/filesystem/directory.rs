@@ -452,6 +452,22 @@ fn set_attributes(fd: &DirectoryFd, initial: &Stat, attrs: &Attributes) -> io::R
     Ok(updated)
 }
 
+pub(crate) fn create_owned_directory(
+    target: &TargetPath,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+) -> io::Result<Stat> {
+    create(
+        target,
+        &Attributes {
+            uid: Some(uid),
+            gid: Some(gid),
+            mode: Some(mode),
+        },
+    )
+}
+
 fn create(target: &TargetPath, attrs: &Attributes) -> io::Result<Stat> {
     let stage = StagingDirectory::new(target)?;
     let name = "directory";

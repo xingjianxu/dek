@@ -22,11 +22,12 @@ impl Default for Database {
     }
 }
 
-pub(super) struct LocalUser {
-    pub(super) uid: u32,
-    pub(super) gid: u32,
+#[derive(Clone)]
+pub(crate) struct LocalUser {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
     pub(super) description: String,
-    pub(super) home: String,
+    pub(crate) home: String,
     pub(super) shell: String,
 }
 
@@ -54,6 +55,23 @@ impl Database {
 }
 
 impl Snapshot<'_> {
+    pub(super) fn ensure_unique_ssh_home(
+        &self,
+        name: &str,
+        home: &Path,
+    ) -> Result<(), BackendError> {
+        if let Some((other, _)) = self
+            .users
+            .iter()
+            .find(|(other, account)| *other != name && Path::new(&account.home) == home)
+        {
+            return Err(BackendError(format!(
+                "用户 {name:?} 与 {other:?} 共用授权目录"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn user(
         &self,
         name: &str,

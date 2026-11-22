@@ -5,6 +5,7 @@ mod directory;
 mod validation;
 
 pub use directory::DirectoryBackend;
+pub(crate) use directory::create_owned_directory;
 pub use validation::{FileValidationGroup, ValidationInput};
 
 use std::{
@@ -356,7 +357,7 @@ fn hash_bytes(file: &mut File) -> io::Result<ContentDigest> {
     Ok(ContentDigest(format!("sha256:{:x}", sha.finalize())))
 }
 
-fn digest(bytes: &[u8]) -> ContentDigest {
+pub(crate) fn digest(bytes: &[u8]) -> ContentDigest {
     ContentDigest(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
