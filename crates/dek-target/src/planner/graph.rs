@@ -67,10 +67,16 @@ pub(super) fn prepare<'a>(
             record_capability(&mut used, capability, attributes);
         }
 
+        let prerequisites = backend
+            .resource_dependencies(&resource.desired, resources)
+            .map_err(|err| {
+                resource_error(registry, resource, format!("validate dependencies: {err}"))
+            })?;
         let dependencies = resource
             .depends_on
             .iter()
             .cloned()
+            .chain(prerequisites)
             .map(|dependency| normalize_id(registry, resource, dependency))
             .collect::<Result<_, _>>()?;
         graph.insert(

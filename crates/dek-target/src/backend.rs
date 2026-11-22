@@ -75,6 +75,15 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Validate related declarations and report prerequisites inferred on this target.
+    fn resource_dependencies(
+        &self,
+        _resource: &DesiredResource,
+        _managed: &ResourceSet,
+    ) -> Result<Vec<ResourceId>, BackendError> {
+        Ok(Vec::new())
+    }
+
     /// Observe actual state in the same typed form used for reviewed preconditions.
     fn observe(&self, resource: &DesiredResource) -> Result<Vec<Precondition>, BackendError>;
 
