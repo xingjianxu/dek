@@ -71,7 +71,12 @@ impl Collector for CachedCollector<'_, '_> {
         );
         let mut keys = Vec::new();
         if matches!(language, CachedLanguage::Ruby) {
-            keys.push(scoped_key(shared.clone(), request.host, request.target));
+            keys.push(scoped_key(
+                shared.clone(),
+                request.host,
+                request.target,
+                request.target_id,
+            ));
         }
         keys.push(shared);
 
@@ -172,7 +177,7 @@ impl CollectedUnit {
             .iter()
             .any(|input| observations::is_target(input.kind))
         {
-            scoped_key(key, host, target)
+            scoped_key(key, host, target, self.target_id.as_deref())
         } else {
             key
         }
@@ -220,9 +225,16 @@ fn unit_key(
     }
 }
 
-fn scoped_key(mut key: UnitKey, host: &str, target: &Target) -> UnitKey {
-    key.target = Some(json!([host, target]).to_string());
+fn scoped_key(mut key: UnitKey, host: &str, target: &Target, target_id: Option<&str>) -> UnitKey {
+    key.target = Some(target_scope(host, target, target_id));
     key
+}
+
+pub(crate) fn target_scope(host: &str, target: &Target, target_id: Option<&str>) -> String {
+    match target_id {
+        Some(id) => json!([host, target, id]).to_string(),
+        None => json!([host, target]).to_string(),
+    }
 }
 
 fn collect_error(message: impl Into<String>) -> CollectError {

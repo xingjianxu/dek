@@ -3,22 +3,11 @@ use std::{collections::BTreeMap, error::Error, io::Write};
 use crate::evaluation::evaluate_options;
 use dek_controller::{
     cache::{CacheStore, CachedHttpInputs},
-    eval::{HttpInputProvider, RubyProviders, RubySession, TargetAnswer, TargetProvider},
+    eval::{HttpInputProvider, RubyProviders, RubySession, TargetProvider},
     repo::{HostSelector, Repository},
 };
-use dek_core::{InputKind, OptionPath, Priority, protocol::TargetQuery};
+use dek_core::{InputKind, OptionPath, Priority};
 use serde_json::json;
-
-pub(super) struct UnavailableTarget;
-
-impl TargetProvider for UnavailableTarget {
-    fn query(&mut self, query: &TargetQuery) -> Result<TargetAnswer, String> {
-        Err(format!(
-            "当前未配置目标查询提供者，无法读取 {:?}",
-            query.key
-        ))
-    }
-}
 
 pub(super) fn show(
     mut out: impl Write,

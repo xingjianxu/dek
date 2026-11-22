@@ -19,9 +19,6 @@ tempfile = "3"
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 age = { version = "0.12.1", default-features = false }
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 [target.'cfg(target_os = "linux")'.dependencies]
 dek-linux.workspace = true
 

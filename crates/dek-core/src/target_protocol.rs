@@ -4,10 +4,11 @@ use std::io::{self, BufRead, Read, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::TargetCapabilities;
+use crate::{Observation, TargetCapabilities, protocol::TargetQueryKind};
+use serde_json::Value;
 
 pub const TARGET_PROTOCOL_VERSION: u32 = 1;
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -28,11 +29,16 @@ pub enum ServerFrame {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum TargetRequest {
     NormalizePath { path: String },
+    QueryInput { kind: TargetQueryKind, key: String },
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum TargetResult {
+    Input {
+        value: Value,
+        observation: Observation,
+    },
     NormalizedPath {
         original: String,
         normalized: String,

@@ -3,6 +3,7 @@
 pub mod backend;
 #[cfg(target_os = "linux")]
 pub mod executor;
+pub mod inputs;
 pub mod planner;
 #[cfg(target_os = "linux")]
 pub mod state;

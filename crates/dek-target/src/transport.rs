@@ -10,6 +10,14 @@ use crate::backend::BackendRegistry;
 
 pub fn dispatch(registry: &BackendRegistry<'_>, operation: TargetRequest) -> TargetResult {
     match operation {
+        TargetRequest::QueryInput { kind, key } => {
+            match crate::inputs::observe_remote(registry, kind, &key) {
+                Ok((value, observation)) => TargetResult::Input { value, observation },
+                Err(error) => TargetResult::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         TargetRequest::NormalizePath { path } => match registry.normalize_path(&path) {
             Ok(normalized) => TargetResult::NormalizedPath {
                 original: path,

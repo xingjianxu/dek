@@ -1,5 +1,9 @@
 //! Launch the fixed target command through system OpenSSH.
 
+mod inputs;
+
+pub use inputs::{RemoteTarget, TargetInputSnapshot};
+
 use std::{
     io::{self, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},

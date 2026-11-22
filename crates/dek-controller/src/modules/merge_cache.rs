@@ -7,7 +7,9 @@ use crate::{
         CacheDependency, CacheDigest, CacheEntry, CacheError, CacheStore, Publication, UnitKey,
         UnitStage, semantic_digest,
     },
-    eval::{CollectedUnit, DeclarationGraph, collection_semantic_digest, observations},
+    eval::{
+        CollectedUnit, DeclarationGraph, collection_semantic_digest, observations, target_scope,
+    },
 };
 
 use super::{
@@ -35,7 +37,11 @@ pub fn merge_cache_key(graph: &DeclarationGraph) -> UnitKey {
 }
 
 pub(super) fn host_scope(graph: &DeclarationGraph) -> String {
-    json!([graph.host.name, graph.target]).to_string()
+    target_scope(
+        &graph.host.name,
+        &graph.target,
+        graph.host.target_id.as_deref(),
+    )
 }
 
 impl SchemaRegistry {

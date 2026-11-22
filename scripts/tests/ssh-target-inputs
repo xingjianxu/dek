@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+if [[ $# != 3 && ! ( $# == 4 && $4 == --plan ) ]]; then
+    printf 'Usage: %s IMAGE_ID MANAGER_DEK GUEST_DEK [--plan]\n' "$0" >&2
+    exit 2
+fi
+image=$1
+manager=$(realpath -e -- "$2")
+guest=$(realpath -e -- "$3")
+mode=${4:-}
+cd -- "$(dirname -- "$0")/../.."
+vm=$(pwd -P)/scripts/run-arch-vm
+dev_root=$(realpath -m -- "${DEK_DEV_ROOT:-/data/dek-dev}")
+mkdir -p -- "$dev_root/runs/41"
+evidence=$(mktemp -d "$dev_root/runs/41/acceptance.XXXXXXXX")
+printf 'Evidence: %s\n' "$evidence"
+
+a=
+b=
+cleanup() {
+    local run
+    for run in "$a" "$b"; do
+        if [[ -n "$run" && ! -e "$run/result" ]]; then
+            "$vm" finish "$run" failed || true
+        fi
+    done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+a=$("$vm" start 41 "$image" "$guest")
+printf '%s\n' "$a" > "$evidence/guest-a"
+b=$("$vm" start 41 "$image" "$guest")
+printf '%s\n' "$b" > "$evidence/guest-b"
+a_id=$(<"$a/instance")
+b_id=$(<"$b/instance")
+[[ "$a_id" != "$b_id" ]]
+
+a_conf=$("$vm" config "$a")
+b_conf=$("$vm" config "$b")
+{
+    sed 's/^Host dek-vm$/Host dek-a/' "$a_conf"
+    sed 's/^Host dek-vm$/Host dek-b/' "$b_conf"
+} > "$evidence/ssh.conf"
+
+mkdir -- "$evidence/bin" "$evidence/repo"
+export DEK_TEST_REAL_SSH DEK_TEST_SSH_CONFIG DEK_TEST_EVAL
+DEK_TEST_REAL_SSH=$(command -v ssh)
+DEK_TEST_SSH_CONFIG="$evidence/ssh.conf"
+DEK_TEST_EVAL="$evidence/evaluations"
+export XDG_CACHE_HOME="$evidence/cache"
+cat > "$evidence/bin/ssh" <<'SH'
+#!/bin/sh
+exec "$DEK_TEST_REAL_SSH" -F "$DEK_TEST_SSH_CONFIG" "$@"
+SH
+chmod 0700 -- "$evidence/bin/ssh"
+
+shared="$evidence/value.txt"
+optional="$evidence/optional.txt"
+desired="$evidence/desired.txt"
+printf '管理机值' > "$shared"
+for run in "$a" "$b"; do
+    "$vm" ssh "$run" sudo install -d -m 0755 "$evidence"
+    if [[ "$mode" == --plan ]]; then
+        "$vm" ssh "$run" sudo -n install -d -m 0700 -o dek /var/lib/dek
+    fi
+done
+printf '目标 A' | "$vm" ssh "$a" sudo tee "$shared" >/dev/null
+printf '目标 B' | "$vm" ssh "$b" sudo tee "$shared" >/dev/null
+# tee inherits the guest's umask. The SSH endpoint runs without sudo.
+"$vm" ssh "$a" sudo chmod 0644 "$shared"
+"$vm" ssh "$b" sudo chmod 0644 "$shared"
+
+jq -n --arg a "$a_id" --arg b "$b_id" '{
+    schemaVersion: 1,
+    hosts: {
+        alpha: {entry: "host.rb", target: {ssh: "dek-a"}, targetId: $a, inputs: "sdk"},
+        beta: {entry: "host.rb", target: {ssh: "dek-b"}, targetId: $b, inputs: "sdk"}
+    },
+    profiles: {
+        reader: {entry: "reader.rb", inputs: "sdk"},
+        independent: {entry: "independent.rb", inputs: "sdk"}
+    },
+    modules: {
+        "lab.target": {schema: "options.json", expand: "expand.rb", inputs: "sdk", readsOptions: ["lab.target"]}
+    }
+}' > "$evidence/repo/dek.json"
+cat > "$evidence/repo/host.rb" <<'RUBY'
+profile 'reader'
+profile 'independent'
+RUBY
+cat > "$evidence/repo/reader.rb" <<RUBY
+File.open(ENV.fetch('DEK_TEST_EVAL'), 'a') { |log| log.puts 'reader' }
+facts = {
+  'manager' => File.read('$shared', encoding: 'UTF-8'),
+  'target' => target.read_text('$shared'),
+  'optional' => target.read_text('$optional') || 'missing',
+  'distribution' => target.fact('distribution'),
+  'filemode' => target.capability('file.mode').to_s
+}
+configure 'programs.git.config', { 'facts' => facts }
+configure 'lab.target.enable', true
+configure 'lab.target.rendered', [facts.fetch('target'), facts.fetch('optional')].join(':')
+RUBY
+cat > "$evidence/repo/independent.rb" <<'RUBY'
+File.open(ENV.fetch('DEK_TEST_EVAL'), 'a') { |log| log.puts 'independent' }
+configure 'programs.git.enable', false
+RUBY
+cat > "$evidence/repo/options.json" <<'JSON'
+{"options": [
+  {"path": "lab.target.enable", "type": "boolean", "default": false, "description": "启用目标输入验收"},
+  {"path": "lab.target.rendered", "type": "string", "description": "按目标输入生成的受管文本"}
+]}
+JSON
+cat > "$evidence/repo/expand.rb" <<RUBY
+file_resource '$desired', content: option('lab.target.rendered')
+RUBY
+
+show() {
+    PATH="$evidence/bin:$PATH" "$manager" --repo "$evidence/repo" -H "$1" show --json "${@:2}"
+}
+plan() {
+    PATH="$evidence/bin:$PATH" "$manager" --repo "$evidence/repo" -H "$1" plan --json
+}
+assert_plan() {
+    local json=$1 host=$2 target_id=$3 value=$4 optional_value=$5 observation digest
+    digest=$(printf '%s:%s' "$value" "$optional_value" | sha256sum)
+    if [[ "$optional_value" == missing ]]; then
+        observation='"missing"'
+    else
+        observation=$(printf '%s' "$optional_value" | sha256sum)
+        observation=$(jq -nc --arg digest "sha256:${observation%% *}" '{digest: $digest}')
+    fi
+    jq -e --arg host "$host" --arg target "$target_id" --arg desired "$desired" \
+        --arg digest "sha256:${digest%% *}" --arg shared "$shared" --arg optional "$optional" \
+        --argjson optionalObservation "$observation" '
+        .host == $host and .target.id == $target and (.plan_id | length > 0)
+        and (.usedInputs | length == 4)
+        and any(.usedInputs[]; .kind == "targetFact" and .id == "distribution")
+        and any(.usedInputs[]; .kind == "targetCapability" and .id == "file.mode")
+        and any(.usedInputs[]; .kind == "targetFile" and .id == $shared)
+        and any(.usedInputs[]; .kind == "targetFile" and .id == $optional
+                               and .observation == $optionalObservation)
+        and any(.actions[]; .kind.writeFile.path == $desired
+                           and .kind.writeFile.content.digest == $digest)
+    ' "$json" >/dev/null
+}
+assert_inputs() {
+    local json=$1 value=$2 optional_value=$3
+    jq -e --arg value "$value" --arg optional "$optional_value" '
+        .options."programs.git.config".value.facts
+        | .manager == "管理机值" and .target == $value and .optional == $optional
+          and .distribution == "arch" and .filemode == "true"
+    ' "$json" >/dev/null
+}
+assert_collections() {
+    [[ $(grep -cx reader "$DEK_TEST_EVAL") == "$1" ]]
+    [[ $(grep -cx independent "$DEK_TEST_EVAL") == 1 ]]
+}
+
+show alpha > "$evidence/live-a.json"
+show beta > "$evidence/live-b.json"
+assert_inputs "$evidence/live-a.json" '目标 A' missing
+assert_inputs "$evidence/live-b.json" '目标 B' missing
+jq -e 'has("targetSnapshot") | not' "$evidence/live-a.json" >/dev/null
+assert_collections 2
+
+DEK_TEST_SSH_CONFIG="$evidence/nonexistent.conf" show alpha --target-snapshot > "$evidence/snapshot-a.json"
+DEK_TEST_SSH_CONFIG="$evidence/nonexistent.conf" show beta --target-snapshot > "$evidence/snapshot-b.json"
+assert_inputs "$evidence/snapshot-a.json" '目标 A' missing
+assert_inputs "$evidence/snapshot-b.json" '目标 B' missing
+jq -e --arg id "$a_id" '.targetSnapshot.label | contains("alpha") and contains($id)' "$evidence/snapshot-a.json" >/dev/null
+jq -e --arg id "$b_id" '.targetSnapshot.label | contains("beta") and contains($id)' "$evidence/snapshot-b.json" >/dev/null
+assert_collections 2
+
+printf '目标 A 的新值' | "$vm" ssh "$a" sudo tee "$shared" >/dev/null
+if [[ "$mode" == --plan ]]; then
+    plan alpha > "$evidence/rechecked-plan-a.json"
+    assert_plan "$evidence/rechecked-plan-a.json" alpha "$a_id" '目标 A 的新值' missing
+    assert_collections 3
+fi
+show alpha > "$evidence/rechecked-a.json"
+assert_inputs "$evidence/rechecked-a.json" '目标 A 的新值' missing
+assert_collections 3
+
+printf '出现了' | "$vm" ssh "$a" sudo tee "$optional" >/dev/null
+"$vm" ssh "$a" sudo chmod 0644 "$optional"
+if [[ "$mode" == --plan ]]; then
+    plan alpha > "$evidence/appeared-plan-a.json"
+    plan beta > "$evidence/stable-plan-b.json"
+    assert_plan "$evidence/appeared-plan-a.json" alpha "$a_id" '目标 A 的新值' '出现了'
+    assert_plan "$evidence/stable-plan-b.json" beta "$b_id" '目标 B' missing
+    assert_collections 4
+fi
+show alpha > "$evidence/appeared-a.json"
+show beta > "$evidence/stable-b.json"
+assert_inputs "$evidence/appeared-a.json" '目标 A 的新值' '出现了'
+assert_inputs "$evidence/stable-b.json" '目标 B' missing
+assert_collections 4
+
+grep -Eq '^ID=.+' /etc/os-release
+"$vm" ssh "$a" 'sudo mv /etc/os-release /etc/os-release.dek-test'
+read_live=show
+if [[ "$mode" == --plan ]]; then
+    read_live=plan
+fi
+if "$read_live" alpha > "$evidence/missing-fact.stdout" 2> "$evidence/missing-fact.stderr"; then
+    printf 'Expected a target fact diagnostic\n' >&2
+    exit 1
+fi
+[[ ! -s "$evidence/missing-fact.stdout" ]]
+grep -Fq 'reader.rb:6' "$evidence/missing-fact.stderr"
+grep -Fq 'distribution' "$evidence/missing-fact.stderr"
+grep -Fq "$a_id" "$evidence/missing-fact.stderr"
+"$vm" ssh "$a" 'sudo mv /etc/os-release.dek-test /etc/os-release'
+
+"$vm" finish "$a" passed
+"$vm" finish "$b" passed
+printf 'Live facts, per-binding offline snapshots and targeted invalidation passed.\n'

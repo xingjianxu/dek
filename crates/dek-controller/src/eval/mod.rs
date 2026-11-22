@@ -9,6 +9,7 @@ pub(crate) mod observations;
 mod ruby;
 mod ruby_runtime;
 
+pub(crate) use cached::target_scope;
 pub use cached::{CachedCollector, collection_semantic_digest};
 pub use graph::{
     CollectError, CollectRequest, CollectedUnit, Collector, DeclarationGraph, GraphError,
