@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+grep -qx 'ID=arch' /etc/os-release
+[[ -e /run/cloud-init/instance-data.json && "$(id -u)" = 0 ]]
+
+fixture=/home/dek/aur-vm-fixture
+root=/var/tmp/dek-aur-plan
+repo=$root/repo
+evidence=$root/evidence
+export XDG_CACHE_HOME=$root/cache
+mkdir -p -- "$repo" "$evidence" "$root/official" /etc/dek
+chmod 0755 -- "$root" "$root/official"
+
+for name in dek-aur-fixture dek-aur-unmanaged; do
+    runuser -u dek -- "$fixture/publish" "$name" 2
+done
+repo-add "$root/official/fixture.db.tar.gz" "$fixture"/archives/git-*.pkg.tar.zst
+cat > /etc/pacman.conf <<CONF
+[options]
+Architecture = auto
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Required
+[fixture]
+Server = file://$root/official
+CONF
+printf 'dek\n' > /etc/dek/aur-build-user
+chmod 0644 /etc/dek/aur-build-user
+printf 'fixture unmanaged Git config\n' > /etc/gitconfig
+
+cat > "$repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"arch":{"entry":"arch.json","target":{"local":true}}}}
+JSON
+cat > "$repo/arch.json" <<'JSON'
+{"schemaVersion":1,"imports":[],"options":[
+  {"path":"dek.arch.aurPackages","value":["dek-aur-fixture","dek-aur-missing"]},
+  {"path":"programs.git.enable","value":true},
+  {"path":"programs.git.config","value":{"init":{"defaultBranch":"main"}}}
+]}
+JSON
+
+observe() {
+    find /var/lib/pacman -type f -print0 | sort -z | xargs -0r sha256sum
+    sha256sum /etc/gitconfig
+    stat --format='%i %s %Y' /etc/gitconfig
+    pacman -Q dek-aur-fixture dek-aur-unmanaged
+}
+plan() {
+    /usr/local/bin/dek --repo "$repo" -H arch plan --state-dir "$1" "${@:2}"
+}
+observe > "$evidence/before"
+plan "$root/state" --upgrade --json > "$evidence/upgrade.json"
+plan "$root/state" --upgrade > "$evidence/upgrade.txt"
+plan "$root/state" --json > "$evidence/normal.json"
+
+python3 - "$evidence" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+upgrade = json.loads((root / "upgrade.json").read_text())
+normal = json.loads((root / "normal.json").read_text())
+terminal = (root / "upgrade.txt").read_text()
+
+def builds(plan):
+    return {
+        action["kind"]["buildAurPackage"]["package"]["name"]: action
+        for action in plan["actions"]
+        if "buildAurPackage" in action["kind"]
+    }
+
+assert builds(normal).keys() == {"dek-aur-missing"}, normal
+actions = builds(upgrade)
+assert actions.keys() == {"dek-aur-fixture", "dek-aur-missing"}, actions
+for name, candidate, installed in [("dek-aur-fixture", "2-1", "1-1"), ("dek-aur-missing", "1-1", None)]:
+    action = actions[name]
+    build = action["kind"]["buildAurPackage"]
+    assert build["package"]["source"] == "aur", build
+    assert build["candidateVersion"] == candidate, build
+    assert build["dependencies"] == {"runtime": ["glibc"], "build": ["gcc", "make"], "check": ["bash"]}, build
+    assert action["preconditions"][0]["packageVersion"]["expected"] == installed, action
+    assert "arch.json" in str(action["origins"]), action
+    assert f"{name} ({candidate})" in terminal, terminal
+assert "构建依赖 gcc, make" in terminal, terminal
+assert "dek-aur-unmanaged" not in terminal, terminal
+assert any("writeFile" in item["kind"] for item in upgrade["actions"]), upgrade
+PY
+
+reject() {
+    local scenario=$1 diagnostic=$2 state=$root/state-$1
+    if plan "$state" --upgrade --json > "$evidence/$scenario.stdout" 2> "$evidence/$scenario.stderr"; then
+        printf 'Unexpected plan for %s\n' "$scenario" >&2
+        return 1
+    fi
+    [[ ! -s "$evidence/$scenario.stdout" && ! -e "$state" ]]
+    grep -F -- "$diagnostic" "$evidence/$scenario.stderr"
+    grep -F 'arch.json' "$evidence/$scenario.stderr"
+    grep -F '/options/0' "$evidence/$scenario.stderr"
+}
+
+mv /usr/local/bin/paru /usr/local/bin/paru.fixture
+reject no-helper '缺少 AUR helper paru'
+mv /usr/local/bin/paru.fixture /usr/local/bin/paru
+
+mv /usr/bin/make /usr/bin/make.fixture
+reject no-tool 'AUR 构建工具：make'
+mv /usr/bin/make.fixture /usr/bin/make
+
+printf 'root\n' > /etc/dek/aur-build-user
+reject root-builder '需要非 root 用户'
+
+observe > "$evidence/after"
+cmp "$evidence/before" "$evidence/after"
+printf 'AUR candidates, dependencies, setup diagnostics and unchanged target state verified.\n'

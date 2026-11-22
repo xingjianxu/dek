@@ -16,10 +16,10 @@ pub use origin::{InvalidJsonPointer, JsonPointer, Origin};
 
 pub use plan::{
     Action, ActionKind, AgeSecretObservation, AgeSecretRevision, AgeSecretVerification,
-    DirectoryObservation, FileObservation, NotificationSource, Plan, PlanMode, PlanVersion,
-    Precondition, RepositoryPackageCandidate, RepositoryPackageChange, RepositoryTransaction,
-    RepositoryTransactionScope, ResourceCapability, TargetCapabilities, TargetIdentity,
-    UnsupportedPlanVersion, UserObservation,
+    AurBuildDependencies, DirectoryObservation, FileObservation, NotificationSource, Plan,
+    PlanMode, PlanVersion, Precondition, RepositoryPackageCandidate, RepositoryPackageChange,
+    RepositoryTransaction, RepositoryTransactionScope, ResourceCapability, TargetCapabilities,
+    TargetIdentity, UnsupportedPlanVersion, UserObservation,
 };
 pub use resource::{
     AgeSecretResource, AuthorizedKeysResource, ContentDigest, DesiredResource, DirectoryResource,

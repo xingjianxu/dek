@@ -34,6 +34,20 @@ pub struct ResourceCapability {
     pub attributes: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AurBuildDependencies {
+    pub runtime: Vec<String>,
+    pub build: Vec<String>,
+    pub check: Vec<String>,
+}
+
+impl AurBuildDependencies {
+    fn is_empty(&self) -> bool {
+        self.runtime.is_empty() && self.build.is_empty() && self.check.is_empty()
+    }
+}
+
 /// Whether a plan reconciles declarations or explicitly previews a system upgrade.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,6 +184,8 @@ pub enum ActionKind {
     BuildAurPackage {
         package: PackageId,
         candidate_version: Option<String>,
+        #[serde(default, skip_serializing_if = "AurBuildDependencies::is_empty")]
+        dependencies: AurBuildDependencies,
     },
     DeployUnit {
         unit: UnitId,

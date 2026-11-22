@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fixture_dir=/home/dek/aur-vm-fixture
+pkgname=$1
+pkgver=$2
+[[ "$pkgname" =~ ^dek-aur-[a-z0-9-]+$ && "$pkgver" =~ ^[0-9]+$ ]]
+origin=http://127.0.0.1:18765
+served="$fixture_dir/http"
+checkout="$fixture_dir/work/$pkgname"
+source="${pkgname}-${pkgver}.c"
+mkdir -p "$served" "$checkout"
+if [[ ! -d "$checkout/.git" ]]; then
+    git -C "$checkout" init --quiet --initial-branch master
+    git -C "$checkout" config user.name 'AUR VM Fixture'
+    git -C "$checkout" config user.email 'aur-vm@invalid.example'
+fi
+
+if ! gpg --batch --list-secret-keys aur-vm@invalid.example >/dev/null 2>&1; then
+    gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key \
+        'AUR VM Fixture <aur-vm@invalid.example>' ed25519 sign 0
+fi
+fingerprint=$(gpg --batch --with-colons --list-secret-keys aur-vm@invalid.example |
+    awk -F: '$1 == "fpr" { print $10; exit }')
+printf '%s\n' '#include <stdio.h>' "int main(void) { puts(\"$pkgname $pkgver\"); }" > "$served/$source"
+gpg --batch --yes --pinentry-mode loopback --passphrase '' --detach-sign \
+    --output "$served/$source.sig" "$served/$source"
+checksum=$(sha256sum "$served/$source")
+cat > "$checkout/PKGBUILD" <<PKGBUILD
+pkgname=$pkgname
+pkgver=$pkgver
+pkgrel=1
+pkgdesc='Signed AUR fixture for a disposable offline Arch VM'
+arch=('x86_64')
+url='$origin'
+license=('0BSD')
+depends=('glibc')
+makedepends=('gcc' 'make')
+checkdepends=('bash')
+source=('$origin/$source' '$origin/$source.sig')
+sha256sums=('${checksum%% *}' 'SKIP')
+validpgpkeys=('$fingerprint')
+
+build() {
+    test "\$(id -u)" -gt 0
+    id -u > "\$srcdir/build.uid"
+    if [[ -e /tmp/$pkgname.fail-build ]]; then
+        printf 'fixture build failure for %s\\n' "\$pkgname" >&2
+        return 1
+    fi
+    gcc -g -o "\$srcdir/\$pkgname" "\$srcdir/$source"
+}
+
+check() {
+    [[ "\$("\$srcdir/\$pkgname")" == "\$pkgname \$pkgver" ]]
+}
+
+package() {
+    install -Dm755 "\$srcdir/\$pkgname" "\$pkgdir/usr/bin/\$pkgname"
+    install -Dm644 "\$srcdir/build.uid" "\$pkgdir/usr/share/\$pkgname/build.uid"
+}
+PKGBUILD
+
+(cd "$checkout" && makepkg --printsrcinfo > .SRCINFO)
+git -C "$checkout" add PKGBUILD .SRCINFO
+if ! git -C "$checkout" diff --cached --quiet; then
+    git -C "$checkout" commit --quiet -m "$pkgname $pkgver-1"
+fi
+repo="$served/$pkgname"
+[[ -d "$repo" ]] || git init --quiet --bare --initial-branch master "$repo"
+git -C "$checkout" push --quiet "$repo" master
+git -C "$repo" update-server-info
+python3 - "$pkgname" "$pkgver" "$served" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+name, version, served = sys.argv[1:]
+metadata = {
+    "ID": 1,
+    "Name": name,
+    "PackageBaseID": 1,
+    "PackageBase": name,
+    "Version": version + "-1",
+    "Description": "Signed AUR fixture for a disposable offline Arch VM",
+    "URL": "http://127.0.0.1:18765",
+    "NumVotes": 0,
+    "Popularity": 0,
+    "OutOfDate": None,
+    "Maintainer": "dek-vm",
+    "FirstSubmitted": 1700000000,
+    "LastModified": 1700000000,
+    "URLPath": "/cgit/aur.git/snapshot/" + name + ".tar.gz",
+    "License": ["0BSD"],
+    "Depends": ["glibc"],
+    "MakeDepends": ["gcc", "make"],
+    "CheckDepends": ["bash"],
+}
+staged = Path(served, name + ".json.new")
+staged.write_text(json.dumps(metadata))
+staged.replace(Path(served, name + ".json"))
+PY
+git -C "$repo" rev-parse HEAD

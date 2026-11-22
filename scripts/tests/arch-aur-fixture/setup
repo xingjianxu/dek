@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+run=$(realpath -e -- "$1")
+fixture_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+runner="$fixture_dir/../../run-arch-vm"
+cache="${DEK_DEV_ROOT:-/data/dek-dev}/cache/arch-packages"
+archives="$cache/aur-build-20261115"
+paru="$cache/paru-v2.2.1/paru-v2.2.1-x86_64.tar.zst"
+guest_dir=/home/dek/aur-vm-fixture
+
+guest() { "$runner" ssh "$run" "$@"; }
+
+while read -r digest url; do
+    printf '%s  %s\n' "$digest" "$archives/pkg/${url##*/}"
+done < "$fixture_dir/archives.txt" | sha256sum --quiet --check -
+printf 'dca66fdd2b7c8e0ceff1133dbf5ba552cfa486af88f807170dd9b6ca0909d745  %s\n' "$paru" |
+    sha256sum --quiet -c -
+
+python3 - "$run" <<'PY'
+import json
+from pathlib import Path
+import socket
+import sys
+
+run = Path(sys.argv[1])
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.settimeout(5)
+    connection.connect(str(run / "qmp.sock"))
+    with connection.makefile("rb") as replies:
+        replies.readline()
+
+        def request(command, arguments=None):
+            message = {"execute": command}
+            if arguments is not None:
+                message["arguments"] = arguments
+            connection.sendall((json.dumps(message) + "\n").encode())
+            for line in replies:
+                response = json.loads(line)
+                if "error" in response:
+                    raise SystemExit(response["error"])
+                if "return" in response:
+                    return response["return"]
+            raise SystemExit("QEMU closed the monitor without a reply")
+
+        request("qmp_capabilities")
+        if request("query-name")["name"] != (run / "instance").read_text().strip():
+            raise SystemExit("Fixture guest does not match the run directory")
+        request("block_resize", {"device": "os", "size": 5 * 1024 ** 3})
+PY
+guest 'sudo growpart /dev/vda 3 && sudo btrfs filesystem resize max / && df -hT /'
+
+guest "mkdir -p '$guest_dir/archives'"
+while read -r _ url; do
+    printf '%s\n' "${url##*/}"
+done < "$fixture_dir/archives.txt" |
+    tar -C "$archives/pkg" -cf - -T - | guest "tar -C '$guest_dir/archives' -xf -"
+tar -C "$fixture_dir" -cf - server.py publish | guest "tar -C '$guest_dir' -xf -"
+guest "tar --zstd -C '$guest_dir' -xf - paru paru.conf" < "$paru"
+
+guest 'bash -se' <<'GUEST'
+fixture_dir=/home/dek/aur-vm-fixture
+sudo install -m 0755 "$fixture_dir/paru" /usr/local/bin/paru
+paru --version
+
+sed -E 's/^LocalFileSigLevel.*/LocalFileSigLevel = Required/' /etc/pacman.conf > "$fixture_dir/pacman-required.conf"
+sudo pacman --config "$fixture_dir/pacman-required.conf" -U --noconfirm "$fixture_dir"/archives/*.pkg.tar.zst
+pacman -Q base-devel git
+
+sed -i '/^\[options\]/a AurUrl = http://127.0.0.1:18765' "$fixture_dir/paru.conf"
+printf '\n[bin]\nPager = cat\n' >> "$fixture_dir/paru.conf"
+sudo install -m 0644 "$fixture_dir/paru.conf" /etc/paru.conf
+"$fixture_dir/publish" dek-aur-fixture 1
+"$fixture_dir/publish" dek-aur-missing 1
+sudo systemd-run --quiet --collect --unit=aur-vm-fixture --uid=dek /usr/bin/python3 "$fixture_dir/server.py" "$fixture_dir/http"
+for retry in {1..30}; do
+    if curl --fail --silent http://127.0.0.1:18765/ >/dev/null; then
+        break
+    fi
+    sleep .1
+done
+git ls-remote http://127.0.0.1:18765/dek-aur-fixture
+GUEST

@@ -5,7 +5,7 @@ mod nss;
 mod primary;
 pub(crate) mod tools;
 
-pub(crate) use nss::{UserAccount, user_account};
+pub(crate) use nss::{UserAccount, user_account, user_account_by_uid};
 
 #[cfg(test)]
 mod tests;
