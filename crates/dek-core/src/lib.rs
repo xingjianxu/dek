@@ -3,6 +3,7 @@
 mod config;
 mod origin;
 mod plan;
+pub mod protocol;
 mod resource;
 
 pub use config::{
