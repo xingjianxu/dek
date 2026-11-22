@@ -117,8 +117,12 @@ pub fn run_local(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
     out: impl Write,
 ) -> Result<(), Box<dyn Error>> {
-    use crate::local_target::{LocalFileBackend, local_registry};
-    run_command(args, out, || local_registry(&LocalFileBackend), true)
+    use crate::local_target::local_registry;
+    #[cfg(target_os = "linux")]
+    let files = dek_linux::filesystem::FileBackend::default();
+    #[cfg(not(target_os = "linux"))]
+    let files = crate::local_target::LocalFileBackend;
+    run_command(args, out, || local_registry(&files), true)
 }
 
 fn run_command<'target>(

@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# This script runs in the disposable Arch guest with the reviewed dek build and Ruby.
+set -euo pipefail
+
+[[ -e /run/cloud-init/instance-data.json && "$(id -un)" == dek ]]
+grep -Fx 'ID=arch' /etc/os-release
+repo=$(mktemp -d)
+printf 'Linux file acceptance fixture %s\n' "$repo"
+export XDG_CACHE_HOME="$repo/cache"
+state="$repo/state"
+file="$repo/managed.conf"
+
+cat > "$repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"files":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.files":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$repo/options.json" <<'JSON'
+{"options":[
+  {"path":"lab.files.enable","type":"boolean","description":"Enable test module"},
+  {"path":"lab.files.path","type":"string","description":"Target file"},
+  {"path":"lab.files.state","type":"string","description":"File fixture state"},
+  {"path":"lab.files.mode","type":"string","description":"File mode"}
+]}
+JSON
+cat > "$repo/expand.rb" <<'RUBY'
+path = option("lab.files.path")
+case option("lab.files.state")
+when "present"
+  file_resource(path, content: "reviewed A\n", attributes: {
+    owner: "dek", group: "wheel", mode: option("lab.files.mode")
+  })
+when "absent"
+  resource "file", path: path, state: "absent"
+when "omitted"
+  {resources: [], contents: {}}
+else
+  raise "unknown fixture state"
+end
+RUBY
+
+entry() {
+    python3 - "$file" "$1" > "$repo/entry.json" <<'PY'
+import json
+import sys
+
+json.dump({"schemaVersion": 1, "imports": [], "options": [
+    {"path": "lab.files.enable", "value": True},
+    {"path": "lab.files.path", "value": sys.argv[1]},
+    {"path": "lab.files.state", "value": sys.argv[2]},
+    {"path": "lab.files.mode", "value": "0640"},
+]}, sys.stdout)
+PY
+}
+
+plan() {
+    dek --repo "$repo" -H files plan --state-dir "$state" --json > "$repo/latest-plan.json"
+}
+
+assert_actions() {
+    python3 - "$repo/latest-plan.json" "$@" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="UTF-8") as source:
+    plan = json.load(source)
+actions = [kind for action in plan["actions"] for kind in action["kind"]]
+assert actions == sys.argv[2:], actions
+print(plan["plan_id"])
+PY
+}
+
+apply() {
+    dek --repo "$repo" -H files apply --state-dir "$state" "$@"
+}
+
+entry present
+plan
+review=$(assert_actions writeFile)
+apply --plan "$review"
+[[ "$(cat "$file")" == "reviewed A" && "$(stat -c '%U %G %a' "$file")" == "dek wheel 640" ]]
+
+printf 'manual B\n' > "$file"
+plan
+review=$(assert_actions writeFile)
+apply --plan "$review"
+[[ "$(cat "$file")" == "reviewed A" ]]
+
+chmod 0600 "$file"
+plan
+review=$(assert_actions setFileAttributes)
+apply --plan "$review"
+[[ "$(stat -c %a "$file")" == 640 ]]
+
+metadata=$(stat -c '%i %y' "$file")
+plan
+assert_actions
+apply
+[[ "$(stat -c '%i %y' "$file")" == "$metadata" ]]
+[[ "$(cat "$file")" == "reviewed A" ]]
+
+entry omitted
+apply
+[[ "$(stat -c '%i %y' "$file")" == "$metadata" ]]
+entry absent
+plan
+review=$(assert_actions removeFile)
+apply --plan "$review"
+[[ ! -e "$file" ]]
+plan
+assert_actions
+
+printf 'unmanaged original\n' > "$repo/unmanaged"
+ln -s "$repo/unmanaged" "$file"
+entry present
+if plan; then
+    printf 'Planning an existing symlink unexpectedly succeeded.\n' >&2
+    exit 1
+fi
+[[ -L "$file" && "$(cat "$repo/unmanaged")" == "unmanaged original" ]]
+printf 'Linux file application, drift correction, isolation and explicit removal passed.\n'
