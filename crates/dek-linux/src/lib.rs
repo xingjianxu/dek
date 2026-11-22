@@ -2,3 +2,6 @@
 
 #[cfg(target_os = "linux")]
 pub mod secrets;
+
+#[cfg(target_os = "linux")]
+pub mod filesystem;

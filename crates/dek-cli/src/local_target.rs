@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 pub struct LocalFileBackend;
 
-pub fn local_registry(backend: &LocalFileBackend) -> Result<BackendRegistry<'_>, Box<dyn Error>> {
+pub fn local_registry(backend: &dyn Backend) -> Result<BackendRegistry<'_>, Box<dyn Error>> {
     let id = hostname::get()?
         .into_string()
         .map_err(|name| format!("当前主机名不是有效的 UTF-8：{name:?}"))?;

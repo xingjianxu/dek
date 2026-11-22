@@ -2,7 +2,7 @@ use std::{ffi::CString, mem::MaybeUninit, ptr};
 
 use dek_target::backend::BackendError;
 
-pub(super) fn user_id(name: &str) -> Result<Option<u32>, BackendError> {
+pub(crate) fn user_id(name: &str) -> Result<Option<u32>, BackendError> {
     account_id(
         name,
         |name, entry: *mut libc::passwd, buf, size, found| {
@@ -13,7 +13,7 @@ pub(super) fn user_id(name: &str) -> Result<Option<u32>, BackendError> {
     )
 }
 
-pub(super) fn group_id(name: &str) -> Result<Option<u32>, BackendError> {
+pub(crate) fn group_id(name: &str) -> Result<Option<u32>, BackendError> {
     account_id(
         name,
         |name, entry: *mut libc::group, buf, size, found| {

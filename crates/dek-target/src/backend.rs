@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use dek_core::{
     Action, ActionKind, ContentDigest, DesiredResource, Precondition, ResourceCapability,
-    ResourceId, ResourceKind, ServiceNotification, TargetCapabilities, TargetIdentity,
+    ResourceId, ResourceKind, ResourceSet, ServiceNotification, TargetCapabilities, TargetIdentity,
 };
 use thiserror::Error;
 
@@ -104,6 +104,11 @@ pub trait Backend {
     /// Validate execution support without observing or mutating the resource.
     fn validate_action(&self, _: &Action) -> Result<(), BackendError> {
         Err(BackendError("后端未提供此动作的执行能力".into()))
+    }
+
+    /// Validate reviewed inputs that must be checked together before any action runs.
+    fn validate_batch(&self, _: &ResourceSet, _: &[ActionContext<'_>]) -> Result<(), BackendError> {
+        Ok(())
     }
 
     /// Compare the action goal and reviewed preconditions with live state.
