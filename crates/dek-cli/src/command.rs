@@ -175,6 +175,8 @@ fn run_command<'target>(
     #[cfg(target_os = "linux")]
     let accounts = dek_linux::accounts::AccountBackend::default();
     #[cfg(target_os = "linux")]
+    let directories = dek_linux::filesystem::DirectoryBackend;
+    #[cfg(target_os = "linux")]
     let local_target = || {
         let mut registry = local_target()?;
         if _production {
@@ -184,6 +186,7 @@ fn run_command<'target>(
             }
             registry.register(&systemd)?;
             registry.register(&accounts)?;
+            registry.register(&directories)?;
         }
         Ok::<_, Box<dyn Error>>(registry)
     };
