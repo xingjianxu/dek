@@ -110,6 +110,8 @@ configure "lab.backup",
 
 `profile "base"` 返回一条引用，由 Rust 负责解析。Ruby 的 `require_relative` 仍可用于共享辅助函数，所引用的本地文件也会计入当前单元的依赖。`source_file` 仅声明待部署文件，由管理机的 Rust 核心在规划阶段读取内容；如果 Ruby 需要读取文件内容参与 option 计算，则使用单独的 `read_text`。区分二者后，日常修改 Caddyfile 即可跳过 Ruby 求值。
 
+JSON 的 `imports` 可写 profile 名称，也可用对象传入命名参数，例如 `{"name":"base","params":{"role":"server"}}`。在同一主机的声明图中，别名和参数相同的引用共用一个采集单元。比较参数时忽略对象键顺序，保留数组元素顺序。
+
 ### 2.2 主机、模块和 option
 
 - **host**：决定引用哪些 profile，并提供该主机的覆盖值。显式指定的主机名必须存在于清单中；本机运行时可通过已绑定的本机名自动匹配入口。
