@@ -4,10 +4,13 @@
 pub mod accounts;
 
 #[cfg(target_os = "linux")]
-pub mod secrets;
+pub mod arch;
 
 #[cfg(target_os = "linux")]
 pub mod filesystem;
+
+#[cfg(target_os = "linux")]
+pub mod secrets;
 
 #[cfg(target_os = "linux")]
 pub mod systemd;
