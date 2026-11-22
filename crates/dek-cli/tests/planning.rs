@@ -494,6 +494,7 @@ fn copied_cli_runs_embedded_ruby_outside_checkout_and_json_without_ruby() {
       "schemaVersion":1,
       "hosts":{
         "server":{"entry":"hosts/server.rb","target":{"local":true}},
+        "alias":{"entry":"hosts/server.rb","target":{"local":true}},
         "static":{"entry":"hosts/static.json","target":{"local":true}}
       },
       "modules":{"lab.file":{"schema":"modules/file/options.json","expand":"modules/file/expand.rb"}}
@@ -530,7 +531,10 @@ fn copied_cli_runs_embedded_ruby_outside_checkout_and_json_without_ruby() {
         cmd.current_dir(cwd.path())
             .arg("--repo")
             .arg(root.path())
-            .args(["plan", "-H", host]);
+            .args(["plan", "-H", host])
+            .env("XDG_CACHE_HOME", root.path().join("cache"));
+        #[cfg(target_os = "linux")]
+        cmd.arg("--state-dir").arg(root.path().join("target-state"));
         if json {
             cmd.arg("--json");
         }
@@ -583,4 +587,128 @@ fn copied_cli_runs_embedded_ruby_outside_checkout_and_json_without_ruby() {
         .unwrap();
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("--json"));
+
+    #[cfg(target_os = "linux")]
+    {
+        use dek_target::state::{PlanBinding, StateStore};
+
+        let state_path = root.path().join("target-state");
+        let store = StateStore::open(&state_path).unwrap();
+        let identity = serde_json::from_value(json["target"].clone()).unwrap();
+        let binding = PlanBinding {
+            repository_id: json["repositoryId"].as_str().unwrap(),
+            logical_host: "server",
+            target: &identity,
+        };
+        let plan_id = json["plan_id"].as_str().unwrap();
+        let old_content = digest(b"planned");
+        let old_object = state_path.join("objects").join(&old_content.0[7..]);
+        let old_record = state_path.join("plans").join(format!("{plan_id}.mpk"));
+
+        let saved = store.lock().unwrap().load_plan(plan_id, binding).unwrap();
+        assert_eq!(saved.plan.id, plan_id);
+        assert_eq!(
+            json["actions"],
+            serde_json::to_value(&saved.plan.actions).unwrap()
+        );
+        assert_eq!(saved.contents[&old_content], b"planned");
+        let repo = Repository::load(root.path()).unwrap();
+        let registry =
+            dek_cli::local_target::local_registry(&dek_cli::local_target::LocalFileBackend)
+                .unwrap();
+        let mut provider = dek_cli::local_target::LocalEvaluationTarget(&registry);
+        let unpublished = plan_host(
+            &repo,
+            HostSelector::Named("alias"),
+            &registry,
+            &mut provider,
+        )
+        .unwrap();
+        let wrong_bytes = BTreeMap::from([(old_content.clone(), b"corrupt".to_vec())]);
+        let error = store
+            .lock()
+            .unwrap()
+            .save_plan(
+                "alias",
+                &unpublished.plan,
+                &unpublished.expanded.resources,
+                &wrong_bytes,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&old_content.0), "{error}");
+        assert!(
+            !state_path
+                .join("plans")
+                .join(format!("{}.mpk", unpublished.plan.id))
+                .exists()
+        );
+
+        let alias = command("alias", true).output().unwrap();
+        assert!(
+            alias.status.success(),
+            "{}",
+            String::from_utf8_lossy(&alias.stderr)
+        );
+        let alias: Value = serde_json::from_slice(&alias.stdout).unwrap();
+        let alias_id = alias["plan_id"].as_str().unwrap();
+        assert_ne!(plan_id, alias_id);
+        let alias = store
+            .lock()
+            .unwrap()
+            .load_plan(
+                alias_id,
+                PlanBinding {
+                    logical_host: "alias",
+                    ..binding
+                },
+            )
+            .unwrap();
+        assert_eq!(alias.contents[&old_content], b"planned");
+        assert_eq!(fs::read_dir(state_path.join("objects")).unwrap().count(), 1);
+
+        fs::write(&source, b"new source").unwrap();
+        fs::remove_dir_all(root.path().join("cache")).unwrap();
+        fs::write(&target, b"new source").unwrap();
+        let latest = command("server", true).output().unwrap();
+        assert!(
+            latest.status.success(),
+            "{}",
+            String::from_utf8_lossy(&latest.stderr)
+        );
+        let latest: Value = serde_json::from_slice(&latest.stdout).unwrap();
+        let newer_id = latest["plan_id"].as_str().unwrap();
+        assert_ne!(newer_id, plan_id);
+        assert!(latest["actions"].as_array().unwrap().is_empty());
+        let locked = store.lock().unwrap();
+        let converged = locked.load_plan(newer_id, binding).unwrap();
+        assert_eq!(converged.contents[&digest(b"new source")], b"new source");
+        assert_eq!(
+            locked.load_plan(plan_id, binding).unwrap().contents[&old_content],
+            b"planned"
+        );
+
+        let bytes = fs::read(&old_record).unwrap();
+        let mut wrong: Value = rmp_serde::from_slice(&bytes).unwrap();
+        wrong["plan"]["actions"][0]["kind"] = json!({"unknownAction":{}});
+        fs::write(&old_record, rmp_serde::to_vec_named(&wrong).unwrap()).unwrap();
+        let error = locked.load_plan(plan_id, binding).unwrap_err().to_string();
+        assert!(
+            error.contains(plan_id) && error.contains("unknownAction"),
+            "{error}"
+        );
+        let mut wrong: Value = rmp_serde::from_slice(&bytes).unwrap();
+        wrong["formatVersion"] = json!(2);
+        fs::write(&old_record, rmp_serde::to_vec_named(&wrong).unwrap()).unwrap();
+        let error = locked.load_plan(plan_id, binding).unwrap_err().to_string();
+        assert!(
+            error.contains(plan_id) && error.contains("不支持的计划记录版本 2"),
+            "{error}"
+        );
+        fs::write(&old_record, bytes).unwrap();
+        fs::remove_file(&old_object).unwrap();
+        let error = locked.load_plan(plan_id, binding).unwrap_err().to_string();
+        assert!(error.contains(&old_content.0), "{error}");
+        assert_eq!(fs::read(&target).unwrap(), b"new source");
+    }
 }

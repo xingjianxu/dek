@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Run through scripts/run-arch-vm ssh in a fresh Arch test guest with Ruby.
+set -euo pipefail
+export LC_ALL=C
+
+[[ "$(id -un)" == dek && "$(id -u)" != 0 && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+[[ ! -e /var/lib/dek && ! -L /var/lib/dek ]]
+sudo -n install -d -m 0700 -o dek /var/lib/dek
+sudo -n useradd -M -s /usr/bin/nologin dek-foreign
+printf 'Planner account\n'
+id
+printf 'Untrusted account\n'
+sudo -n -u dek-foreign id
+
+fixture=$(mktemp -d)
+export XDG_CACHE_HOME="$fixture/cache"
+cat > "$fixture/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"state":{"entry":"entry.rb","target":{"local":true}}},"modules":{"lab.state":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$fixture/options.json" <<'JSON'
+{"options":[{"path":"lab.state.enable","type":"boolean","default":false,"description":"State fixture"}]}
+JSON
+cat > "$fixture/entry.rb" <<'RUBY'
+raise "planning must run without root" if Process.euid == 0
+configure 'lab.state', enable: true
+RUBY
+cat > "$fixture/expand.rb" <<'RUBY'
+raise "expansion must run without root" if Process.euid == 0
+file_resource("/home/dek/reviewed.txt", content: "reviewed bytes\n")
+RUBY
+
+dek --version
+dek --repo "$fixture" plan --host state --json > "$fixture/first.json"
+id=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0), encoding: "UTF-8")).fetch("plan_id")' "$fixture/first.json")
+digest=$(printf 'reviewed bytes\n' | sha256sum | cut -d ' ' -f 1)
+plan="/var/lib/dek/plans/$id.mpk"
+object="/var/lib/dek/objects/$digest"
+[[ "$(stat -c '%u:%a' /var/lib/dek /var/lib/dek/plans /var/lib/dek/objects | sort -u)" == "$(id -u):700" ]]
+[[ "$(stat -c '%u:%a' "$plan" "$object" | sort -u)" == "$(id -u):600" ]]
+stat -c '%u:%a %n' /var/lib/dek /var/lib/dek/plans /var/lib/dek/objects "$plan" "$object"
+before=$(sha256sum "$plan" "$object")
+printf '%s\n' "$before"
+for path in "$plan" "$object"; do
+    if sudo -n -u dek-foreign sh -c 'printf tampered > "$1"' sh "$path" 2>"$fixture/attempt.log"; then
+        printf 'Untrusted account wrote %s\n' "$path" >&2
+        exit 1
+    fi
+    grep -F 'Permission denied' "$fixture/attempt.log"
+done
+
+dek --repo "$fixture" plan --host state --json > "$fixture/again.json"
+cmp "$fixture/first.json" "$fixture/again.json"
+[[ "$(sha256sum "$plan" "$object")" == "$before" ]]
+[[ "$(cat "$object")" == 'reviewed bytes' ]]
+[[ ! -e /home/dek/reviewed.txt ]]
+printf 'Default state path, unprivileged planning, denied writes and verified reuse passed.\n'
