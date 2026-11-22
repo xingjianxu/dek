@@ -5,8 +5,10 @@ use std::{
 };
 
 use dek_core::{OptionDefinition, OptionPath, Origin, Priority};
-use serde::{Deserialize, Deserializer};
-use serde_json::Value;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Value, json};
+
+use crate::cache::semantic_digest;
 use thiserror::Error;
 
 #[derive(Debug, Default)]
@@ -74,7 +76,7 @@ fn present_value<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Va
     Value::deserialize(deserializer).map(Some)
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum MergeStrategy {
     #[default]
@@ -84,7 +86,7 @@ pub(super) enum MergeStrategy {
     Map,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub(super) enum ValueType {
     Primitive(PrimitiveType),
@@ -92,7 +94,7 @@ pub(super) enum ValueType {
     Map { map: Box<Self> },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum PrimitiveType {
     Any,
@@ -112,6 +114,22 @@ pub(super) struct RegisteredOption {
 }
 
 impl SchemaRegistry {
+    pub(super) fn merge_signature(&self) -> String {
+        let schemas = self
+            .options
+            .iter()
+            .map(|option| {
+                json!([
+                    option.schema.path,
+                    option.schema.value_type,
+                    option.schema.merge,
+                    option.default
+                ])
+            })
+            .collect::<Vec<_>>();
+        format!("rust-merge-v1:{}", semantic_digest(&Value::Array(schemas)))
+    }
+
     /// Register one static schema document atomically. `file` is the source path
     /// used for diagnostics and for relative defaults of type `sourceFile`.
     pub fn register_json(

@@ -1,15 +1,20 @@
 //! Static option schemas and source-preserving configuration merging.
 
 mod merge;
+mod merge_cache;
+mod provenance;
 mod schema;
 
 pub use merge::MergeError;
+pub use merge_cache::{CachedMergeError, merge_cache_key};
 pub use schema::{SchemaError, SchemaLocation, SchemaRegistry, ValueMismatch};
 
 mod builtin_apps;
 pub use builtin_apps::{register_app_modules, register_app_schemas};
 
 mod expansion;
+mod expansion_cache;
+pub use expansion_cache::ExpansionCache;
 mod resources;
 
 pub use expansion::{

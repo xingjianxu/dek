@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::BTreeMap, fs, num::NonZeroU32, path::PathBuf, rc::Rc};
 
-use dek_core::{OptionPath, Origin, protocol::EvalOperation};
-use serde_json::json;
+use dek_core::{HostConfig, OptionPath, Origin, protocol::EvalOperation};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
@@ -11,6 +11,7 @@ use crate::{
 
 use super::{
     ExpansionError, ModuleDefinition, ModuleOutput, ModuleRegistry, SchemaError, SchemaRegistry,
+    expansion_cache::ModuleCache,
 };
 
 #[derive(Debug, Error)]
@@ -131,47 +132,58 @@ impl RepositoryModules {
     ) -> Result<(), ExpansionError> {
         let runtime = Rc::new(RefCell::new((ruby, providers)));
         for module in &self.entries {
+            let cache = if module.inputs == Some(InputPolicy::Sdk) {
+                ModuleCache::Ruby(Rc::clone(&runtime))
+            } else {
+                ModuleCache::Dynamic
+            };
             let runtime = Rc::clone(&runtime);
             let repo_root = self.repo_root.clone();
             let entry = repo_root.join(&module.entry);
-            registry.register(module.definition.clone(), move |context| {
-                let options: BTreeMap<_, _> = context
-                    .options
-                    .options
-                    .iter()
-                    .map(|(path, option)| (path, &option.value))
-                    .collect();
-                let option_origins: BTreeMap<_, _> = context
-                    .options
-                    .options
-                    .iter()
-                    .filter_map(|(path, option)| {
-                        option
-                            .effective_definitions
-                            .first()
-                            .map(|definition| (path, &definition.origin))
-                    })
-                    .collect();
-                let (ruby, providers) = &mut *runtime.borrow_mut();
-                let evaluated = ruby
-                    .evaluate_with_sdk(
-                        EvalOperation::Expand,
-                        &repo_root,
-                        &entry,
-                        json!({ "options": options, "optionOrigins": option_origins }),
-                        providers.reborrow(),
-                    )
-                    .map_err(|err| err.to_string())?;
-                if !evaluated.result.is_object() {
-                    return Err("module output must be a JSON object".into());
-                }
-                let mut output: ModuleOutput =
-                    serde_path_to_error::deserialize(evaluated.result)
-                        .map_err(|err| format!("invalid module output: {err}"))?;
-                output.inputs.extend(evaluated.inputs);
-                Ok(output)
-            })?;
+            registry.register_with_cache(
+                module.definition.clone(),
+                move |context| {
+                    let (ruby, providers) = &mut *runtime.borrow_mut();
+                    let evaluated = ruby
+                        .evaluate_with_sdk(
+                            EvalOperation::Expand,
+                            &repo_root,
+                            &entry,
+                            ruby_context(context.options),
+                            providers.reborrow(),
+                        )
+                        .map_err(|err| err.to_string())?;
+                    if !evaluated.result.is_object() {
+                        return Err("module output must be a JSON object".into());
+                    }
+                    let mut output: ModuleOutput =
+                        serde_path_to_error::deserialize(evaluated.result)
+                            .map_err(|err| format!("invalid module output: {err}"))?;
+                    output.inputs.extend(evaluated.inputs);
+                    Ok(output)
+                },
+                cache,
+            )?;
         }
         Ok(())
     }
+}
+
+pub(super) fn ruby_context(config: &HostConfig) -> Value {
+    let options: BTreeMap<_, _> = config
+        .options
+        .iter()
+        .map(|(path, option)| (path, &option.value))
+        .collect();
+    let option_origins: BTreeMap<_, _> = config
+        .options
+        .iter()
+        .filter_map(|(path, option)| {
+            option
+                .effective_definitions
+                .first()
+                .map(|definition| (path, &definition.origin))
+        })
+        .collect();
+    json!({ "options": options, "optionOrigins": option_origins })
 }

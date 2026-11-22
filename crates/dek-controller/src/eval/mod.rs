@@ -5,7 +5,7 @@ mod graph;
 mod host;
 mod json;
 mod languages;
-mod observations;
+pub(crate) mod observations;
 mod ruby;
 mod ruby_runtime;
 

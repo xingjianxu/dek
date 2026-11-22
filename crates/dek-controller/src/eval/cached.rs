@@ -25,11 +25,16 @@ enum CachedLanguage {
 pub struct CachedCollector<'cache, 'language> {
     store: &'cache CacheStore,
     language: LanguageCollector<'language>,
+    last_revision: Option<CacheDigest>,
 }
 
 impl<'cache, 'language> CachedCollector<'cache, 'language> {
     pub fn new(store: &'cache CacheStore, language: LanguageCollector<'language>) -> Self {
-        Self { store, language }
+        Self {
+            store,
+            language,
+            last_revision: None,
+        }
     }
 
     /// Resolve the expected signature for looking up this unit's stored result.
@@ -48,6 +53,7 @@ impl<'cache, 'language> CachedCollector<'cache, 'language> {
 
 impl Collector for CachedCollector<'_, '_> {
     fn collect(&mut self, request: &CollectRequest<'_>) -> Result<UnitSpec, CollectError> {
+        self.last_revision = None;
         let Some(language) = cached_language(request.entry, request.input_policy) else {
             return self.language.collect(request);
         };
@@ -83,13 +89,12 @@ impl Collector for CachedCollector<'_, '_> {
 
             for lookup in &mut snapshots {
                 if let Some(entry) = lookup.entry.take()
-                    && observations::unchanged(
-                        &mut self.language,
-                        request.repo_root,
-                        &entry.dependencies,
-                    )
+                    && observations::unchanged(request.repo_root, &entry.dependencies, |input| {
+                        self.language.reobserve_provider_input(input)
+                    })
                     .unwrap_or(false)
                 {
+                    self.last_revision = lookup.revision();
                     return Ok(entry.output);
                 }
             }
@@ -114,19 +119,25 @@ impl Collector for CachedCollector<'_, '_> {
                 semantic_digest: collection_semantic_digest(&spec),
                 output: spec,
             };
-            let published = self
+            let (published, revision) = self
                 .store
-                .publish(lookup, &entry, |dependencies| {
+                .publish_with_revision(lookup, &entry, |dependencies| {
                     if self.signature(language).as_deref() != Some(signature.as_str()) {
                         return Ok(false);
                     }
-                    observations::unchanged(&mut self.language, request.repo_root, dependencies)
-                        .map_err(Into::into)
+                    observations::unchanged(request.repo_root, dependencies, |input| {
+                        self.language.reobserve_provider_input(input)
+                    })
+                    .map_err(Into::into)
                 })
                 .map_err(cache_error)?;
 
             match published {
-                Publication::Published => return Ok(entry.output),
+                Publication::Published => {
+                    self.last_revision = revision;
+                    return Ok(entry.output);
+                }
+
                 Publication::Superseded => continue,
                 Publication::InputsChanged => {
                     return Err(collect_error(
@@ -140,25 +151,31 @@ impl Collector for CachedCollector<'_, '_> {
             "declaration cache changed concurrently; retry",
         ))
     }
+
+    fn last_cache_revision(&self) -> Option<CacheDigest> {
+        self.last_revision
+    }
 }
 
 impl CollectedUnit {
     /// Reconstruct the persistent collection key, when this unit uses the cache policy.
     pub fn cache_key(&self, host: &str, target: &Target) -> Option<UnitKey> {
         cached_language(&self.entry, self.input_policy)?;
+        Some(self.dependency_key(host, target))
+    }
+
+    pub(crate) fn dependency_key(&self, host: &str, target: &Target) -> UnitKey {
         let key = unit_key(&self.entry, &self.name, self.priority, &self.params);
-        Some(
-            if self
-                .spec
-                .inputs
-                .iter()
-                .any(|input| observations::is_target(input.kind))
-            {
-                scoped_key(key, host, target)
-            } else {
-                key
-            },
-        )
+        if self
+            .spec
+            .inputs
+            .iter()
+            .any(|input| observations::is_target(input.kind))
+        {
+            scoped_key(key, host, target)
+        } else {
+            key
+        }
     }
 }
 
