@@ -23,7 +23,7 @@ use rustix::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::secrets::accounts::{group_id, user_id};
+use crate::accounts::{group_id, user_id};
 use atomic_file::{StagedFile, TargetPath, same_revision};
 
 #[derive(Default)]

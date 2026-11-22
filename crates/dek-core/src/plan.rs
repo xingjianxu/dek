@@ -138,6 +138,10 @@ pub enum ActionKind {
     },
     EnsureDirectory(DirectoryResource),
     EnsureUser(UserResource),
+    SetUserPrimaryGroup {
+        user: String,
+        group: String,
+    },
     EnsureGroup(GroupResource),
     InstallPackage {
         package: PackageId,
@@ -179,6 +183,14 @@ pub enum Precondition {
         path: String,
         expected: AgeSecretObservation,
     },
+    UserAccount {
+        user: String,
+        expected: Option<UserObservation>,
+    },
+    GroupAccount {
+        group: String,
+        expected: Option<u32>,
+    },
     PackageVersion {
         package: PackageId,
         expected: Option<String>,
@@ -202,6 +214,18 @@ pub enum Precondition {
 pub enum FileObservation {
     Missing,
     Present(FileContent),
+}
+
+/// Local account identity and observed managed fields, with no credential data.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserObservation {
+    pub uid: u32,
+    pub primary_gid: Option<u32>,
+    pub extra_groups: Option<BTreeSet<String>>,
+    pub home: Option<String>,
+    pub shell: Option<String>,
+    pub description: Option<String>,
 }
 
 /// A target-side verification result. It deliberately has no plaintext fingerprint.

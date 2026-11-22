@@ -594,7 +594,7 @@ fn action_kind(action: &ActionKind) -> ResourceKind {
         | ActionKind::SetFileAttributes { .. }
         | ActionKind::RemoveFile { .. } => ResourceKind::File,
         ActionKind::EnsureDirectory(_) => ResourceKind::Directory,
-        ActionKind::EnsureUser(_) => ResourceKind::User,
+        ActionKind::EnsureUser(_) | ActionKind::SetUserPrimaryGroup { .. } => ResourceKind::User,
         ActionKind::EnsureGroup(_) => ResourceKind::Group,
         ActionKind::InstallPackage { .. } | ActionKind::RemovePackage { .. } => {
             ResourceKind::Package

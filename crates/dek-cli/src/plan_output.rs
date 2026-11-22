@@ -51,6 +51,9 @@ pub(crate) fn description(action: &ActionKind) -> String {
         ActionKind::RemoveFile { path } => format!("移除文件 {path}"),
         ActionKind::EnsureDirectory(directory) => format!("设置目录 {}", directory.path),
         ActionKind::EnsureUser(user) => format!("设置用户 {}", user.name),
+        ActionKind::SetUserPrimaryGroup { user, group } => {
+            format!("设置用户 {user} 的主组 {group}")
+        }
         ActionKind::EnsureGroup(group) => format!("设置组 {}", group.name),
         ActionKind::InstallPackage {
             package,
