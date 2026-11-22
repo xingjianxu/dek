@@ -79,16 +79,6 @@ impl Directory {
         Ok(dir)
     }
 
-    pub(super) fn existing_private_child(&self, name: &str) -> Result<Option<Self>, StateError> {
-        match self.open_child(OsStr::new(name), true) {
-            Ok(dir) => Ok(Some(dir)),
-            Err(StateError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-                Ok(None)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
     fn open_child(&self, name: &OsStr, private: bool) -> Result<Self, StateError> {
         let path = self.path.join(name);
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
