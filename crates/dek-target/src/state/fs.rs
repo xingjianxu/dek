@@ -8,7 +8,7 @@ use std::{
 };
 
 use rustix::{
-    fs::{Mode, OFlags, RenameFlags, mkdirat, openat, renameat_with, unlinkat},
+    fs::{Mode, OFlags, RenameFlags, fchmod, mkdirat, openat, renameat_with, unlinkat},
     process::geteuid,
 };
 
@@ -127,22 +127,20 @@ impl Directory {
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
         let path = self.path.join(name);
         let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
+        let mode = Mode::from_bits_truncate(0o600);
         let (temp, mut file) = loop {
             let count = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let temp = format!(".stage-{}-{count}", std::process::id());
-            match openat(
-                &self.fd,
-                temp.as_str(),
-                flags,
-                Mode::from_bits_truncate(0o600),
-            ) {
+            match openat(&self.fd, temp.as_str(), flags, mode) {
                 Ok(fd) => break (temp, File::from(fd)),
                 Err(rustix::io::Errno::EXIST) => continue,
                 Err(err) => return Err(StateError::io("暂存文件", &path, err.into())),
             }
         };
-        let result = file
-            .write_all(data)
+        // Set the exact persisted mode even when umask masks owner permissions.
+        let result = fchmod(&file, mode)
+            .map_err(io::Error::from)
+            .and_then(|()| file.write_all(data))
             .and_then(|()| file.sync_all())
             .and_then(|()| {
                 renameat_with(

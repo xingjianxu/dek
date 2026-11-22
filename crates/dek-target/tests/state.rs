@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use std::{collections::BTreeMap, fs, os::unix::fs::symlink};
+use std::{collections::BTreeMap, env, fs, os::unix::fs::symlink, path::Path, process::Command};
 
 use dek_core::{
     ContentDigest, DesiredResource, FileAttributes, FileContent, FileResource, FileState, Resource,
@@ -119,5 +119,55 @@ fn binds_identical_plan_to_each_logical_host() {
                 }
             )
             .is_err()
+    );
+}
+
+#[test]
+fn restrictive_umask_keeps_new_records_and_objects_readable() {
+    const CHILD_ROOT: &str = "DEK_TEST_RESTRICTIVE_STATE_ROOT";
+    if let Some(root) = env::var_os(CHILD_ROOT) {
+        let store = StateStore::open(Path::new(&root)).unwrap();
+        let state = store.lock().unwrap();
+        let target = target();
+        let registry = BackendRegistry::new(target.clone(), 1, |path| Ok(path.into()));
+        let resources = ResourceSet::default();
+        let plan = plan_for_host(&registry, "repo", "host", &resources, &[]).unwrap();
+        let (digest, _) = wanted(b"reviewed");
+
+        state.put_object(&digest, b"reviewed").unwrap();
+        state
+            .save_plan("host", &plan, &resources, &BTreeMap::new())
+            .unwrap();
+        assert_eq!(
+            state
+                .load_plan(&plan.id, binding("host", &target))
+                .unwrap()
+                .plan,
+            plan
+        );
+        assert_eq!(state.read_object(&digest).unwrap(), b"reviewed");
+        return;
+    }
+
+    let storage = tempfile::tempdir().unwrap();
+    let root = storage.path().join("state");
+    let store = StateStore::open(&root).unwrap();
+    // Preinitialize the directories and lock so the child tests publication.
+    drop(store.lock().unwrap());
+    let output = Command::new("sh")
+        .args(["-c", "umask 0200; exec \"$@\"", "sh"])
+        .arg(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "restrictive_umask_keeps_new_records_and_objects_readable",
+        ])
+        .env(CHILD_ROOT, &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
