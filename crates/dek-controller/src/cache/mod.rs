@@ -29,6 +29,7 @@ pub enum UnitStage {
     Collect,
     Merge,
     Expand,
+    TargetSnapshot,
 }
 
 /// Stable identity of an evaluation unit across evaluations.

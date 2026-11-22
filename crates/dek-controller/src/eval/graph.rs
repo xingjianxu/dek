@@ -22,6 +22,7 @@ pub struct CollectRequest<'a> {
     pub input_policy: Option<InputPolicy>,
     pub host: &'a str,
     pub target: &'a Target,
+    pub target_id: Option<&'a str>,
 }
 
 impl CollectRequest<'_> {
@@ -98,6 +99,7 @@ pub struct CollectedUnit {
     pub input_policy: Option<InputPolicy>,
     pub spec: UnitSpec,
     pub cache_revision: Option<CacheDigest>,
+    pub(crate) target_id: Option<String>,
     /// 每条 `spec.imports` 对应的 `DeclarationGraph::profiles` 下标。
     pub dependencies: Vec<usize>,
 }
@@ -121,6 +123,10 @@ pub fn collect_graph(
         repo,
         host: name,
         target: &host.target,
+        target_id: match host.target {
+            Target::Local => None,
+            Target::Ssh(_) => host.target_id.as_deref(),
+        },
         collector,
     };
     let host = builder.collect_unit(
@@ -153,6 +159,7 @@ struct GraphBuilder<'a> {
     repo: &'a Repository,
     host: &'a str,
     target: &'a Target,
+    target_id: Option<&'a str>,
     collector: &'a mut dyn Collector,
 }
 
@@ -255,6 +262,7 @@ impl GraphBuilder<'_> {
             input_policy,
             host: self.host,
             target: self.target,
+            target_id: self.target_id,
         };
         let spec = self
             .collector
@@ -269,6 +277,7 @@ impl GraphBuilder<'_> {
             priority,
             params,
             input_policy,
+            target_id: self.target_id.map(str::to_owned),
             spec,
             cache_revision: self.collector.last_cache_revision(),
             dependencies: Vec::new(),

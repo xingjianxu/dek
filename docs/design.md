@@ -375,7 +375,7 @@ dek hosts
 
 主机参数的完整写法为 `--host server`。首版中 `hosts`、`show`、`plan` 和 `status` 均支持 `--json` 输出，便于脚本集成（例如将升级预览输出的 `plan_id` 直接传给 `apply --plan`）。`apply` 与 `upgrade` 开始执行时会输出 `run_id` 供后续追踪。所有子命令均支持 `--help`。
 
-`show --json` 的 `options` 以完整选项路径索引生效值、优先级和定义来源。指定路径时，`options` 仅包含对应项。依赖注入的目标快照参与求值时，输出的 `targetSnapshot.label` 记录来源标签。
+`show --json` 的 `options` 以完整选项路径索引生效值、优先级和定义来源。指定路径时，`options` 仅包含对应项。`show --target-snapshot -H <host>` 使用该 SSH 目标已记录的输入离线预览。快照参与求值时，文本输出和 JSON 的 `targetSnapshot.label` 都记录来源。
 
 ### 7.3 从配置修改到远端生效
 

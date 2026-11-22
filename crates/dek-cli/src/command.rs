@@ -12,8 +12,10 @@ use crate::{
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dek_controller::{
+    cache::{CacheError, CacheStore},
+    eval::TargetProvider,
     repo::{EntryLanguage, HostSelector, Repository, Target, initialize},
-    transport::SshSession,
+    transport::{RemoteTarget, SshSession, TargetInputSnapshot},
 };
 use dek_core::{OptionPath, TargetCapabilities};
 use serde_json::json;
@@ -64,6 +66,9 @@ enum Command {
         /// 要追溯的完整选项路径，省略时显示整机配置。
         #[arg(value_name = "选项")]
         option: Option<OptionPath>,
+        /// 使用此 SSH 目标已记录的输入快照离线预览。
+        #[arg(long)]
+        target_snapshot: bool,
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
@@ -214,30 +219,65 @@ fn run_command<'target>(
             let repo = discover_repo(cli.repo.as_deref())?;
             list_hosts(&mut out, &repo, cli.host.as_deref(), json)?;
         }
-        Command::Show { option, json } => {
+        Command::Show {
+            option,
+            json,
+            target_snapshot,
+        } => {
             let repo = discover_repo(cli.repo.as_deref())?;
             let selected = HostSelection::from_arg(cli.host)?;
+            let selector = selected.selector();
+            let (name, entry) = repo.select_host(selector)?;
             let cache = normal_cache(&repo)?;
-            show::show(
-                &mut out,
-                &repo,
-                selected.selector(),
-                option.as_ref(),
-                json,
-                &mut show::UnavailableTarget,
-                cache.as_ref(),
-            )?;
+            let mut display = |provider: &mut dyn TargetProvider| {
+                show::show(
+                    &mut out,
+                    &repo,
+                    selector,
+                    option.as_ref(),
+                    json,
+                    provider,
+                    cache.as_ref(),
+                )
+            };
+            match &entry.target {
+                Target::Local => {
+                    if target_snapshot {
+                        return Err("--target-snapshot 用于 SSH 目标".into());
+                    }
+                    display(&mut LocalEvaluationTarget(&local_target()?))?;
+                }
+                Target::Ssh(alias) => {
+                    let expected = entry.target_id.as_deref().unwrap_or(name);
+                    if target_snapshot {
+                        let store = cache.as_ref().ok_or(CacheError::CacheHomeUnavailable)?;
+                        display(&mut TargetInputSnapshot::new(store, name, alias, expected))?;
+                    } else {
+                        let mut provider =
+                            RemoteTarget::on_demand(cache.as_ref(), name, alias, expected);
+                        display(&mut provider)?;
+                        provider.finish()?;
+                    }
+                }
+            }
         }
         Command::Refresh => {
             let repo = discover_repo(cli.repo.as_deref())?;
             let selected = HostSelection::from_arg(cli.host)?;
             let selector = selected.selector();
-            if repo.select_host(selector)?.1.target == Target::Local {
-                let registry = local_target()?;
-                let mut provider = LocalEvaluationTarget(&registry);
-                refresh::refresh(&mut out, &repo, selector, &mut provider)?;
-            } else {
-                refresh::refresh(&mut out, &repo, selector, &mut show::UnavailableTarget)?;
+            let (name, entry) = repo.select_host(selector)?;
+            let cache = CacheStore::for_repository(repo.root())?;
+            let mut refresh = |provider: &mut dyn TargetProvider| {
+                refresh::refresh(&mut out, &repo, selector, provider, &cache)
+            };
+            match &entry.target {
+                Target::Local => refresh(&mut LocalEvaluationTarget(&local_target()?))?,
+                Target::Ssh(alias) => {
+                    let expected = entry.target_id.as_deref().unwrap_or(name);
+                    let mut provider = RemoteTarget::on_demand(Some(&cache), name, alias, expected);
+                    refresh(&mut provider)?;
+                    provider.finish()?;
+                }
             }
         }
         Command::TargetInfo { json } => {

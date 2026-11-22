@@ -12,9 +12,9 @@ pub(super) fn refresh(
     repo: &Repository,
     selector: HostSelector<'_>,
     target: &mut dyn TargetProvider,
+    cache: &CacheStore,
 ) -> Result<(), Box<dyn Error>> {
-    let cache = CacheStore::for_repository(repo.root())?;
-    let mut http = RefreshHttpInputs::new(&cache);
+    let mut http = RefreshHttpInputs::new(cache);
     let mut ruby = RubySession::new();
     let mut providers = RubyProviders {
         target,

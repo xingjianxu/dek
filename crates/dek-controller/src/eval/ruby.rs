@@ -78,7 +78,7 @@ enum HttpKind {
     Http,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TargetAnswer {
     pub value: Value,
     pub observation: Observation,

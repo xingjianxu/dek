@@ -3,21 +3,21 @@
 use std::{
     env,
     error::Error,
-    fs::{self, File, Metadata, OpenOptions},
-    io::{self, Read},
+    fs::{self, Metadata},
+    io,
     path::Path,
 };
 
 use dek_controller::eval::{TargetAnswer, TargetProvider};
 use dek_core::{
     ActionKind, ContentDigest, DesiredResource, FileAttributes, FileContent, FileObservation,
-    FileResource, FileState, Observation, Precondition, ResourceCapability, ResourceKind,
-    TargetIdentity,
-    protocol::{TargetQuery, TargetQueryKind},
-    target_protocol::TARGET_PROTOCOL_VERSION,
+    FileResource, FileState, Precondition, ResourceCapability, ResourceKind, TargetIdentity,
+    protocol::TargetQuery, target_protocol::TARGET_PROTOCOL_VERSION,
 };
-use dek_target::backend::{Backend, BackendError, BackendRegistry, PlannedAction};
-use serde_json::{Value, json};
+use dek_target::{
+    backend::{Backend, BackendError, BackendRegistry, PlannedAction},
+    inputs::{absolute_path, observe, open_regular},
+};
 use sha2::{Digest, Sha256};
 
 pub struct LocalFileBackend;
@@ -77,16 +77,6 @@ fn normalize_path(raw: &str) -> Result<String, BackendError> {
         .into_os_string()
         .into_string()
         .map_err(|_| BackendError(format!("resolved path for {raw:?} is not UTF-8")))
-}
-
-fn absolute_path(raw: &str) -> Result<&Path, BackendError> {
-    let path = Path::new(raw);
-    if !path.is_absolute() || raw.contains('\0') {
-        return Err(BackendError(format!(
-            "expected an absolute target path: {raw:?}"
-        )));
-    }
-    Ok(path)
 }
 
 impl Backend for LocalFileBackend {
@@ -243,97 +233,12 @@ fn observe_mode(_: &Metadata) -> Option<String> {
     None
 }
 
-fn open_regular(path: &Path, follow_links: bool) -> io::Result<Option<(File, Metadata)>> {
-    let metadata = if follow_links {
-        fs::metadata(path)
-    } else {
-        fs::symlink_metadata(path)
-    };
-    let metadata = match metadata {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    ensure_regular(&metadata)?;
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let flags = libc::O_NONBLOCK | if follow_links { 0 } else { libc::O_NOFOLLOW };
-        options.custom_flags(flags);
-    }
-    let file = options.open(path)?;
-    let metadata = file.metadata()?;
-    ensure_regular(&metadata)?;
-    Ok(Some((file, metadata)))
-}
-
-fn ensure_regular(metadata: &Metadata) -> io::Result<()> {
-    if metadata.is_file() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected a regular file",
-        ))
-    }
-}
-
 pub struct LocalEvaluationTarget<'a, 'registry>(pub &'a BackendRegistry<'registry>);
 
 impl TargetProvider for LocalEvaluationTarget<'_, '_> {
     fn query(&mut self, query: &TargetQuery) -> Result<TargetAnswer, String> {
-        let target = self.0.target();
-        let value = match query.kind {
-            TargetQueryKind::Fact => match query.key.as_str() {
-                "architecture" => json!(target.architecture),
-                "os" => json!(target.os),
-                "distribution" => json!(target.distribution),
-                "id" => json!(target.id),
-                _ => Value::Null,
-            },
-            TargetQueryKind::Capability => {
-                let supported = self.0.capabilities().resources.iter().any(|capability| {
-                    json!(capability.kind).as_str().is_some_and(|kind| {
-                        query.key == kind
-                            || query
-                                .key
-                                .strip_prefix(kind)
-                                .and_then(|suffix| suffix.strip_prefix('.'))
-                                .is_some_and(|attribute| capability.attributes.contains(attribute))
-                    })
-                });
-                json!(supported)
-            }
-            TargetQueryKind::ReadText => {
-                let path = absolute_path(&query.key).map_err(|err| err.to_string())?;
-                let Some((mut file, _)) = open_regular(path, true)
-                    .map_err(|err| format!("cannot read target file {}: {err}", path.display()))?
-                else {
-                    return Ok(TargetAnswer {
-                        value: Value::Null,
-                        observation: Observation::Missing,
-                    });
-                };
-                let mut content = String::new();
-                file.read_to_string(&mut content)
-                    .map_err(|err| format!("cannot read target file {}: {err}", path.display()))?;
-                let observation =
-                    Observation::Digest(format!("sha256:{:x}", Sha256::digest(content.as_bytes())));
-                return Ok(TargetAnswer {
-                    value: Value::String(content),
-                    observation,
-                });
-            }
-        };
-        let observation = if value.is_null() {
-            Observation::Missing
-        } else {
-            let encoded = serde_json::to_vec(&value).map_err(|err| err.to_string())?;
-            Observation::Digest(format!("sha256:{:x}", Sha256::digest(&encoded)))
-        };
+        let (value, observation) =
+            observe(self.0, query.kind, &query.key).map_err(|error| error.to_string())?;
         Ok(TargetAnswer { value, observation })
     }
 }
