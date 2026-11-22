@@ -6,6 +6,11 @@ use std::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
+use dek_cli::{
+    local_target::{LocalEvaluationTarget, LocalFileBackend, local_registry},
+    plan_output::write_plan,
+    planning::plan_host,
+};
 use dek_controller::repo::{EntryLanguage, HostSelector, Repository, Target, initialize};
 use dek_core::OptionPath;
 use serde_json::json;
@@ -52,6 +57,12 @@ enum Command {
         /// 要追溯的完整选项路径，省略时显示整机配置。
         #[arg(value_name = "选项")]
         option: Option<OptionPath>,
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
+    },
+    /// 观测本机目标并预览配置差异。
+    Plan {
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
@@ -108,6 +119,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 json,
                 &mut show::UnavailableTarget,
             )?;
+        }
+        Command::Plan { json } => {
+            let repo = repository::discover_repo(cli.repo.as_deref())?;
+            let selection = repository::HostSelection::from_arg(cli.host)?;
+            let registry = local_registry(&LocalFileBackend)?;
+            let mut provider = LocalEvaluationTarget(&registry);
+            let planned = plan_host(&repo, selection.selector(), &registry, &mut provider)?;
+            write_plan(&mut out, &planned.name, &planned.plan, json)?;
         }
     }
     Ok(())
