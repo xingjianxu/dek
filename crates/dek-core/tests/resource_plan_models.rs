@@ -199,3 +199,33 @@ fn rejects_unknown_actions_and_unsupported_plan_versions() {
         assert!(error.to_string().contains(expected), "{error}");
     }
 }
+
+#[test]
+fn repository_transaction_round_trips_as_an_atomic_reviewed_action() {
+    use dek_core::{
+        RepositoryPackageCandidate, RepositoryPackageChange, RepositoryTransaction,
+        RepositoryTransactionScope,
+    };
+
+    let kind = ActionKind::RepositoryTransaction(RepositoryTransaction {
+        scope: RepositoryTransactionScope::Upgrade,
+        targets: vec!["successor".into()],
+        changes: vec![RepositoryPackageChange::Replace {
+            package: "retired".into(),
+            installed_version: "1-1".into(),
+            candidate: RepositoryPackageCandidate {
+                name: "successor".into(),
+                version: "2-1".into(),
+                repository: "fixture".into(),
+                sha256: "a".repeat(64),
+            },
+        }],
+    });
+    let json = serde_json::to_value(&kind).unwrap();
+    assert_eq!(json["repositoryTransaction"]["scope"], "upgrade");
+    assert_eq!(
+        json["repositoryTransaction"]["changes"][0]["replace"]["installedVersion"],
+        "1-1"
+    );
+    assert_eq!(serde_json::from_value::<ActionKind>(json).unwrap(), kind);
+}

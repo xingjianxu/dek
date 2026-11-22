@@ -10,10 +10,10 @@ use dek_controller::{
     transport::{RemoteTarget, SshSession},
 };
 use dek_core::{
-    HostConfig, InputKind, InputObservation, Plan,
+    HostConfig, InputKind, InputObservation, Plan, PlanMode,
     target_protocol::{PlanRequest, RemotePlan},
 };
-use dek_target::{backend::BackendRegistry, planner::plan_for_host_with_contents};
+use dek_target::{backend::BackendRegistry, planner::plan_for_host_with_contents_mode};
 
 use crate::evaluation::{evaluate_options, expand_host};
 
@@ -40,18 +40,30 @@ pub fn plan_host_with_cache(
     provider: &mut dyn TargetProvider,
     cache: Option<&CacheStore>,
 ) -> Result<PlannedHost, Box<dyn Error>> {
+    plan_host_with_cache_mode(repo, selector, registry, provider, cache, PlanMode::Normal)
+}
+
+pub fn plan_host_with_cache_mode(
+    repo: &Repository,
+    selector: HostSelector<'_>,
+    registry: &BackendRegistry<'_>,
+    provider: &mut dyn TargetProvider,
+    cache: Option<&CacheStore>,
+    mode: PlanMode,
+) -> Result<PlannedHost, Box<dyn Error>> {
     let (name, entry) = repo.select_host(selector)?;
     if let Target::Ssh(alias) = &entry.target {
         return Err(format!("主机 {name:?} 使用 SSH 别名 {alias:?}，需要远程规划连接").into());
     }
     let (config, expanded, used_inputs) = evaluate_resources(repo, selector, provider, cache)?;
-    let plan = plan_for_host_with_contents(
+    let plan = plan_for_host_with_contents_mode(
         registry,
         &repository_id(repo),
         name,
         &expanded.resources,
         &used_inputs,
         &expanded.contents,
+        mode,
     )?;
     Ok(PlannedHost {
         name: name.into(),
@@ -66,6 +78,7 @@ pub fn plan_remote_host(
     selector: HostSelector<'_>,
     session: &mut SshSession,
     cache: Option<&CacheStore>,
+    mode: PlanMode,
 ) -> Result<RemotePlan, Box<dyn Error>> {
     let (name, _) = repo.select_host(selector)?;
     let (_, expanded, used_inputs) = {
@@ -77,6 +90,7 @@ pub fn plan_remote_host(
         logical_host: name.into(),
         resources: expanded.resources,
         used_inputs,
+        mode,
     };
     Ok(session.request_plan(request, &expanded.contents)?)
 }

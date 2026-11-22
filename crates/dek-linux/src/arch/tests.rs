@@ -26,7 +26,9 @@ fn fixture(preview: &str) -> (tempfile::TempDir, PacmanBackend) {
 state_dir=$(dirname "$0")
 printf '%s\n' "$*" >> "$state_dir/argv"
 case "$1:${{2:-}}" in
-    --query:--color) printf 'ripgrep 15.2.0-1\ntree 2.3.2-1\n' ;;
+    --query:--color)
+        if [ -f "$state_dir/query-diagnostic" ]; then cat "$state_dir/query-diagnostic" >&2; fi
+        printf 'ripgrep 15.2.0-1\ntree 2.3.2-1\n' ;;
     --remove:--print) printf '%s\n' '{}' ;;
     *) printf 'hook diagnostic\n'; printf 'unexpected invocation\n' >&2; exit 49 ;;
 esac
@@ -102,7 +104,7 @@ fn only_previews_the_reviewed_single_package_and_version() {
 }
 
 #[test]
-fn rejects_ambiguous_rows_and_unavailable_sources() {
+fn rejects_ambiguous_rows_and_unsupported_aur_removals() {
     assert!(package_rows("tree 2.3.2-1\ntree 2.3.1-1\n").is_err());
     assert!(package_rows("tree\n").is_err());
     let backend = PacmanBackend::default();
@@ -114,9 +116,14 @@ fn rejects_ambiguous_rows_and_unavailable_sources() {
         state: Presence::Present,
     });
     assert_ne!(aur.id(), request("tree", Presence::Present).id());
+    assert!(backend.validate(&aur).is_ok());
+    let DesiredResource::Package(mut absent) = aur else {
+        unreachable!()
+    };
+    absent.state = Presence::Absent;
     assert!(
         backend
-            .validate(&aur)
+            .validate(&DesiredResource::Package(absent))
             .unwrap_err()
             .to_string()
             .contains("AUR")
@@ -138,5 +145,26 @@ fn reports_native_hook_details_from_both_output_streams() {
     assert!(
         error.contains("hook diagnostic") && error.contains("unexpected invocation"),
         "{error}"
+    );
+}
+
+#[test]
+fn local_query_tolerates_missing_sync_metadata_and_reports_local_read_errors() {
+    let (fixture, backend) = fixture("tree\t2.3.2-1");
+    let file = fixture.path().join("query-diagnostic");
+    fs::write(
+        &file,
+        "warning: database file for 'core' does not exist (use '-Sy' to download)\n",
+    )
+    .unwrap();
+    let package = request("ripgrep", Presence::Present);
+    assert!(backend.observe(&package).is_ok());
+    fs::write(&file, "error: cannot read local package description\n").unwrap();
+    assert!(
+        backend
+            .observe(&package)
+            .unwrap_err()
+            .0
+            .contains("cannot read local")
     );
 }

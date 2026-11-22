@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
-    ContentDigest, InputObservation, Observation, PendingRunNotification, Plan, ResourceSet,
-    TargetCapabilities, protocol::TargetQueryKind,
+    ContentDigest, InputObservation, Observation, PendingRunNotification, Plan, PlanMode,
+    ResourceSet, TargetCapabilities, protocol::TargetQueryKind,
 };
 
 pub const TARGET_PROTOCOL_VERSION: u32 = 1;
@@ -81,6 +81,12 @@ pub struct PlanRequest {
     pub logical_host: String,
     pub resources: ResourceSet,
     pub used_inputs: Vec<InputObservation>,
+    #[serde(default, skip_serializing_if = "is_normal_plan")]
+    pub mode: PlanMode,
+}
+
+fn is_normal_plan(mode: &PlanMode) -> bool {
+    *mode == PlanMode::Normal
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]

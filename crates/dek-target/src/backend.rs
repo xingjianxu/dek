@@ -1,9 +1,9 @@
 //! Interfaces for target capabilities and resource backends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dek_core::{
-    Action, ActionKind, ContentDigest, DesiredResource, Precondition, ResourceCapability,
+    Action, ActionKind, ContentDigest, DesiredResource, PlanMode, Precondition, ResourceCapability,
     ResourceId, ResourceKind, ResourceSet, ServiceNotification, TargetCapabilities, TargetIdentity,
 };
 use thiserror::Error;
@@ -19,6 +19,14 @@ pub struct PlannedAction {
     pub preconditions: Vec<Precondition>,
     /// Whether this action would change the resource's content.
     pub content_changed: bool,
+}
+
+/// A native package transaction and resource-level plans derived from one snapshot.
+#[derive(Debug, Default)]
+pub struct PlannedPackages {
+    pub transaction: Option<PlannedAction>,
+    pub covered: BTreeSet<ResourceId>,
+    pub actions: BTreeMap<ResourceId, Vec<PlannedAction>>,
 }
 
 #[derive(Debug)]
@@ -178,6 +186,15 @@ pub trait Backend {
             .map_err(|err| BackendError(format!("plan: {err}")))
     }
 
+    /// Plan package work that must be resolved across several resource declarations.
+    fn plan_packages(
+        &self,
+        _resources: &ResourceSet,
+        _mode: PlanMode,
+    ) -> Result<Option<PlannedPackages>, BackendError> {
+        Ok(None)
+    }
+
     fn validate_notification(&self, _: &ServiceNotification) -> Result<(), BackendError> {
         Ok(())
     }
@@ -225,6 +242,8 @@ pub trait Backend {
         let ambiguous = match action.kind {
             ActionKind::InstallPackage { .. }
             | ActionKind::RemovePackage { .. }
+            | ActionKind::RepositoryTransaction(_)
+            | ActionKind::BuildAurPackage { .. }
             | ActionKind::ReloadManager(_) => true,
             ActionKind::NotifyService { .. } => prior != PriorAttempt::NotificationJobFailed,
             _ => false,

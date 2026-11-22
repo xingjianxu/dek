@@ -11,7 +11,7 @@ use crate::{
     evaluation::normal_cache,
     local_target::LocalEvaluationTarget,
     plan_output::write_plan_with_pending,
-    planning::{plan_host_with_cache, plan_remote_host},
+    planning::{plan_host_with_cache_mode, plan_remote_host},
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dek_controller::{
@@ -20,7 +20,7 @@ use dek_controller::{
     repo::{EntryLanguage, HostSelector, Repository, Target, initialize},
     transport::{RemoteTarget, SshSession, TargetInputSnapshot},
 };
-use dek_core::{OptionPath, TargetCapabilities};
+use dek_core::{OptionPath, PlanMode, TargetCapabilities};
 use serde_json::json;
 
 use crate::{
@@ -119,6 +119,9 @@ enum Command {
     },
     /// 观测目标并预览配置差异。
     Plan {
+        /// 预览完整的 Arch 滚动升级。
+        #[arg(long)]
+        upgrade: bool,
         /// 本机模式使用指定的私有状态目录。默认 /var/lib/dek。
         #[cfg(target_os = "linux")]
         #[arg(long, value_name = "目录")]
@@ -382,6 +385,7 @@ fn run_command<'target>(
         }
         Command::Plan {
             json,
+            upgrade,
             #[cfg(target_os = "linux")]
             state_dir,
         } => {
@@ -389,6 +393,11 @@ fn run_command<'target>(
             let selection = HostSelection::from_arg(cli.host)?;
             let (host, entry) = repo.select_host(selection.selector())?;
             let cache = normal_cache(&repo)?;
+            let mode = if upgrade {
+                PlanMode::Upgrade
+            } else {
+                PlanMode::Normal
+            };
             if let Target::Ssh(alias) = &entry.target {
                 #[cfg(target_os = "linux")]
                 if state_dir.is_some() {
@@ -396,8 +405,13 @@ fn run_command<'target>(
                 }
                 let expected = entry.target_id.as_deref().unwrap_or(host);
                 let mut session = SshSession::connect(alias, expected)?;
-                let review =
-                    plan_remote_host(&repo, selection.selector(), &mut session, cache.as_ref())?;
+                let review = plan_remote_host(
+                    &repo,
+                    selection.selector(),
+                    &mut session,
+                    cache.as_ref(),
+                    mode,
+                )?;
                 session.finish()?;
                 return write_plan_with_pending(
                     &mut out,
@@ -409,12 +423,13 @@ fn run_command<'target>(
             }
             let registry = local_target()?;
             let mut provider = LocalEvaluationTarget(&registry);
-            let planned = plan_host_with_cache(
+            let planned = plan_host_with_cache_mode(
                 &repo,
                 selection.selector(),
                 &registry,
                 &mut provider,
                 cache.as_ref(),
+                mode,
             )?;
             #[cfg(target_os = "linux")]
             let (plan, pending) = {

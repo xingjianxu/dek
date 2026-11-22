@@ -1,18 +1,22 @@
-//! Arch package state from the installed database and reviewed removals.
+//! Arch package state, read-only native transaction planning and reviewed removals.
 
+mod alpm;
 mod removal;
+mod upgrade;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     process::{Command, Output},
 };
 
 use dek_core::{
-    Action, ActionKind, DesiredResource, PackageId, PackageResource, PackageSource, Precondition,
-    Presence, ResourceCapability, ResourceKind,
+    Action, ActionKind, DesiredResource, PackageId, PackageResource, PackageSource, PlanMode,
+    Precondition, Presence, ResourceCapability, ResourceKind, ResourceSet,
 };
-use dek_target::backend::{ActionContext, ActionReadiness, Backend, BackendError, PlannedAction};
+use dek_target::backend::{
+    ActionContext, ActionReadiness, Backend, BackendError, PlannedAction, PlannedPackages,
+};
 
 pub struct PacmanBackend {
     program: PathBuf,
@@ -54,14 +58,29 @@ impl PacmanBackend {
         Ok(output)
     }
 
-    fn installed(&self, package: &PackageId) -> Result<Option<String>, BackendError> {
+    fn installed_packages(&self) -> Result<Output, BackendError> {
         let output = self.output("查询本地软件包", &["--query", "--color", "never"])?;
-        if !output.stderr.is_empty() {
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        let errors = diagnostics
+            .lines()
+            .filter(|line| {
+                // pacman emits this while initializing configured sync databases,
+                // even when the operation only reads the local package database.
+                !line.starts_with("warning: database file for '")
+                    || !line.ends_with("' does not exist (use '-Sy' to download)")
+            })
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
             return Err(BackendError(format!(
                 "pacman 无法完整读取本地数据库：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                errors.join("\n")
             )));
         }
+        Ok(output)
+    }
+
+    fn installed(&self, package: &PackageId) -> Result<Option<String>, BackendError> {
+        let output = self.installed_packages()?;
         let rows = package_rows(pacman_text(&output)?)?;
         Ok(rows
             .get(package.name.as_str())
@@ -98,12 +117,22 @@ impl Backend for PacmanBackend {
         vec![ResourceCapability {
             kind: ResourceKind::Package,
             version: 1,
-            attributes: Default::default(),
+            attributes: BTreeSet::from(["aur".into()]),
         }]
     }
 
     fn validate(&self, resource: &DesiredResource) -> Result<(), BackendError> {
-        validate_package(&package_resource(resource)?.package)
+        let resource = package_resource(resource)?;
+        if resource.package.source == PackageSource::Aur {
+            if resource.state == Presence::Absent {
+                return Err(BackendError(format!(
+                    "当前 pacman 后端无法规划移除 AUR 软件包 {}",
+                    resource.package.name
+                )));
+            }
+            return validate_package_name(&resource.package.name);
+        }
+        validate_package(&resource.package)
     }
 
     fn observe(&self, resource: &DesiredResource) -> Result<Vec<Precondition>, BackendError> {
@@ -146,8 +175,24 @@ impl Backend for PacmanBackend {
         }
     }
 
+    fn plan_packages(
+        &self,
+        resources: &ResourceSet,
+        mode: PlanMode,
+    ) -> Result<Option<PlannedPackages>, BackendError> {
+        self.plan_package_set(resources, mode)
+    }
+
     fn validate_action(&self, action: &Action) -> Result<(), BackendError> {
-        reviewed_removal(action).map(|_| ())
+        match action.kind {
+            ActionKind::RepositoryTransaction(_) => {
+                Err(BackendError("当前 pacman 后端仅预览仓库事务".into()))
+            }
+            ActionKind::BuildAurPackage { .. } => {
+                Err(BackendError("AUR 候选版本和构建环境待核查".into()))
+            }
+            _ => reviewed_removal(action).map(|_| ()),
+        }
     }
 
     fn inspect_action(&self, action: &Action) -> Result<ActionReadiness, BackendError> {
@@ -249,11 +294,12 @@ fn validate_package(package: &PackageId) -> Result<(), BackendError> {
             package.name
         )));
     }
-    if !valid_package_name(&package.name) {
-        return Err(BackendError(format!(
-            "无效 Arch 软件包名 {:?}",
-            package.name
-        )));
+    validate_package_name(&package.name)
+}
+
+fn validate_package_name(name: &str) -> Result<(), BackendError> {
+    if !valid_package_name(name) {
+        return Err(BackendError(format!("无效 Arch 软件包名 {name:?}")));
     }
     Ok(())
 }

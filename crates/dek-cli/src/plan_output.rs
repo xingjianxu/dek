@@ -1,6 +1,9 @@
 use std::{error::Error, io::Write};
 
-use dek_core::{ActionKind, PendingRunNotification, Plan, ServiceEffect, UnitId, UnitScope};
+use dek_core::{
+    ActionKind, PendingRunNotification, Plan, RepositoryPackageChange, RepositoryTransaction,
+    RepositoryTransactionScope, ServiceEffect, UnitId, UnitScope,
+};
 use serde_json::json;
 
 pub fn write_plan(
@@ -22,7 +25,12 @@ pub fn write_plan(
         writeln!(out, "已符合声明，0 项变更")?;
     }
     for action in &plan.actions {
-        writeln!(out, "{}  [{}]", description(&action.kind), action.id)?;
+        let label = description(&action.kind);
+        if let Some((title, details)) = label.split_once('\n') {
+            writeln!(out, "{title}  [{}]\n{details}", action.id)?;
+        } else {
+            writeln!(out, "{label}  [{}]", action.id)?;
+        }
         writeln!(out, "  原因 {}", action.reason)?;
         if !action.depends_on.is_empty() {
             writeln!(out, "  依赖 {}", action.depends_on.join(", "))?;
@@ -63,6 +71,15 @@ pub(crate) fn description(action: &ActionKind) -> String {
             format!("安装软件包 {} ({candidate_version})", package.name)
         }
         ActionKind::RemovePackage { package } => format!("移除软件包 {}", package.name),
+        ActionKind::RepositoryTransaction(transaction) => describe_transaction(transaction),
+        ActionKind::BuildAurPackage {
+            package,
+            candidate_version,
+        } => format!(
+            "构建 AUR 软件包 {} ({})",
+            package.name,
+            candidate_version.as_deref().unwrap_or("候选版本待核查"),
+        ),
         ActionKind::DeployUnit { unit, .. } => format!("部署 unit {}", unit_name(unit)),
         ActionKind::ReloadManager(scope) => format!("重载 systemd manager {}", scope_name(scope)),
         ActionKind::SetUnitEnabled { unit, enabled } => {
@@ -98,6 +115,42 @@ pub(crate) fn description(action: &ActionKind) -> String {
             format!("调整加密文件属性 {} ({})", secret.path, secret.ciphertext.0)
         }
     }
+}
+
+fn describe_transaction(transaction: &RepositoryTransaction) -> String {
+    let title = match transaction.scope {
+        RepositoryTransactionScope::Install => "仓库软件包补装事务",
+        RepositoryTransactionScope::Upgrade => "完整仓库升级事务",
+    };
+    let mut lines = vec![title.to_owned()];
+    for change in &transaction.changes {
+        lines.push(match change {
+            RepositoryPackageChange::Install { candidate } => format!(
+                "  新增 {}/{} {}",
+                candidate.repository, candidate.name, candidate.version
+            ),
+            RepositoryPackageChange::Upgrade {
+                installed_version,
+                candidate,
+            } => format!(
+                "  升级 {}/{} {} → {}",
+                candidate.repository, candidate.name, installed_version, candidate.version
+            ),
+            RepositoryPackageChange::Replace {
+                package,
+                installed_version,
+                candidate,
+            } => format!(
+                "  替换 {package} {installed_version} → {}/{} {}",
+                candidate.repository, candidate.name, candidate.version
+            ),
+            RepositoryPackageChange::Remove {
+                package,
+                installed_version,
+            } => format!("  移除 {package} {installed_version}"),
+        });
+    }
+    lines.join("\n")
 }
 
 fn unit_name(unit: &UnitId) -> String {
