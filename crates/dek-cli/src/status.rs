@@ -134,6 +134,7 @@ pub(crate) fn write_plan_with_pending(
             description(&ActionKind::NotifyService {
                 unit: item.notification.unit.clone(),
                 effect: item.notification.effect,
+                sources: Vec::new(),
             }),
             item.run_id,
         )?;

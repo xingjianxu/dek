@@ -282,7 +282,7 @@ impl Backend for SystemdBackend {
                 )
             }
             ActionKind::ReloadManager(_) => return Ok(ActionReadiness::Ready),
-            ActionKind::NotifyService { unit, effect } => {
+            ActionKind::NotifyService { unit, effect, .. } => {
                 return notification::inspect(action, unit, *effect);
             }
             _ => return Err(BackendError("未知的单元动作".into())),
@@ -363,7 +363,7 @@ impl Backend for SystemdBackend {
     }
 
     fn execute_notification(&self, context: &ActionContext<'_>) -> Result<(), NotificationError> {
-        let ActionKind::NotifyService { unit, effect } = &context.action.kind else {
+        let ActionKind::NotifyService { unit, effect, .. } = &context.action.kind else {
             return Err(NotificationError::Unverified(BackendError(
                 "动作类型与服务通知不符".into(),
             )));

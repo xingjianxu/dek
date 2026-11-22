@@ -65,7 +65,7 @@ pub enum NotificationError {
 pub struct ActionContext<'a> {
     pub action: &'a Action,
     contents: &'a BTreeMap<ContentDigest, Vec<u8>>,
-    before_content_change: Option<&'a dyn Fn() -> Result<(), BackendError>>,
+    before_content_change: Option<&'a (dyn Fn(bool) -> Result<(), BackendError> + Sync)>,
 }
 
 impl<'a> ActionContext<'a> {
@@ -81,7 +81,7 @@ impl<'a> ActionContext<'a> {
     #[cfg(target_os = "linux")]
     pub(crate) fn with_content_change(
         mut self,
-        before: &'a dyn Fn() -> Result<(), BackendError>,
+        before: &'a (dyn Fn(bool) -> Result<(), BackendError> + Sync),
     ) -> Self {
         self.before_content_change = Some(before);
         self
@@ -89,8 +89,17 @@ impl<'a> ActionContext<'a> {
 
     /// Persist dependent notices immediately before publishing verified changed content.
     pub fn before_content_change(&self) -> Result<(), BackendError> {
+        self.before_file_change(true)
+    }
+
+    /// Persist only notices that explicitly cover a metadata change.
+    pub fn before_metadata_change(&self) -> Result<(), BackendError> {
+        self.before_file_change(false)
+    }
+
+    fn before_file_change(&self, content_changed: bool) -> Result<(), BackendError> {
         match self.before_content_change {
-            Some(before) => before(),
+            Some(before) => before(content_changed),
             None => Ok(()),
         }
     }

@@ -83,6 +83,7 @@ fn save_review(guard: &StateGuard<'_>, target: &TargetIdentity) -> Plan {
                         name: "example.service".into(),
                     },
                     effect: ServiceEffect::Reload,
+                    sources: Vec::new(),
                 },
                 reason: "reload after file update".into(),
                 origins: Vec::new(),

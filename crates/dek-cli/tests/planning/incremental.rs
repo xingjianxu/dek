@@ -282,7 +282,7 @@ fn assert_caddy_plan(run: &Run, before: &str, after: &str) {
         path, expected: FileObservation::Present(content)
     }] if path == CADDY_PATH && content.digest == digest(before.as_bytes())));
     assert!(
-        matches!(&reload.kind, ActionKind::NotifyService { unit, effect: ServiceEffect::Reload }
+        matches!(&reload.kind, ActionKind::NotifyService { unit, effect: ServiceEffect::Reload, .. }
         if unit.name == "caddy.service")
     );
     assert_eq!(reload.depends_on, std::slice::from_ref(&file.id));

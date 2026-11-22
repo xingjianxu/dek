@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgeSecretResource, AuthorizedKeysResource, ContentDigest, DirectoryResource, FileAttributes,
-    FileContent, GroupResource, InputObservation, Observation, PackageId, ResourceId, ResourceKind,
-    ResourceOrigin, ServiceEffect, UnitDefinition, UnitId, UnitScope, UserResource,
+    FileContent, GroupResource, InputObservation, NotifyWhen, Observation, PackageId, ResourceId,
+    ResourceKind, ResourceOrigin, ServiceEffect, UnitDefinition, UnitId, UnitScope, UserResource,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -166,10 +166,21 @@ pub enum ActionKind {
     NotifyService {
         unit: UnitId,
         effect: ServiceEffect,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<NotificationSource>,
     },
     UpdateAuthorizedKeys(AuthorizedKeysResource),
     DeployAgeSecret(AgeSecretResource),
     SetAgeSecretAttributes(AgeSecretResource),
+}
+
+/// A source that can request a specific effect once its actual change is known.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationSource {
+    pub action: String,
+    pub effect: ServiceEffect,
+    pub when: NotifyWhen,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

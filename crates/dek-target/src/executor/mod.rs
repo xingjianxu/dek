@@ -383,16 +383,26 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             let action = &item.action;
             if let ActionResult::Verified { changed } = item.result {
                 if changed && !runtime_content_check(&action.kind) {
-                    triggered.insert(action.id.as_str());
+                    triggered.insert(item.action.id.as_str());
                 }
                 continue;
             }
 
+            let effective = self.effective_notification(run, binding, action)?;
+            let selected = effective.as_ref();
+            let action = selected.unwrap_or(action);
             let backend = self.backend(action)?;
             match &item.result {
                 ActionResult::Pending => {
                     if matches!(action.kind, ActionKind::NotifyService { .. })
-                        && !self.notification_triggered(run, binding, action, live, &triggered)?
+                        && !match &action.kind {
+                            ActionKind::NotifyService { sources, .. } if !sources.is_empty() => {
+                                selected.is_some()
+                            }
+                            _ => {
+                                self.notification_triggered(run, binding, action, live, &triggered)?
+                            }
+                        }
                     {
                         let attempt = self.begin(run, binding, action)?;
                         self.record(run, binding, action, attempt, &Ok(false))?;
@@ -400,15 +410,15 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                     }
                 }
                 ActionResult::Failed { .. } | ActionResult::Unverified => {
-                    if !self.recover_attempt(run, binding, item, backend)? {
+                    if !self.recover_attempt(run, binding, item, action, backend)? {
                         if !runtime_content_check(&action.kind) {
-                            triggered.insert(action.id.as_str());
+                            triggered.insert(item.action.id.as_str());
                         }
                         continue;
                     }
                 }
                 ActionResult::Deferred { .. } => {
-                    deferred.insert(action.id.as_str());
+                    deferred.insert(item.action.id.as_str());
                     continue;
                 }
                 ActionResult::Verified { .. } => unreachable!("verified actions were handled"),
@@ -428,7 +438,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                 self.store
                     .lock()?
                     .defer_action(&run.id, binding, &action.id, message)?;
-                deferred.insert(action.id.as_str());
+                deferred.insert(item.action.id.as_str());
                 continue;
             }
             let readiness = backend
@@ -463,7 +473,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             let outcome = self.dispatch(run, binding, reviewed, action, backend, readiness);
             self.record(run, binding, action, attempt, &outcome.as_ref().copied())?;
             if outcome? && !runtime_content_check(&action.kind) {
-                triggered.insert(action.id.as_str());
+                triggered.insert(item.action.id.as_str());
             }
         }
         Ok(())
@@ -474,9 +484,9 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         run: &RunRecord,
         binding: PlanBinding<'_>,
         item: &RunAction,
+        action: &Action,
         backend: &dyn Backend,
     ) -> Result<bool, ExecutionError> {
-        let action = &item.action;
         let prior = match item.result {
             ActionResult::Unverified => PriorAttempt::Unverified,
             ActionResult::Failed {
@@ -563,15 +573,16 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             ActionReadiness::Ready => {}
         }
 
-        let queue = || {
-            self.queue_dependent_notifications(run, binding, action)
+        let store = self.store;
+        let queue = |content_changed| {
+            Self::queue_dependent_notifications(store, run, binding, action, content_changed)
                 .map_err(|error| BackendError(error.to_string()))
         };
         let context = ActionContext::new(action, &reviewed.contents);
         let context = if runtime_content_check(&action.kind) {
             context.with_content_change(&queue)
         } else {
-            self.queue_dependent_notifications(run, binding, action)?;
+            Self::queue_dependent_notifications(store, run, binding, action, true)?;
             context
         };
         if let ActionKind::NotifyService { unit, .. } = &action.kind {
@@ -592,29 +603,78 @@ impl<'a, 'backend> Executor<'a, 'backend> {
     }
 
     fn queue_dependent_notifications(
-        &self,
+        store: &StateStore,
         run: &RunRecord,
         binding: PlanBinding<'_>,
         action: &Action,
+        content_changed: bool,
     ) -> Result<(), StateError> {
         let notices = run
             .actions
             .iter()
             .filter_map(|item| {
                 let notice = &item.action;
-                (matches!(notice.kind, ActionKind::NotifyService { .. })
-                    && notice.depends_on.contains(&action.id))
-                .then_some(notice.id.as_str())
+                let ActionKind::NotifyService { sources, .. } = &notice.kind else {
+                    return None;
+                };
+                if sources.is_empty() {
+                    notice
+                        .depends_on
+                        .contains(&action.id)
+                        .then_some((notice.id.as_str(), None))
+                        .filter(|_| content_changed)
+                } else {
+                    sources
+                        .iter()
+                        .filter(|source| {
+                            source.action == action.id
+                                && (content_changed || source.when == dek_core::NotifyWhen::Changed)
+                        })
+                        .map(|source| source.effect)
+                        .reduce(|first, second| {
+                            if second == dek_core::ServiceEffect::Restart {
+                                second
+                            } else {
+                                first
+                            }
+                        })
+                        .map(|effect| (notice.id.as_str(), Some(effect)))
+                }
             })
             .collect::<Vec<_>>();
         if !notices.is_empty() {
-            let guard = self.store.lock()?;
-            for id in notices {
-                guard.queue_notification(&run.id, binding, id)?;
+            let guard = store.lock()?;
+            for (id, source_effect) in notices {
+                guard.queue_notification_effect(&run.id, binding, id, source_effect)?;
             }
         }
-
         Ok(())
+    }
+
+    fn effective_notification(
+        &self,
+        run: &RunRecord,
+        binding: PlanBinding<'_>,
+        action: &Action,
+    ) -> Result<Option<Action>, StateError> {
+        let ActionKind::NotifyService { sources, .. } = &action.kind else {
+            return Ok(None);
+        };
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        let latest = self.store.lock()?.load_run(&run.id, binding)?;
+        Ok(latest
+            .pending_notifications
+            .iter()
+            .find(|item| item.action_id == action.id)
+            .map(|item| {
+                let mut actual = action.clone();
+                if let ActionKind::NotifyService { effect, .. } = &mut actual.kind {
+                    *effect = item.effect;
+                }
+                actual
+            }))
     }
 
     fn notification_triggered(

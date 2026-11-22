@@ -31,6 +31,7 @@ pub(super) fn apply(
     let attributes = Attributes::resolve(secret, expected)?;
     if matches!(context.action.kind, ActionKind::SetAgeSecretAttributes(_)) {
         let expected = expected.ok_or_else(|| BackendError("待修正的加密文件已不存在".into()))?;
+        context.before_metadata_change()?;
         attributes
             .update(&target, expected)
             .map_err(|err| access_error(secret, err))?;
@@ -59,6 +60,12 @@ pub(super) fn apply(
     if contents_match {
         let prior = expected.expect("identical content requires an existing file");
         if !attributes.matches(prior) {
+            store
+                .lock()
+                .map_err(state_error)?
+                .stage_secret_verification(&id, &marker)
+                .map_err(state_error)?;
+            context.before_metadata_change()?;
             attributes
                 .update(&target, prior)
                 .map_err(|err| access_error(secret, err))?;
