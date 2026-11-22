@@ -9,14 +9,7 @@ pub fn write_plan(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     if json {
-        let mut value = serde_json::to_value(plan)?;
-        let document = value
-            .as_object_mut()
-            .expect("core plan serializes as an object");
-        document.remove("id");
-        document.insert("plan_id".into(), plan.id.as_str().into());
-        document.insert("host".into(), host.into());
-        serde_json::to_writer_pretty(&mut out, &value)?;
+        serde_json::to_writer_pretty(&mut out, &plan_document(host, plan)?)?;
         writeln!(out)?;
         return Ok(());
     }
@@ -37,13 +30,30 @@ pub fn write_plan(
     Ok(())
 }
 
-fn description(action: &ActionKind) -> String {
+pub(crate) fn plan_document(
+    host: &str,
+    plan: &Plan,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(plan)?;
+    let document = value
+        .as_object_mut()
+        .expect("core plan serializes as an object");
+    document.remove("id");
+    document.insert("plan_id".into(), plan.id.as_str().into());
+    document.insert("host".into(), host.into());
+    Ok(value)
+}
+
+pub(crate) fn description(action: &ActionKind) -> String {
     match action {
         ActionKind::WriteFile { path, .. } => format!("更新文件 {path}"),
         ActionKind::SetFileAttributes { path, .. } => format!("调整文件属性 {path}"),
         ActionKind::RemoveFile { path } => format!("移除文件 {path}"),
         ActionKind::EnsureDirectory(directory) => format!("设置目录 {}", directory.path),
         ActionKind::EnsureUser(user) => format!("设置用户 {}", user.name),
+        ActionKind::SetUserPrimaryGroup { user, group } => {
+            format!("设置用户 {user} 的主组 {group}")
+        }
         ActionKind::EnsureGroup(group) => format!("设置组 {}", group.name),
         ActionKind::InstallPackage {
             package,

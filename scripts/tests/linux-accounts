@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Run through scripts/run-arch-vm ssh in a disposable Arch guest.
+set -euo pipefail
+export LC_ALL=C
+[[ "$(id -u)" == 0 && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+cat /proc/sys/kernel/hostname
+uname -r
+/usr/local/bin/dek --version
+
+repo=$(mktemp -d)
+export XDG_CACHE_HOME="$repo/cache"
+state="$repo/state"
+alice=dek29_alice
+service=dek29_service
+research=dek29_research
+staff=dek29_staff
+manual=dek29_manual
+old_home=/srv/dek29-old-home
+new_home=/srv/dek29-new-home
+for login in "$alice" "$service"; do
+    ! getent passwd "$login"
+done
+for group in "$research" "$staff" "$manual"; do
+    ! getent group "$group"
+done
+[[ ! -e "$old_home" && ! -e "$new_home" ]]
+
+cat > "$repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"target":{"local":true},"entry":"host.json"}}}
+JSON
+configuration() {
+    python3 - "$1" "$alice" "$service" "$research" "$staff" "$old_home" "$new_home" > "$repo/host.json" <<'PY'
+import json, sys
+phase, alice, service, research, staff, old_home, new_home = sys.argv[1:]
+user = "users.users." + alice
+daemon = "users.users." + service
+options = {
+    "users.groups." + research: {},
+    "users.groups." + staff: {},
+    user + ".isNormalUser": True,
+    user + ".group": staff if phase in ("group", "home") else research,
+    user + ".extraGroups": [research],
+    user + ".shell": "/bin/bash" if phase == "create" else "/bin/sh",
+    user + ".description": "Account fixture",
+    user + ".home": new_home if phase == "home" else old_home,
+    daemon + ".isSystemUser": True,
+    daemon + ".group": research,
+    daemon + ".shell": "/usr/bin/nologin",
+}
+if phase == "omit":
+    options = {}
+print(json.dumps({"schemaVersion":1,"imports":[],"options":[{"path": path, "value": value} for path, value in options.items()]}))
+PY
+}
+dek_command() {
+    local command=$1
+    shift
+    /usr/local/bin/dek --repo "$repo" -H fixture "$command" --state-dir "$state" "$@"
+}
+account() { getent passwd "$1" | cut -d: -f1,3-7; }
+plan_json() { dek_command plan --json; }
+plan_id() { python3 -c 'import json, sys; print(json.load(sys.stdin)["plan_id"])'; }
+assert_empty_plan() {
+    plan_json | python3 -c 'import json, sys; assert json.load(sys.stdin)["actions"] == []'
+}
+
+configuration create
+approved=$(plan_json | plan_id)
+dek_command apply --plan "$approved"
+account "$alice"
+account "$service"
+id "$alice"
+id "$service"
+alice_uid=$(id -u "$alice")
+research_gid=$(getent group "$research" | cut -d: -f3)
+staff_gid=$(getent group "$staff" | cut -d: -f3)
+[[ "$(id -g "$alice")" == "$research_gid" && "$(id -g "$service")" == "$research_gid" ]]
+[[ "$(account "$alice" | cut -d: -f4-6)" == "Account fixture:$old_home:/bin/bash" ]]
+[[ "$(account "$service" | cut -d: -f6)" == /usr/bin/nologin ]]
+[[ ! -e "$old_home" ]]
+native_uid_min=$(awk '$1 == "UID_MIN" { print $2 }' /etc/login.defs)
+[[ -n "$native_uid_min" && "$alice_uid" -ge "$native_uid_min" && "$(id -u "$service")" -lt "$native_uid_min" ]]
+assert_empty_plan
+
+groupadd -- "$manual"
+install -d -m 0750 -o "$alice" -g "$research" "$old_home"
+printf 'home data marker\n' > "$old_home/marker"
+chown "$alice:$research" "$old_home/marker"
+snapshot=$(stat -c '%i %u %g %a' "$old_home" "$old_home/marker")
+shadow_before=$(sha256sum /etc/shadow)
+
+configuration shell
+approved=$(plan_json | plan_id)
+usermod --append --groups "$manual" -- "$alice"
+dek_command apply --plan "$approved"
+[[ "$(account "$alice" | cut -d: -f6)" == /bin/sh ]]
+id -nG "$alice" | tr ' ' '\n' | grep -Fx "$manual"
+assert_empty_plan
+
+configuration group
+(set -o noclobber; printf '%s\0' "$$" > /etc/passwd.lock)
+held_lock=$(stat -c '%d:%i' /etc/passwd.lock)
+if dek_command apply 2> "$repo/lock-error"; then
+    printf 'Expected an occupied passwd lock to stop the group change.\n' >&2
+    exit 1
+fi
+grep -F '设置用户' "$repo/lock-error"
+[[ "$(id -g "$alice")" == "$research_gid" ]]
+[[ "$(stat -c '%d:%i' /etc/passwd.lock)" == "$held_lock" ]]
+rm -- /etc/passwd.lock
+dek_command apply
+[[ "$(id -g "$alice")" == "$staff_gid" && "$(id -u "$alice")" == "$alice_uid" ]]
+[[ "$(stat -c '%i %u %g %a' "$old_home" "$old_home/marker")" == "$snapshot" ]]
+id -nG "$alice" | tr ' ' '\n' | grep -Fx "$manual"
+assert_empty_plan
+
+configuration home
+dek_command apply
+[[ "$(account "$alice" | cut -d: -f5)" == "$new_home" && ! -e "$new_home" ]]
+[[ "$(cat "$old_home/marker")" == 'home data marker' ]]
+[[ "$(stat -c '%i %u %g %a' "$old_home" "$old_home/marker")" == "$snapshot" ]]
+[[ "$(sha256sum /etc/shadow)" == "$shadow_before" ]]
+assert_empty_plan
+
+configuration omit
+dek_command apply
+account "$alice"
+account "$service"
+getent group "$research"
+[[ "$(cat "$old_home/marker")" == 'home data marker' ]]
+printf 'Account creation, native allocation, non-destructive updates, idempotence and omission passed.\n'

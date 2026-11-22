@@ -13,11 +13,16 @@ test_binary=$(realpath -e -- "$3")
 cd -- "$(dirname -- "$0")/../.."
 vm=$(pwd -P)/scripts/run-arch-vm
 dev_root=$(realpath -m -- "${DEK_DEV_ROOT:-/data/dek-dev}")
-mkdir -p -- "$dev_root/runs/27"
-evidence=$(mktemp -d "$dev_root/runs/27/acceptance.XXXXXXXX")
+branch=$(git branch --show-current)
+issue=27
+if [[ "$branch" =~ ^issue-([1-9][0-9]*)- ]]; then
+    issue=${BASH_REMATCH[1]}
+fi
+mkdir -p -- "$dev_root/runs/$issue"
+evidence=$(mktemp -d "$dev_root/runs/$issue/acceptance.XXXXXXXX")
 printf 'Evidence: %s\n' "$evidence"
 
-run=$("$vm" start 27 "$image" "$guest_dek")
+run=$("$vm" start "$issue" "$image" "$guest_dek")
 printf '%s\n' "$run" > "$evidence/guest"
 cleanup() {
     if [[ ! -e "$run/result" ]]; then

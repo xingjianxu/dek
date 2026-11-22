@@ -50,6 +50,8 @@ pub struct RunAction {
     pub action: Action,
     pub attempt: u32,
     pub result: ActionResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -81,6 +83,15 @@ pub struct RunNotification {
     pub unit: UnitId,
     pub effect: ServiceEffect,
     pub depends_on: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRunNotification {
+    pub run_id: String,
+    pub notification: RunNotification,
+    pub result: ActionResult,
+    pub prerequisites_verified: bool,
 }
 
 impl StateGuard<'_> {
@@ -139,6 +150,7 @@ impl StateGuard<'_> {
                     action,
                     attempt: 0,
                     result: ActionResult::Pending,
+                    recovery_diagnostic: None,
                 })
                 .collect(),
             pending_notifications: Vec::new(),
@@ -156,6 +168,96 @@ impl StateGuard<'_> {
 
     pub fn latest_run(&self, binding: PlanBinding<'_>) -> Result<Option<RunRecord>, StateError> {
         latest(&self.runs_directory()?, binding)
+    }
+
+    /// Resolve a replay before loading the review, which may have been collected.
+    pub fn run_for_request(
+        &self,
+        binding: PlanBinding<'_>,
+        request_id: &str,
+    ) -> Result<Option<RunRecord>, StateError> {
+        let runs = self.runs_directory()?;
+        let id = run_id(binding, request_id);
+        let name = run_filename(&runs, &id)?;
+        let run = read_run(&runs, &name)?;
+        if let Some(run) = &run
+            && (!run.matches(binding) || run.request_id != request_id)
+        {
+            return Err(StateError::invalid(
+                &runs.path.join(name),
+                "执行请求标识的归属不符",
+            ));
+        }
+        Ok(run)
+    }
+
+    /// Expose queued notices and their dependency state to later planners.
+    pub fn pending_notifications(
+        &self,
+        binding: PlanBinding<'_>,
+    ) -> Result<Vec<PendingRunNotification>, StateError> {
+        let mut notices = Vec::new();
+        for run in self
+            .active_runs()?
+            .into_iter()
+            .filter(|run| run.matches(binding))
+        {
+            for notification in run.pending_notifications {
+                let Some(action) = run
+                    .actions
+                    .iter()
+                    .find(|item| item.action.id == notification.action_id)
+                else {
+                    return Err(StateError::invalid(
+                        &self.store.root.path,
+                        "执行记录的待重试通知无对应动作",
+                    ));
+                };
+                let prerequisites_verified = notification.depends_on.iter().all(|dependency| {
+                    run.actions.iter().any(|item| {
+                        item.action.id == *dependency
+                            && matches!(item.result, ActionResult::Verified { .. })
+                    })
+                });
+                notices.push(PendingRunNotification {
+                    run_id: run.id.clone(),
+                    notification,
+                    result: action.result.clone(),
+                    prerequisites_verified,
+                });
+            }
+        }
+        notices.sort_by(|a, b| {
+            (&a.run_id, &a.notification.action_id).cmp(&(&b.run_id, &b.notification.action_id))
+        });
+        Ok(notices)
+    }
+
+    /// Keep a failed or unverified attempt inspectable without certifying it.
+    pub fn record_recovery_diagnostic(
+        &self,
+        run_id: &str,
+        binding: PlanBinding<'_>,
+        action_id: &str,
+        attempt: u32,
+        diagnostic: String,
+    ) -> Result<(), StateError> {
+        let runs = self.runs_directory()?;
+        let mut run = bound_run(&runs, run_id, binding)?;
+        let action = action_mut(&runs, &mut run, action_id)?;
+        if action.attempt != attempt
+            || !matches!(
+                action.result,
+                ActionResult::Failed { .. } | ActionResult::Unverified
+            )
+        {
+            return Err(StateError::invalid(&runs.path, "恢复诊断与当前尝试不符"));
+        }
+        if action.recovery_diagnostic.as_deref() == Some(&diagnostic) {
+            return runs.sync();
+        }
+        action.recovery_diagnostic = Some(diagnostic);
+        replace_run(&runs, &run)
     }
 
     /// Publish the unknown-result state before calling the backend.
@@ -185,6 +287,7 @@ impl StateGuard<'_> {
             StateError::invalid(&runs.path, format!("动作 {action_id} 尝试次数已达上限"))
         })?;
         action.result = ActionResult::Unverified;
+        action.recovery_diagnostic = None;
         let attempt = action.attempt;
         replace_run(&runs, &run)?;
         Ok(ActionAttempt::Started(attempt))
@@ -222,6 +325,7 @@ impl StateGuard<'_> {
         }
         let completed = matches!(next, ActionResult::Verified { .. });
         action.result = next;
+        action.recovery_diagnostic = None;
         if completed {
             run.pending_notifications
                 .retain(|notice| notice.action_id != action_id);
