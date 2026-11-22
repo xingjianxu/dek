@@ -51,6 +51,8 @@ pub struct RunAction {
     pub attempt: u32,
     pub result: ActionResult,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_notification_effect: Option<ServiceEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_diagnostic: Option<String>,
 }
 
@@ -164,6 +166,7 @@ impl StateGuard<'_> {
                     action,
                     attempt: 0,
                     result: ActionResult::Pending,
+                    selected_notification_effect: None,
                     recovery_diagnostic: None,
                 })
                 .collect(),
@@ -283,6 +286,11 @@ impl StateGuard<'_> {
     ) -> Result<ActionAttempt, StateError> {
         let runs = self.runs_directory()?;
         let mut run = bound_run(&runs, run_id, binding)?;
+        let selected_effect = run
+            .pending_notifications
+            .iter()
+            .find(|notice| notice.action_id == action_id)
+            .map(|notice| notice.effect);
         let action = action_mut(&runs, &mut run, action_id)?;
         match action.result {
             ActionResult::Unverified => {
@@ -301,6 +309,10 @@ impl StateGuard<'_> {
             StateError::invalid(&runs.path, format!("动作 {action_id} 尝试次数已达上限"))
         })?;
         action.result = ActionResult::Unverified;
+        if matches!(&action.action.kind, ActionKind::NotifyService { sources, .. } if !sources.is_empty())
+        {
+            action.selected_notification_effect = selected_effect;
+        }
         action.recovery_diagnostic = None;
         let attempt = action.attempt;
         replace_run(&runs, &run)?;

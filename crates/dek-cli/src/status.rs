@@ -80,12 +80,17 @@ pub(crate) fn show_status(
             ActionResult::Deferred { .. } => "待激活",
             ActionResult::Pending => "待执行",
         };
-        writeln!(
-            out,
-            "{label} [{}] {}",
-            item.action.id,
-            description(&item.action.kind)
-        )?;
+        let operation = match (&item.action.kind, item.selected_notification_effect) {
+            (ActionKind::NotifyService { unit, .. }, Some(effect)) => {
+                description(&ActionKind::NotifyService {
+                    unit: unit.clone(),
+                    effect,
+                    sources: Vec::new(),
+                })
+            }
+            (_, _) => description(&item.action.kind),
+        };
+        writeln!(out, "{label} [{}] {operation}", item.action.id)?;
         if let ActionResult::Failed { message, .. } | ActionResult::Deferred { message } =
             &item.result
         {
