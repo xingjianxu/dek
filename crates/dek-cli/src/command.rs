@@ -149,10 +149,13 @@ fn run_command<'target>(
         dek_linux::secrets::SecretBackend::new(root)
     };
     #[cfg(target_os = "linux")]
+    let systemd = dek_linux::systemd::SystemdBackend;
+    #[cfg(target_os = "linux")]
     let local_target = || {
         let mut registry = local_target()?;
         if _production {
             registry.register(&secrets)?;
+            registry.register(&systemd)?;
         }
         Ok::<_, Box<dyn Error>>(registry)
     };

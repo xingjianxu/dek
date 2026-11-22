@@ -1,6 +1,7 @@
 //! Read-only planning from a complete resource set and current target state.
 
 mod graph;
+mod systemd;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -334,7 +335,7 @@ impl Actions {
                 );
             }
         }
-        Ok(self.records)
+        systemd::coalesce_reload(self.records, registry.target())
     }
 }
 
