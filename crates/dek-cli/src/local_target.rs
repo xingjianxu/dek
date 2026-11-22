@@ -53,21 +53,25 @@ pub fn local_registry(backend: &LocalFileBackend) -> Result<BackendRegistry<'_>,
 }
 
 fn normalize_path(raw: &str) -> Result<String, BackendError> {
-    let path = absolute_path(raw)?;
-    let problem = |err| BackendError(format!("cannot resolve {raw:?}: {err}"));
-    let resolved = match path.canonicalize() {
-        Ok(resolved) => resolved,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let name = path.file_name().ok_or_else(|| {
-                BackendError(format!("cannot determine the file name of {raw:?}"))
-            })?;
-            path.parent()
-                .expect("absolute path with file name has a parent")
-                .canonicalize()
-                .map_err(problem)?
-                .join(name)
+    let mut prefix = absolute_path(raw)?;
+    let mut missing = Vec::new();
+    let resolved = loop {
+        match prefix.canonicalize() {
+            Ok(path) => {
+                break missing
+                    .into_iter()
+                    .rev()
+                    .fold(path, |path, name| path.join(name));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (prefix.parent(), prefix.file_name()) else {
+                    return Err(BackendError(format!("cannot resolve {raw:?}: {err}")));
+                };
+                missing.push(name);
+                prefix = parent;
+            }
+            Err(err) => return Err(BackendError(format!("cannot resolve {raw:?}: {err}"))),
         }
-        Err(err) => return Err(problem(err)),
     };
     resolved
         .into_os_string()

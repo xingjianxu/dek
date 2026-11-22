@@ -58,6 +58,12 @@ pub struct StateStore {
     objects: Directory,
 }
 
+/// Secret verification material is read locally and never enters a plan record.
+pub struct SecretVerification {
+    pub key: Vec<u8>,
+    pub marker: Vec<u8>,
+}
+
 /// A target-wide transaction. A later state consumer can pin a plan reference
 /// and read its complete content under the same lock.
 pub struct StateGuard<'a> {
@@ -95,6 +101,28 @@ struct Record<P, R, H> {
 type OwnedRecord = Record<Plan, ResourceSet, String>;
 
 impl StateStore {
+    /// Read a marker from the existing private state hierarchy without initializing it.
+    pub fn read_secret_verification(
+        path: &Path,
+        id: &str,
+    ) -> Result<Option<SecretVerification>, StateError> {
+        if !valid_hash(id) {
+            return Err(StateError::invalid(path, "无效的验证标记 ID"));
+        }
+        let Some(root) = Directory::existing_root(path)? else {
+            return Ok(None);
+        };
+        let Some(secrets) = root.existing_private_child("secrets")? else {
+            return Ok(None);
+        };
+        let Some(marker) = secrets.read(&format!("{id}.marker"))? else {
+            return Ok(None);
+        };
+        Ok(secrets
+            .read("verification.key")?
+            .map(|key| SecretVerification { key, marker }))
+    }
+
     pub fn open(path: &Path) -> Result<Self, StateError> {
         let root = Directory::open_root(path)?;
         let plans = root.private_child("plans")?;
