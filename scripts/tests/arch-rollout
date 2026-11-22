@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+if [[ $# != 3 ]]; then
+    printf 'Usage: %s IMAGE_ID MANAGER_DEK GUEST_DEK\n' "$0" >&2
+    exit 2
+fi
+image=$1
+manager=$(realpath -e -- "$2")
+guest=$(realpath -e -- "$3")
+scripts=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+fixtures=$scripts/tests
+vm=$scripts/run-arch-vm
+dev_root=$(realpath -e -- "${DEK_DEV_ROOT:-/data/dek-dev}")
+run_root=$dev_root/runs/50
+mkdir -p -- "$run_root"
+evidence=$(mktemp -d "$run_root/arch-rollout.XXXXXXXX")
+printf 'Evidence %s\n' "$evidence"
+
+verified_image=$("$scripts/arch-vm-image" check "$image")
+cp -- "$(dirname -- "$verified_image")/metadata.json" "$evidence/image.json"
+git -C "$scripts/.." rev-parse HEAD > "$evidence/source"
+git -C "$scripts/.." status --porcelain > "$evidence/source-status"
+sha256sum -- "$manager" "$guest" > "$evidence/binaries.sha256"
+(
+    cd -- "$fixtures"
+    sha256sum -- arch-rollout arch-package-install{,-guest} arch-upgrade-plan{,-guest} \
+        arch-upgrade-apply{,-guest} arch-upgrade-implicit-guest arch-aur-apply{,-guest,-tty.py} arch-aur-fixture/* \
+        service-notifications
+) > "$evidence/fixtures.sha256"
+
+# Only the verified image and validated downloads are shared. Each component
+# creates its own disposable guest and keeps its results in this run.
+ln -s -- "$dev_root/vm" "$evidence/vm"
+ln -s -- "$dev_root/cache" "$evidence/cache"
+export DEK_DEV_ROOT=$evidence
+"$fixtures/arch-aur-fixture/prepare" > "$evidence/prepare.log" 2>&1
+mkdir -- "$evidence/logs"
+
+service_retry() (
+    set -euo pipefail
+    local out=$evidence/notification
+    local ruby run fixture_dir
+    mkdir -- "$out"
+    printf 'Evidence %s\n' "$out"
+    ruby=$(realpath -e -- "$(command -v ruby)")
+    [[ "$ruby" == /nix/store/*/bin/ruby ]]
+    nix-store -qR "${ruby%/bin/ruby}" | sed 's,^/,,' > "$out/ruby-paths"
+    run=$("$vm" start 50 "$image" "$guest")
+    trap 'if [[ ! -e "$run/result" ]]; then "$vm" finish "$run" failed || true; fi' EXIT
+    printf '%s\n' "$run" > "$out/guest"
+    grep -F 'restrict=on' "$run/qemu.command" > "$out/offline-network"
+    tar -C / -cf - -T "$out/ruby-paths" | gzip -1 |
+        "$vm" ssh "$run" sudo -n tar -xzpf - -C /
+    "$vm" ssh "$run" sudo -n env "PATH=/usr/local/bin:${ruby%/ruby}:/usr/bin" bash -s \
+        < "$fixtures/service-notifications" | tee "$out/guest.log"
+    fixture_dir=$(sed -n 's/^Service notification fixture //p' "$out/guest.log")
+    [[ "$fixture_dir" =~ ^/tmp/tmp\.[a-zA-Z0-9]+$ ]]
+    "$vm" ssh "$run" sudo -n tar -C "$fixture_dir" -cf - \
+        reload-failed-status.json reload-pending-plan.json reload-resumed-status.json attempts successes |
+        tar -C "$out" -xf -
+    "$vm" finish "$run" passed
+)
+
+declare -A pids=()
+scenarios=(preview install upgrade aur notification)
+# Give each background suite a process group, including any VM startup commands.
+set -m
+start() {
+    local name=$1
+    shift
+    "$@" > "$evidence/logs/$name.log" 2>&1 &
+    pids[$name]=$!
+}
+cleanup_failed_run() {
+    local pid run
+    for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+    for run in "$evidence"/runs/*/arch.*; do
+        if [[ -f "$run/instance" && ! -e "$run/result" ]]; then
+            "$vm" finish "$run" failed || true
+        fi
+    done
+}
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'if (( $? != 0 )); then cleanup_failed_run; fi' EXIT
+
+start preview "$fixtures/arch-upgrade-plan" "$image" "$guest"
+start install "$fixtures/arch-package-install" "$image" "$guest"
+start upgrade "$fixtures/arch-upgrade-apply" "$image" "$manager" "$guest"
+start aur "$fixtures/arch-aur-apply" "$image" "$manager" "$guest"
+start notification service_retry
+
+passed=true
+printf 'scenario\tresult\tevidence\n' > "$evidence/summary.tsv"
+printf 'scenario\trun_id\n' > "$evidence/run-ids.tsv"
+for scenario in "${scenarios[@]}"; do
+    log=$evidence/logs/$scenario.log
+    if wait "${pids[$scenario]}"; then
+        result=passed
+    else
+        result=failed
+        passed=false
+        tail -n 24 -- "$log" >&2
+    fi
+    unset "pids[$scenario]"
+    path=$(sed -n -E '/^Evidence:? / { s/^Evidence:? //; p; q; }' "$log")
+    printf '%s\t%s\t%s\n' "$scenario" "$result" "$path" | tee -a "$evidence/summary.tsv"
+    {
+        awk '/^run_id [[:xdigit:]]+\r?$/ { sub(/\r$/, "", $2); print $2 }' "$log"
+        if [[ "$path" == "$evidence/"* ]]; then
+            for output in "$path"/*.log; do
+                if [[ -f "$output" ]]; then
+                    awk '/^run_id [[:xdigit:]]+\r?$/ { sub(/\r$/, "", $2); print $2 }' "$output"
+                fi
+            done
+            for status in "$path"/*status.json "$path"/implicit/*status.json; do
+                if [[ -f "$status" ]]; then
+                    jq -r '.run_id // empty' "$status"
+                fi
+            done
+        fi
+    } | LC_ALL=C sort -u | awk -v scenario="$scenario" 'length == 64 { print scenario "\t" $0 }' \
+        >> "$evidence/run-ids.tsv"
+done
+[[ "$passed" == true ]]

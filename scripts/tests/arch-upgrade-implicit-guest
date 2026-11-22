@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Run after the signed local and SSH transitions in arch-upgrade-apply.
+set -euo pipefail
+[[ $(id -u) == 0 && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+export LC_ALL=C
+
+signed=/run/dek-upgrade-apply
+base=/run/dek-upgrade-implicit
+unit=dek-test-upgrade-review.service
+install -d -m 0700 "$base"/{cache,repo,state}
+ln -sfn "$signed/d" "$signed/current"
+printf 'before\n' > "$base/managed.conf"
+cat > "/etc/systemd/system/$unit" <<'UNIT'
+[Service]
+ExecStart=/usr/bin/sleep infinity
+UNIT
+systemctl daemon-reload
+systemctl start "$unit"
+
+cat > "$base/repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.implicit":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$base/repo/options.json" <<'JSON'
+{"options":[{"path":"lab.implicit.enable","type":"boolean","description":"Enable the upgrade review fixture"}]}
+JSON
+cat > "$base/repo/entry.json" <<'JSON'
+{"schemaVersion":1,"imports":[],"options":[
+  {"path":"environment.systemPackages","value":["dek-upgrade-extra"]},
+  {"path":"lab.implicit.enable","value":true}
+]}
+JSON
+cat > "$base/repo/expand.rb" <<'RUBY'
+file_resource "/run/dek-upgrade-implicit/managed.conf", content: "approved\n"
+resource "systemdUnit", unit: {scope: "system", name: "dek-test-upgrade-review.service"}, running: false
+RUBY
+
+run_dek() {
+    XDG_CACHE_HOME="$base/cache" /usr/local/bin/dek-native --repo "$base/repo" -H fixture \
+        "$@" --state-dir "$base/state"
+}
+snapshot() {
+    pacman -Q
+    printf '\n'
+    find /var/lib/pacman/local /var/lib/pacman/sync -type f -print0 | sort -z | xargs -0 sha256sum
+    stat --format='%a %u %g %i %y %z %n' "$base/managed.conf"
+    sha256sum "$base/managed.conf"
+    cat "$base/managed.conf"
+    systemctl show --property=ActiveState,SubState,MainPID,ActiveEnterTimestampMonotonic "$unit"
+    grep -c '\[ALPM\] transaction started$' /var/log/pacman.log
+}
+
+systemctl is-active --quiet "$unit"
+snapshot > "$base/before.txt"
+if run_dek apply > "$base/review.log" 2>&1; then
+    printf 'Expected ordinary apply to pause for upgrade approval\n' >&2
+    exit 1
+fi
+cat "$base/review.log"
+id=$(awk '/^计划 / {print $2}' "$base/review.log")
+[[ "$id" =~ ^[0-9a-f]{64}$ ]]
+grep -Fq "等待审阅计划 $id" "$base/review.log"
+grep -Fq "dek apply -H fixture --plan $id" "$base/review.log"
+if grep -q '^run_id ' "$base/review.log"; then
+    printf 'Ordinary apply started a run before approval\n' >&2
+    exit 1
+fi
+snapshot > "$base/paused.txt"
+cmp "$base/before.txt" "$base/paused.txt"
+
+run_dek apply --plan "$id" --request-id implicit-upgrade | tee "$base/apply.log"
+run_id=$(awk '/^run_id / {print $2}' "$base/apply.log")
+[[ "$run_id" =~ ^[0-9a-f]{64}$ ]]
+run_dek status --run "$run_id" --json > "$base/approved-status.json"
+snapshot > "$base/after.txt"
+before_transactions=$(tail -n 1 "$base/before.txt")
+after_transactions=$(tail -n 1 "$base/after.txt")
+[[ "$after_transactions" == "$((before_transactions + 1))" ]]
+[[ "$(cat "$base/managed.conf")" == approved ]]
+[[ "$(systemctl show --property=ActiveState --value "$unit")" == inactive ]]
+cmp "$signed/d/fixture.db" /var/lib/pacman/sync/fixture.db
+cmp "$signed/d/fixture.db.sig" /var/lib/pacman/sync/fixture.db.sig
+
+python3 - "$base" "$id" "$run_id" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+base, plan_id, run_id = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+run = json.loads((base / "approved-status.json").read_bytes())
+assert run["finished"] and run["plan_id"] == plan_id and run["run_id"] == run_id, run
+assert all(action["result"] == {"verified": {"changed": True}} for action in run["actions"]), run
+actions = [entry["action"] for entry in run["actions"]]
+kinds = [action["kind"] for action in actions]
+assert len(kinds) == 3 and "repositoryTransaction" in kinds[0], kinds
+assert {key for kind in kinds[1:] for key in kind} == {"writeFile", "setUnitRunning"}, kinds
+assert all(actions[0]["id"] in action["dependsOn"] for action in actions[1:]), actions
+transaction = kinds[0]["repositoryTransaction"]
+assert transaction["scope"] == "upgrade" and transaction["targets"] == ["dek-upgrade-extra"], transaction
+candidates = {
+    (operation, change["candidate"]["name"], change["candidate"]["version"], change["candidate"]["repository"])
+    for item in transaction["changes"] for operation, change in item.items()
+}
+assert candidates == {
+    ("install", "dek-upgrade-extra", "1-1", "fixture"),
+    ("upgrade", "dek-upgrade-main", "5-1", "fixture"),
+}, candidates
+
+def versions(name):
+    packages, _ = (base / name).read_text().split("\n\n", 1)
+    return dict(row.split() for row in packages.splitlines())
+
+before, after = versions("before.txt"), versions("after.txt")
+changed = {name: (before.get(name), after.get(name)) for name in before.keys() | after.keys()
+           if before.get(name) != after.get(name)}
+assert changed == {"dek-upgrade-main": ("4-1", "5-1"), "dek-upgrade-extra": (None, "1-1")}, changed
+(base / "expected-packages.diff").write_text(
+    "".join(f"{name}\t{old or '-'}\t{new}\n" for name, (old, new) in sorted(changed.items()))
+)
+PY
+printf 'Ordinary apply plan %s approved without prior writes in run %s.\n' "$id" "$run_id"

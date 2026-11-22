@@ -71,5 +71,11 @@ jq -e --arg plan "$id" '.finished and .plan_id == $plan and .actions[0].result.v
 "$scripts/run-arch-vm" ssh "$run" cmp /run/dek-upgrade-apply/c/fixture.db.sig /var/lib/pacman/sync/fixture.db.sig
 "$scripts/run-arch-vm" ssh "$run" sha256sum /var/lib/pacman/local/dek-upgrade-main-4-1/{desc,files,mtree} \
     > "$evidence/remote-package-record.sha256"
+"$scripts/run-arch-vm" ssh "$run" sudo -n env "PATH=$ruby_root/bin:/usr/bin" bash -s \
+    < "$scripts/tests/arch-upgrade-implicit-guest" 2>&1 | tee "$evidence/implicit.log"
+mkdir -- "$evidence/implicit"
+"$scripts/run-arch-vm" ssh "$run" sudo -n tar -C /run/dek-upgrade-implicit -cf - \
+    before.txt paused.txt after.txt review.log apply.log approved-status.json expected-packages.diff |
+    tar -C "$evidence/implicit" -xf -
 "$scripts/run-arch-vm" finish "$run" passed
 printf 'Reviewed local and SSH upgrade transactions passed.\n'

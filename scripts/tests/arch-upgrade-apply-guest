@@ -6,7 +6,7 @@ grep -Fx 'ID=arch' /etc/os-release
 export LC_ALL=C SOURCE_DATE_EPOCH=1700000000
 
 base=/run/dek-upgrade-apply
-install -d -m 0755 "$base"/{seed,a,b,c,repo}
+install -d -m 0755 "$base"/{seed,a,b,c,d,repo}
 install -d -m 0700 "$base"/{cache,state,signing,keyring}
 work=$(mktemp -d)
 chmod 0755 "$work"
@@ -54,7 +54,10 @@ mkpkg b dek-upgrade-main 3-1 hook
 mkpkg b dek-upgrade-addon 2-1
 mkpkg c dek-upgrade-main 4-1 hook
 cp -- "$base/b/dek-upgrade-addon-2-1-any.pkg.tar.zst"{,.sig} "$base/c/"
-for state in a b c; do
+mkpkg d dek-upgrade-main 5-1
+mkpkg d dek-upgrade-extra 1-1
+cp -- "$base/b/dek-upgrade-addon-2-1-any.pkg.tar.zst"{,.sig} "$base/d/"
+for state in a b c d; do
     (cd "$base/$state" &&
         GNUPGHOME="$base/signing" repo-add --sign --key "$key" fixture.db.tar.gz ./*.pkg.tar.zst &&
         sha256sum -- fixture.db fixture.db.sig ./*.pkg.tar.zst)
