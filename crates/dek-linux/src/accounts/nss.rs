@@ -32,6 +32,7 @@ pub(crate) struct UserAccount {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) home: PathBuf,
+    pub(crate) groups: Vec<u32>,
 }
 
 impl NameService for SystemNss {
@@ -94,9 +95,28 @@ pub(crate) fn user_account(name: &str) -> Result<Option<UserAccount>, BackendErr
                 uid: identity.id,
                 gid: entry.pw_gid,
                 home: PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())),
+                groups: supplementary_groups(&name, entry.pw_gid)?,
             })
         },
     )
+}
+
+fn supplementary_groups(name: &CStr, gid: u32) -> Result<Vec<u32>, BackendError> {
+    let mut groups = vec![gid; 16];
+    loop {
+        let mut count = groups.len() as libc::c_int;
+        // getgrouplist fills the buffer or reports the capacity needed.
+        let result =
+            unsafe { libc::getgrouplist(name.as_ptr(), gid, groups.as_mut_ptr(), &mut count) };
+        if result >= 0 {
+            groups.truncate(count as usize);
+            return Ok(groups);
+        }
+        if count <= groups.len() as libc::c_int || count > 65_536 {
+            return Err(BackendError("无法解析目标账户的附加组".into()));
+        }
+        groups.resize(count as usize, gid);
+    }
 }
 
 fn lookup_name(key: Key<'_>) -> Result<CString, BackendError> {

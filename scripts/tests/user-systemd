@@ -62,7 +62,8 @@ JSON
 cat > "$repo/expand.rb" <<'RUBY'
 user = option("lab.userUnits.user")
 revision = option("lab.userUnits.revision")
-resource("user", name: user, home: "/home/#{user}") if option("lab.userUnits.declare")
+home = user == "charlie" ? "/srv/charlie-sandbox/charlie" : "/home/#{user}"
+resource("user", name: user, home: home) if option("lab.userUnits.declare")
 scope = {user: {user: user}}
 service = {scope: scope, name: "backup.service"}
 timer = {scope: scope, name: "backup.timer"}
@@ -158,13 +159,49 @@ if plan > "$repo/missing.plan" 2> "$repo/missing.log"; then exit 1; fi
 grep -F 'charlie' "$repo/missing.log"
 entry charlie true
 plan > "$repo/account.plan"
-apply
-[[ "$(stat -c %U /home/charlie/.config/systemd/user/backup.timer)" == charlie ]]
+if apply > "$repo/charlie.log" 2>&1; then exit 1; fi
+grep -F '父目录不存在' "$repo/charlie.log"
+charlie_run=$(awk '/^run_id / {print $2}' "$repo/charlie.log")
+test -n "$charlie_run"
+id charlie
+install -d -m 0755 /srv/charlie-sandbox
+apply --run "$charlie_run"
+[[ "$(stat -c %U /srv/charlie-sandbox/charlie/.config/systemd/user/backup.timer)" == charlie ]]
 as_user charlie --root=/ is-enabled --quiet backup.timer
+
+groupadd home-access
+install -d -o root -g home-access -m 0750 /srv/group-homes
+useradd -M -G home-access -d /srv/group-homes/dana dana
+install -d -o dana -g dana -m 0700 /srv/group-homes/dana
+dana_runtime="/run/user/$(id -u dana)"
+install -d -o dana -g dana -m 0700 "$dana_runtime" "$dana_runtime/systemd"
+runuser -u dana -- python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' \
+    "$dana_runtime/systemd/private"
+entry dana false
+plan > "$repo/stale-socket.plan"
+grep -q '待激活' "$repo/stale-socket.plan"
+apply | tee "$repo/stale-socket.log"
+grep -q '待激活' "$repo/stale-socket.log"
+test -f /srv/group-homes/dana/.config/systemd/user/backup.timer
+as_user dana --root=/ is-enabled --quiet backup.timer
+
+useradd -m eve
+entry eve false
+plan > "$repo/old-home.plan"
+old_home_plan=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["plan_id"])' < "$repo/old-home.plan")
+install -d -o eve -g eve -m 0700 /home/eve-new
+usermod --home /home/eve-new eve
+if apply --plan "$old_home_plan" > "$repo/old-home.log" 2>&1; then
+    printf 'An account home changed after plan review.\n' >&2
+    exit 1
+fi
+grep -F '重新规划' "$repo/old-home.log"
+test ! -e /home/eve/.config/systemd/user/backup.timer
+test ! -e /home/eve-new/.config/systemd/user/backup.timer
 
 sha256sum --check "$repo/other.sha"
 systemctl is-enabled --quiet backup.timer
 systemctl is-active --quiet backup.timer
 as_user bob is-enabled --quiet backup.timer
 as_user bob is-active --quiet backup.timer
-printf 'User scope, offline activation, online timer, account dependency and scope isolation passed.\n'
+printf 'User scope, activation, account recovery, supplementary groups and reviewed home isolation passed.\n'

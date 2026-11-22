@@ -240,7 +240,12 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             &reviewed.resources,
             &reviewed.plan.used_inputs,
         )?;
-        let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh) else {
+        let resumed = match &application {
+            Application::Resume(run) => Some(run.as_ref()),
+            Application::New { .. } => None,
+        };
+        let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh, resumed)
+        else {
             return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
         };
         if let Application::Resume(run) = &application

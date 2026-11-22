@@ -1,7 +1,10 @@
 use std::{
     ffi::OsString,
     fs,
-    os::unix::fs::{FileTypeExt, MetadataExt},
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt},
+        net::UnixStream,
+    },
     path::{Component, Path, PathBuf},
     process::{Command, Output},
 };
@@ -46,7 +49,8 @@ pub(super) fn with_permissions<T: Send>(
     std::thread::scope(|scope| {
         scope
             .spawn(move || {
-                set_thread_groups(&[])
+                let groups: Vec<_> = account.groups.iter().copied().map(Gid::from_raw).collect();
+                set_thread_groups(&groups)
                     .and_then(|()| set_thread_gid(gid))
                     .and_then(|()| set_thread_uid(uid))
                     .map_err(|err| {
@@ -65,7 +69,22 @@ pub(super) fn with_permissions<T: Send>(
 pub(super) fn online(account: &UserAccount) -> Result<bool, BackendError> {
     let socket = runtime_dir(account).join("systemd/private");
     match fs::symlink_metadata(&socket) {
-        Ok(stat) if stat.file_type().is_socket() && stat.uid() == account.uid => Ok(true),
+        Ok(stat) if stat.file_type().is_socket() && stat.uid() == account.uid => {
+            match UnixStream::connect(&socket) {
+                Ok(_) => Ok(true),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    Ok(false)
+                }
+                Err(err) => Err(BackendError(format!(
+                    "无法连接用户 manager 套接字 {socket:?}：{err}"
+                ))),
+            }
+        }
         Ok(_) => Err(BackendError(format!("用户 manager 套接字无效 {socket:?}"))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(BackendError(format!(
@@ -85,8 +104,24 @@ pub(super) fn command(
         command = Command::new("/usr/bin/env");
         command.arg("-i");
     } else {
-        command = Command::new("/usr/bin/runuser");
-        command.args(["-u", &account.name, "--", "/usr/bin/env", "-i"]);
+        let groups = account
+            .groups
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        command = Command::new("/usr/bin/setpriv");
+        command.args([
+            "--reuid",
+            &account.uid.to_string(),
+            "--regid",
+            &account.gid.to_string(),
+            "--groups",
+            &groups,
+            "--",
+            "/usr/bin/env",
+            "-i",
+        ]);
     }
     command
         .env_clear()

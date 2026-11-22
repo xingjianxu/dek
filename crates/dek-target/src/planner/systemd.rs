@@ -1,23 +1,44 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use dek_core::{Action, ActionKind, ResourceOrigin, TargetIdentity, UnitScope};
+use dek_core::{
+    Action, ActionKind, Precondition, ResourceId, ResourceOrigin, TargetIdentity, UnitScope,
+};
 
 use super::{PlanError, action_id};
+
+#[derive(Default)]
+struct ManagerChanges {
+    definitions: Vec<String>,
+    origins: Vec<ResourceOrigin>,
+    account: Vec<Precondition>,
+}
 
 pub(super) fn coalesce_reload(
     mut actions: Vec<Action>,
     target: &TargetIdentity,
 ) -> Result<Vec<Action>, PlanError> {
-    let mut managers = BTreeMap::<UnitScope, (Vec<String>, Vec<ResourceOrigin>)>::new();
+    let mut managers = BTreeMap::<UnitScope, ManagerChanges>::new();
     for action in &actions {
         if let ActionKind::DeployUnit { unit, .. } = &action.kind
             && unit.scope != UnitScope::UserGlobal
         {
-            let (definitions, origins) = managers.entry(unit.scope.clone()).or_default();
-            definitions.push(action.id.clone());
+            let manager = managers.entry(unit.scope.clone()).or_default();
+            manager.definitions.push(action.id.clone());
             for origin in &action.origins {
-                if !origins.contains(origin) {
-                    origins.push(origin.clone());
+                if !manager.origins.contains(origin) {
+                    manager.origins.push(origin.clone());
+                }
+            }
+            for condition in &action.preconditions {
+                if matches!(
+                    condition,
+                    Precondition::ResourceState {
+                        resource: ResourceId::User(_),
+                        ..
+                    }
+                ) && !manager.account.contains(condition)
+                {
+                    manager.account.push(condition.clone());
                 }
             }
         }
@@ -26,7 +47,7 @@ pub(super) fn coalesce_reload(
         return Ok(actions);
     }
 
-    for (scope, (definitions, origins)) in managers {
+    for (scope, manager) in managers {
         let id = action_id(actions.len());
         for action in &mut actions {
             let after_reload = match &action.kind {
@@ -46,9 +67,9 @@ pub(super) fn coalesce_reload(
             id,
             kind: ActionKind::ReloadManager(scope),
             reason: "此 manager 的单元定义发生变化".into(),
-            origins,
-            depends_on: definitions,
-            preconditions: Vec::new(),
+            origins: manager.origins,
+            depends_on: manager.definitions,
+            preconditions: manager.account,
         });
     }
     order(actions, target)

@@ -26,7 +26,10 @@ use rustix::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::filesystem::atomic_file::{StagedFile, TargetPath, same_revision};
+use crate::{
+    accounts::UserAccount,
+    filesystem::atomic_file::{StagedFile, TargetPath, same_revision},
+};
 
 pub struct SystemdBackend;
 
@@ -90,6 +93,11 @@ impl Backend for SystemdBackend {
         let resource = unit_resource(resource)?;
         let unit = &resource.unit;
         let mut conditions = Vec::new();
+        if let UnitScope::User { user: name } = &unit.scope
+            && let Some(account) = user::resolve(name)?
+        {
+            conditions.push(account_condition(name, &account));
+        }
         if declares_definition(&resource.definition) {
             let definition = read_definition(unit, &resource.definition)?;
             conditions.push(Precondition::ResourceState {
@@ -119,6 +127,15 @@ impl Backend for SystemdBackend {
     ) -> Result<Vec<PlannedAction>, BackendError> {
         let resource = unit_resource(resource)?;
         let unit = &resource.unit;
+        let account = observed.iter().find(|condition| {
+            matches!(
+                condition,
+                Precondition::ResourceState {
+                    resource: ResourceId::User(_),
+                    ..
+                }
+            )
+        });
         let mut actions = Vec::new();
         for condition in observed {
             let (kind, reason, content_changed) = match condition {
@@ -186,12 +203,16 @@ impl Backend for SystemdBackend {
                         false,
                     )
                 }
+                Precondition::ResourceState {
+                    resource: ResourceId::User(_),
+                    ..
+                } => continue,
                 _ => return Err(BackendError("无效的单元观测".into())),
             };
             actions.push(PlannedAction {
                 kind,
                 reason: reason.into(),
-                preconditions: vec![condition.clone()],
+                preconditions: std::iter::once(condition).chain(account).cloned().collect(),
                 content_changed,
             });
         }
@@ -230,6 +251,9 @@ impl Backend for SystemdBackend {
 
     fn inspect_action(&self, action: &Action) -> Result<ActionReadiness, BackendError> {
         self.validate_action(action)?;
+        if let Some(UnitScope::User { user }) = action_scope(&action.kind) {
+            reviewed_account(action, user)?;
+        }
         let (origin, actual, satisfied) = match &action.kind {
             ActionKind::DeployUnit { unit, definition } => {
                 let actual = read_definition(unit, definition)?;
@@ -265,7 +289,7 @@ impl Backend for SystemdBackend {
         };
         if satisfied {
             Ok(ActionReadiness::Satisfied)
-        } else if action.preconditions == [actual] {
+        } else if action.preconditions.first() == Some(&actual) {
             Ok(ActionReadiness::Ready)
         } else {
             Ok(ActionReadiness::Conflict(format!(
@@ -284,7 +308,7 @@ impl Backend for SystemdBackend {
             _ => return Ok(None),
         };
         if let UnitScope::User { user } = scope
-            && !manager_online(scope)?
+            && !user::online(&reviewed_account(action, user)?)?
         {
             return Ok(Some(format!(
                 "账户 {user:?} 的用户 manager 离线，动作待激活"
@@ -309,23 +333,30 @@ impl Backend for SystemdBackend {
         }
         match &context.action.kind {
             ActionKind::DeployUnit { unit, definition } => deploy(unit, definition, context),
-            ActionKind::ReloadManager(scope) => ctl(scope, false, &["daemon-reload"]).map(|_| ()),
+            ActionKind::ReloadManager(scope) => {
+                action_ctl(context.action, scope, false, &["daemon-reload"])
+            }
             ActionKind::SetUnitEnabled { unit, enabled } => {
                 if *enabled && let UnitScope::User { user } = &unit.scope {
-                    let account = unit_account(user)?;
+                    let account = reviewed_account(context.action, user)?;
                     ensure_account_home(&account)?;
                 }
                 let action = if *enabled { "enable" } else { "disable" };
-                ctl(
+                action_ctl(
+                    context.action,
                     &unit.scope,
                     true,
                     &[action, "--no-reload", "--", &unit.name],
                 )
-                .map(|_| ())
             }
             ActionKind::SetUnitRunning { unit, running } => {
                 let action = if *running { "start" } else { "stop" };
-                ctl(&unit.scope, false, &[action, "--", &unit.name]).map(|_| ())
+                action_ctl(
+                    context.action,
+                    &unit.scope,
+                    false,
+                    &[action, "--", &unit.name],
+                )
             }
             _ => Err(BackendError("未知的单元动作".into())),
         }
@@ -375,6 +406,28 @@ fn unit_resource(resource: &DesiredResource) -> Result<&SystemdUnitResource, Bac
     match resource {
         DesiredResource::SystemdUnit(unit) => Ok(unit),
         _ => Err(BackendError("后端收到非单元资源".into())),
+    }
+}
+
+fn action_scope(kind: &ActionKind) -> Option<&UnitScope> {
+    match kind {
+        ActionKind::DeployUnit { unit, .. }
+        | ActionKind::SetUnitEnabled { unit, .. }
+        | ActionKind::SetUnitRunning { unit, .. } => Some(&unit.scope),
+        ActionKind::ReloadManager(scope) => Some(scope),
+        _ => None,
+    }
+}
+
+fn account_condition(name: &str, account: &UserAccount) -> Precondition {
+    let mut hash = Sha256::new();
+    hash.update(b"systemd-user-account-v1");
+    hash.update(account.uid.to_be_bytes());
+    hash.update(account.gid.to_be_bytes());
+    hash.update(account.home.as_os_str().as_encoded_bytes());
+    Precondition::ResourceState {
+        resource: ResourceId::User(name.into()),
+        expected: Observation::Digest(format!("sha256:{:x}", hash.finalize())),
     }
 }
 
@@ -501,7 +554,7 @@ fn inspect_definition(
     };
     if desired == observed {
         ActionReadiness::Satisfied
-    } else if action.preconditions == [condition] {
+    } else if action.preconditions.first() == Some(&condition) {
         ActionReadiness::Ready
     } else {
         ActionReadiness::Conflict(format!("单元 {:?} 在审阅后发生变化", unit.name))
@@ -541,7 +594,7 @@ fn deploy(
     match &unit.scope {
         UnitScope::System => deploy_at(Path::new(UNIT_ROOT), unit, definition, context),
         UnitScope::User { user: name } => {
-            let account = unit_account(name)?;
+            let account = reviewed_account(context.action, name)?;
             ensure_account_home(&account)?;
             user::with_permissions(&account, || {
                 let root = user::config_dir(&account);
@@ -561,11 +614,27 @@ fn deploy(
     }
 }
 
-fn unit_account(name: &str) -> Result<crate::accounts::UserAccount, BackendError> {
-    user::resolve(name)?.ok_or_else(|| BackendError(format!("缺少用户单元所属账户 {name:?}")))
+fn reviewed_account(action: &Action, name: &str) -> Result<UserAccount, BackendError> {
+    let account = user::resolve(name)?
+        .ok_or_else(|| BackendError(format!("缺少用户单元所属账户 {name:?}")))?;
+    let actual = account_condition(name, &account);
+    if action.preconditions.iter().any(|condition| {
+        matches!(
+            condition,
+            Precondition::ResourceState {
+                resource: ResourceId::User(_),
+                ..
+            }
+        ) && *condition != actual
+    }) {
+        return Err(BackendError(format!(
+            "账户 {name:?} 的 UID、主组或 home 在审阅后变化，请重新规划"
+        )));
+    }
+    Ok(account)
 }
 
-fn ensure_account_home(account: &crate::accounts::UserAccount) -> Result<(), BackendError> {
+fn ensure_account_home(account: &UserAccount) -> Result<(), BackendError> {
     required_target(&account.home)?
         .create_home(Uid::from_raw(account.uid), Gid::from_raw(account.gid))
         .map_err(|err| file_error(&account.home, err))
@@ -729,6 +798,26 @@ fn ctl(scope: &UnitScope, disk_only: bool, args: &[&str]) -> Result<String, Back
         return Err(ctl_error(args[0], &output));
     }
     String::from_utf8(output.stdout).map_err(|_| BackendError("systemctl 返回无效 UTF-8".into()))
+}
+
+fn action_ctl(
+    action: &Action,
+    scope: &UnitScope,
+    disk_only: bool,
+    args: &[&str],
+) -> Result<(), BackendError> {
+    let output = match scope {
+        UnitScope::User { user: name } => {
+            user::command(&reviewed_account(action, name)?, disk_only, args)?
+        }
+        UnitScope::System => system_ctl_output(args)?,
+        UnitScope::UserGlobal => unreachable!("validated unit scope"),
+    };
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(ctl_error(args[0], &output))
+    }
 }
 
 fn ctl_error(command: &str, output: &Output) -> BackendError {
