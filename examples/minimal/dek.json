@@ -8,6 +8,11 @@
     "server": {
       "entry": "hosts/server/default.json",
       "target": { "local": true }
+    },
+    "server-ruby": {
+      "entry": "hosts/server/default.rb",
+      "inputs": "sdk",
+      "target": { "local": true }
     }
   },
   "profiles": { "base": "profiles/base.json" },
