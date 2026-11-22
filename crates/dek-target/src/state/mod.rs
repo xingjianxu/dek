@@ -1,13 +1,13 @@
 //! Target-owned reviewed plans and content-addressed objects.
 
 mod fs;
+mod remote_plan;
 mod retention;
 mod runs;
 
-pub use runs::{
-    ActionAttempt, ActionReceipt, ActionResult, PendingRunNotification, RunAction, RunNotification,
-    RunRecord,
-};
+pub use dek_core::{ActionResult, PendingRunNotification, RunNotification};
+pub use remote_plan::PlanSession;
+pub use runs::{ActionAttempt, ActionReceipt, RunAction, RunRecord};
 
 use std::{
     cell::Cell,

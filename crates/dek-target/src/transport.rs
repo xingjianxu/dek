@@ -27,6 +27,9 @@ pub fn dispatch(registry: &BackendRegistry<'_>, operation: TargetRequest) -> Tar
                 message: error.to_string(),
             },
         },
+        _ => TargetResult::Error {
+            message: "当前目标端不支持此请求".into(),
+        },
     }
 }
 
@@ -34,6 +37,17 @@ pub fn serve(
     registry: &BackendRegistry<'_>,
     input: &mut impl BufRead,
     output: &mut impl Write,
+) -> io::Result<()> {
+    serve_with(registry, input, output, |operation| {
+        dispatch(registry, operation)
+    })
+}
+
+pub fn serve_with(
+    registry: &BackendRegistry<'_>,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    mut dispatch: impl FnMut(TargetRequest) -> TargetResult,
 ) -> io::Result<()> {
     let Some(ClientFrame::Hello { versions }) = read_frame(input)? else {
         return Err(invalid("expected a target protocol hello"));
@@ -58,7 +72,7 @@ pub fn serve(
             return Err(invalid("target protocol request IDs must increase"));
         }
         last_id = id;
-        let result = dispatch(registry, operation);
+        let result = dispatch(operation);
         write_frame(output, &ServerFrame::Response { id, result })?;
     }
     Ok(())

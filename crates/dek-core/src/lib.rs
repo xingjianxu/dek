@@ -5,6 +5,7 @@ mod origin;
 mod plan;
 pub mod protocol;
 mod resource;
+mod run;
 pub mod target_protocol;
 
 pub use config::{
@@ -26,3 +27,4 @@ pub use resource::{
     ResourceSet, ServiceEffect, ServiceNotification, SystemdUnitResource, UnitDefinition, UnitId,
     UnitScope, UserKind, UserResource,
 };
+pub use run::{ActionResult, PendingRunNotification, RunNotification};

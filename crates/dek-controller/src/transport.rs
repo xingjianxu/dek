@@ -1,6 +1,7 @@
 //! Launch the fixed target command through system OpenSSH.
 
 mod inputs;
+mod plan;
 
 pub use inputs::{RemoteTarget, TargetInputSnapshot};
 
@@ -49,6 +50,8 @@ pub enum SshErrorKind {
     Version { remote: Vec<u32> },
     #[error("目标标识不匹配，预期 {expected:?}，收到 {actual:?}")]
     Identity { expected: String, actual: String },
+    #[error("目标端拒绝请求：{0}")]
+    Target(String),
 }
 
 /// An SSH process whose host key, protocol version and target ID have been checked.

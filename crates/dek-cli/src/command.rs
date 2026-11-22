@@ -8,7 +8,10 @@ use std::{
 #[cfg(not(target_os = "linux"))]
 use crate::plan_output::write_plan;
 use crate::{
-    evaluation::normal_cache, local_target::LocalEvaluationTarget, planning::plan_host_with_cache,
+    evaluation::normal_cache,
+    local_target::LocalEvaluationTarget,
+    plan_output::write_plan_with_pending,
+    planning::{plan_host_with_cache, plan_remote_host},
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dek_controller::{
@@ -80,7 +83,11 @@ enum Command {
         json: bool,
     },
     #[command(name = "__target-stdio", hide = true)]
-    TargetStdio,
+    TargetStdio {
+        #[cfg(target_os = "linux")]
+        #[arg(long, value_name = "目录")]
+        state_dir: Option<PathBuf>,
+    },
     /// 执行当次规划或指定的本机已审阅计划。
     #[cfg(target_os = "linux")]
     Apply {
@@ -110,9 +117,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 观测本机目标并预览配置差异。
+    /// 观测目标并预览配置差异。
     Plan {
-        /// 使用指定的私有目标状态目录。默认 /var/lib/dek。
+        /// 本机模式使用指定的私有状态目录。默认 /var/lib/dek。
         #[cfg(target_os = "linux")]
         #[arg(long, value_name = "目录")]
         state_dir: Option<PathBuf>,
@@ -168,6 +175,9 @@ fn run_command<'target>(
             | Command::Apply {
                 state_dir: Some(root),
                 ..
+            }
+            | Command::TargetStdio {
+                state_dir: Some(root),
             } => root.clone(),
             _ => PathBuf::from(DEFAULT_ROOT),
         };
@@ -296,11 +306,31 @@ fn run_command<'target>(
             };
             write_target_info(&mut out, &capabilities, json)?;
         }
-        Command::TargetStdio => {
+        Command::TargetStdio {
+            #[cfg(target_os = "linux")]
+            state_dir,
+        } => {
             if cli.repo.is_some() || cli.host.is_some() {
                 return Err("目标端入口无需 --repo 或 --host".into());
             }
-            dek_target::transport::serve(&local_target()?, &mut io::stdin().lock(), &mut out)?;
+            let registry = local_target()?;
+            #[cfg(target_os = "linux")]
+            {
+                use dek_target::{
+                    state::{DEFAULT_ROOT, PlanSession},
+                    transport::{dispatch, serve_with},
+                };
+
+                let root = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
+                let mut planning = PlanSession::new(&root);
+                serve_with(&registry, &mut io::stdin().lock(), &mut out, |operation| {
+                    planning
+                        .dispatch(&registry, operation)
+                        .unwrap_or_else(|operation| dispatch(&registry, operation))
+                })?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            dek_target::transport::serve(&registry, &mut io::stdin().lock(), &mut out)?;
         }
         #[cfg(target_os = "linux")]
         Command::Apply {
@@ -357,9 +387,28 @@ fn run_command<'target>(
         } => {
             let repo = discover_repo(cli.repo.as_deref())?;
             let selection = HostSelection::from_arg(cli.host)?;
+            let (host, entry) = repo.select_host(selection.selector())?;
+            let cache = normal_cache(&repo)?;
+            if let Target::Ssh(alias) = &entry.target {
+                #[cfg(target_os = "linux")]
+                if state_dir.is_some() {
+                    return Err("远程 plan 的状态目录由目标端配置，请省略 --state-dir".into());
+                }
+                let expected = entry.target_id.as_deref().unwrap_or(host);
+                let mut session = SshSession::connect(alias, expected)?;
+                let review =
+                    plan_remote_host(&repo, selection.selector(), &mut session, cache.as_ref())?;
+                session.finish()?;
+                return write_plan_with_pending(
+                    &mut out,
+                    host,
+                    &review.plan,
+                    json,
+                    &review.pending_notifications,
+                );
+            }
             let registry = local_target()?;
             let mut provider = LocalEvaluationTarget(&registry);
-            let cache = normal_cache(&repo)?;
             let planned = plan_host_with_cache(
                 &repo,
                 selection.selector(),
@@ -392,7 +441,7 @@ fn run_command<'target>(
                 (plan, pending)
             };
             #[cfg(target_os = "linux")]
-            crate::status::write_plan_with_pending(&mut out, &planned.name, &plan, json, &pending)?;
+            write_plan_with_pending(&mut out, &planned.name, &plan, json, &pending)?;
             #[cfg(not(target_os = "linux"))]
             write_plan(&mut out, &planned.name, &planned.plan, json)?;
         }

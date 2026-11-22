@@ -3,14 +3,11 @@
 use std::{error::Error, io::Write, path::Path};
 
 use dek_controller::repo::{HostSelector, Repository, Target};
-use dek_core::{ActionKind, Plan, TargetIdentity};
-use dek_target::state::{ActionResult, PendingRunNotification, PlanBinding, StateStore};
+use dek_core::{ActionKind, TargetIdentity};
+use dek_target::state::{ActionResult, PlanBinding, StateStore};
 use serde_json::json;
 
-use crate::{
-    plan_output::{description, plan_document, write_plan},
-    planning::repository_id,
-};
+use crate::{plan_output::description, planning::repository_id};
 
 pub(crate) fn show_status(
     mut out: impl Write,
@@ -108,40 +105,6 @@ pub(crate) fn show_status(
             out,
             "待续办服务通知 [{}] {}",
             notice.action_id, notice.unit.name
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) fn write_plan_with_pending(
-    mut out: impl Write,
-    host: &str,
-    plan: &Plan,
-    json_output: bool,
-    pending: &[PendingRunNotification],
-) -> Result<(), Box<dyn Error>> {
-    if pending.is_empty() {
-        return write_plan(out, host, plan, json_output);
-    }
-    if json_output {
-        let mut document = plan_document(host, plan)?;
-        document["pending_notifications"] = json!(pending);
-        serde_json::to_writer_pretty(&mut out, &document)?;
-        writeln!(out)?;
-        return Ok(());
-    }
-    write_plan(&mut out, host, plan, false)?;
-    for item in pending {
-        writeln!(
-            out,
-            "待续办 [{}] {}，执行 {}",
-            item.notification.action_id,
-            description(&ActionKind::NotifyService {
-                unit: item.notification.unit.clone(),
-                effect: item.notification.effect,
-                sources: Vec::new(),
-            }),
-            item.run_id,
         )?;
     }
     Ok(())

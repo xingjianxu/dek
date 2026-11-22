@@ -3,7 +3,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dek_core::{Action, ActionKind, ServiceEffect, TargetIdentity, UnitId};
+use dek_core::{
+    Action, ActionKind, ActionResult, PendingRunNotification, RunNotification, ServiceEffect,
+    TargetIdentity,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -56,28 +59,6 @@ pub struct RunAction {
     pub recovery_diagnostic: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub enum ActionResult {
-    Pending,
-    Unverified,
-    Deferred {
-        message: String,
-    },
-    Verified {
-        changed: bool,
-    },
-    Failed {
-        message: String,
-        #[serde(
-            default,
-            rename = "notificationJobFailed",
-            skip_serializing_if = "std::ops::Not::not"
-        )]
-        notification_job_failed: bool,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActionAttempt {
     /// A new attempt is persisted. The backend may now be called.
@@ -90,24 +71,6 @@ pub enum ActionReceipt {
     Verified { changed: bool },
     Failed { message: String },
     NotificationJobFailed { message: String },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RunNotification {
-    pub action_id: String,
-    pub unit: UnitId,
-    pub effect: ServiceEffect,
-    pub depends_on: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingRunNotification {
-    pub run_id: String,
-    pub notification: RunNotification,
-    pub result: ActionResult,
-    pub prerequisites_verified: bool,
 }
 
 impl StateGuard<'_> {

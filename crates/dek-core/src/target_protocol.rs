@@ -4,11 +4,17 @@ use std::io::{self, BufRead, Read, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{Observation, TargetCapabilities, protocol::TargetQueryKind};
 use serde_json::Value;
+
+use crate::{
+    ContentDigest, InputObservation, Observation, PendingRunNotification, Plan, ResourceSet,
+    TargetCapabilities, protocol::TargetQueryKind,
+};
 
 pub const TARGET_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Keep each content frame well below the protocol frame limit.
+pub const CONTENT_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -28,8 +34,23 @@ pub enum ServerFrame {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum TargetRequest {
-    NormalizePath { path: String },
-    QueryInput { kind: TargetQueryKind, key: String },
+    NormalizePath {
+        path: String,
+    },
+    QueryInput {
+        kind: TargetQueryKind,
+        key: String,
+    },
+    PreparePlan {
+        request: Box<PlanRequest>,
+    },
+    UploadContent {
+        digest: ContentDigest,
+        #[serde(with = "content_chunk")]
+        chunk: Vec<u8>,
+        complete: bool,
+    },
+    FinishPlan,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,9 +64,52 @@ pub enum TargetResult {
         original: String,
         normalized: String,
     },
+    MissingContents {
+        digests: Vec<ContentDigest>,
+    },
+    ContentAccepted,
+    Planned(Box<RemotePlan>),
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanRequest {
+    pub repository_id: String,
+    pub logical_host: String,
+    pub resources: ResourceSet,
+    pub used_inputs: Vec<InputObservation>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemotePlan {
+    pub plan: Plan,
+    pub pending_notifications: Vec<PendingRunNotification>,
+}
+
+mod content_chunk {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    use super::CONTENT_CHUNK_BYTES;
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        let bytes = STANDARD.decode(encoded).map_err(D::Error::custom)?;
+        if bytes.len() > CONTENT_CHUNK_BYTES {
+            return Err(D::Error::custom("oversized target content chunk"));
+        }
+        Ok(bytes)
+    }
 }
 
 /// Read one complete frame, distinguishing clean EOF from a partial frame.

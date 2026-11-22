@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+if [[ $# != 3 ]]; then
+    printf 'Usage: %s IMAGE_ID MANAGER_DEK GUEST_DEK\n' "$0" >&2
+    exit 2
+fi
+image=$1
+manager=$(realpath -e -- "$2")
+guest=$(realpath -e -- "$3")
+cd -- "$(dirname -- "$0")/../.."
+vm=$PWD/scripts/run-arch-vm
+run_root="${DEK_DEV_ROOT:-/data/dek-dev}/runs/42"
+mkdir -p -- "$run_root"
+evidence=$(mktemp -d "$run_root/acceptance.XXXXXXXX")
+printf 'Evidence: %s\n' "$evidence"
+
+run=
+cleanup() {
+    if [[ -n "$run" && ! -e "$run/result" ]]; then
+        "$vm" finish "$run" failed || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+run=$("$vm" start 42 "$image" "$guest")
+printf '%s\n' "$run" > "$evidence/guest"
+export DEK_TEST_SSH_CONFIG
+DEK_TEST_SSH_CONFIG=$("$vm" config "$run")
+export DEK_TEST_REAL_SSH
+DEK_TEST_REAL_SSH=$(command -v ssh)
+target_id=$(<"$run/instance")
+"$vm" ssh "$run" 'sh -s' <<'SH' > "$evidence/guest-setup.log"
+set -eu
+grep -x 'ID=arch' /etc/os-release
+sudo -n install -d -m 0700 -o dek /var/lib/dek
+printf shared > /home/dek/plan-content-a
+printf shared > /home/dek/plan-content-b
+printf existing > /home/dek/plan-content-c
+SH
+
+# Simulate an actual connection loss after one complete and one partial object.
+python3 - "$target_id" <<'PY' > "$evidence/interrupted.jsonl"
+import base64
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+cmd = [os.environ["DEK_TEST_REAL_SSH"], "-F", os.environ["DEK_TEST_SSH_CONFIG"],
+       "-T", "-S", "none", "dek-vm", "dek __target-stdio"]
+
+def exchange(process, frame):
+    process.stdin.write(json.dumps(frame) + "\n")
+    process.stdin.flush()
+    answer = json.loads(process.stdout.readline())
+    print(json.dumps({"send": frame, "receive": answer}), flush=True)
+    return answer
+
+def request(process, number, operation):
+    answer = exchange(process, {"request": {"id": number, "operation": operation}})
+    assert answer["response"]["id"] == number, answer
+    return answer["response"]["result"]
+
+def start(process):
+    hello = exchange(process, {"hello": {"versions": [1]}})
+    assert hello["hello"]["capabilities"]["target"]["id"] == sys.argv[1], hello
+
+def digest(data):
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+def upload(address, data, complete):
+    return {"uploadContent": {"digest": address, "chunk": base64.b64encode(data).decode(),
+                              "complete": complete}}
+
+shared = digest(b"shared")
+existing = digest(b"existing")
+resources = [{"desired": {"file": {"path": "/home/dek/" + path,
+                                    "state": {"present": {"digest": address}}}}}
+             for path, address in [("plan-content-a", shared), ("plan-content-b", shared),
+                                   ("plan-content-c", existing)]]
+prepare = {"preparePlan": {"request": {"repositoryId": "acceptance-interrupted",
+                                       "logicalHost": "server", "usedInputs": [],
+                                       "resources": {"resources": resources}}}}
+with subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as process:
+    start(process)
+    assert request(process, 1, prepare) == {"missingContents": {"digests": sorted([shared, existing])}}
+    assert request(process, 2, upload(existing, b"existing", True)) == "contentAccepted"
+    assert request(process, 3, upload(shared, b"sha", False)) == "contentAccepted"
+    process.kill()
+    process.wait(timeout=10)
+with subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as process:
+    start(process)
+    assert request(process, 1, prepare) == {"missingContents": {"digests": [shared]}}
+    bad = request(process, 2, upload(shared, b"wrong", True))
+    assert shared in bad["error"]["message"], bad
+    assert "error" in request(process, 3, "finishPlan")
+    process.stdin.close()
+    assert process.wait(timeout=10) == 0
+PY
+"$vm" ssh "$run" 'test -z "$(ls -A /var/lib/dek/plans)" && test "$(ls /var/lib/dek/objects | wc -l)" -eq 1'
+
+mkdir -- "$evidence/bin" "$evidence/repo"
+cat > "$evidence/bin/ssh" <<'SH'
+#!/bin/sh
+tee "$DEK_TEST_WIRE" | "$DEK_TEST_REAL_SSH" -F "$DEK_TEST_SSH_CONFIG" "$@"
+SH
+chmod 0700 -- "$evidence/bin/ssh"
+export DEK_TEST_REAL_RUBY DEK_TEST_RUBY_RUNS="$evidence/ruby-runs"
+DEK_TEST_REAL_RUBY=$(command -v ruby)
+cat > "$evidence/bin/ruby" <<'SH'
+#!/bin/sh
+printf 'started\n' >> "$DEK_TEST_RUBY_RUNS"
+exec "$DEK_TEST_REAL_RUBY" "$@"
+SH
+chmod 0700 -- "$evidence/bin/ruby"
+jq -n --arg id "$target_id" '{
+    schemaVersion: 1,
+    hosts: {server: {entry: "host.json", target: {ssh: "dek-vm"}, targetId: $id}},
+    modules: {"lab.file": {schema: "options.json", expand: "expand.rb", inputs: "sdk"}}
+}' > "$evidence/repo/dek.json"
+printf '%s\n' '{"schemaVersion":1,"imports":[],"options":[]}' > "$evidence/repo/host.json"
+printf '%s\n' '{"options":[{"path":"lab.file.enable","type":"boolean","default":true,"description":"file fixture"}]}' > "$evidence/repo/options.json"
+cat > "$evidence/repo/expand.rb" <<'RUBY'
+file_resource '/home/dek/plan-content-a', content: 'shared'
+file_resource '/home/dek/plan-content-b', content: 'shared'
+file_resource '/home/dek/plan-content-c', content: 'existing'
+RUBY
+
+plan() {
+    XDG_CACHE_HOME="$evidence/cache" PATH="$evidence/bin:$PATH" DEK_TEST_WIRE="$evidence/$1.wire" \
+        "$manager" --repo "$evidence/repo" -H server plan --json > "$evidence/$1.json"
+}
+plan first
+[[ "$(wc -l < "$DEK_TEST_RUBY_RUNS")" == 1 ]]
+"$vm" ssh "$run" 'printf manual > /home/dek/plan-content-b'
+plan drifted
+[[ "$(wc -l < "$DEK_TEST_RUBY_RUNS")" == 1 ]]
+python3 - "$evidence" "$target_id" <<'PY'
+from base64 import b64decode
+from hashlib import sha256
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+def uploads(name):
+    operations = [json.loads(line)["request"]["operation"]
+                  for line in (root / (name + ".wire")).read_text().splitlines()[1:]]
+    return [op["uploadContent"] for op in operations if isinstance(op, dict) and "uploadContent" in op]
+
+(first,) = uploads("first")
+assert first["digest"] == "sha256:" + sha256(b"shared").hexdigest(), first
+assert first["complete"] and b64decode(first["chunk"], validate=True) == b"shared", first
+assert uploads("drifted") == []
+initial = json.loads((root / "first.json").read_bytes())
+drifted = json.loads((root / "drifted.json").read_bytes())
+assert initial["actions"] == [] and initial["target"]["id"] == sys.argv[2], initial
+assert initial["plan_id"] != drifted["plan_id"], drifted
+(action,) = drifted["actions"]
+assert action["kind"]["writeFile"]["path"] == "/home/dek/plan-content-b", action
+PY
+id=$(jq -er '.plan_id | select(test("^[0-9a-f]{64}$"))' "$evidence/drifted.json")
+"$vm" ssh "$run" "test -s /var/lib/dek/plans/$id.mpk && test \"\$(cat /home/dek/plan-content-b)\" = manual && sha256sum /var/lib/dek/plans/$id.mpk /var/lib/dek/objects/*" \
+    > "$evidence/guest-state.sha256"
+"$vm" finish "$run" passed
+printf 'OpenSSH content deduplication, interruption, rejection and live drift passed.\n'
