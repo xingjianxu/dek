@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname -- "$0")/.."
+root="$(pwd -P)"
+dev_root="${DEK_DEV_ROOT:-/data/dek-dev}"
+worktree="${root##*/}"
+branch="$(git branch --show-current)"
+if [[ "$branch" =~ ^issue-([1-9][0-9]*)- ]]; then
+    issue="${BASH_REMATCH[1]}"
+else
+    issue="workspace"
+fi
+
+export CARGO_HOME="$dev_root/cache/cargo"
+export CARGO_TARGET_DIR="$dev_root/cargo/target/$worktree"
+run_root="$dev_root/runs/$issue"
+mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR" "$run_root"
+run_dir="$(mktemp -d "$run_root/check.XXXXXXXX")"
+export TMPDIR="$run_dir/tmp"
+mkdir "$TMPDIR"
+printf '验证目录 %s\n' "$run_dir"
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+# 失败时保留本轮临时目录供排查。
+rm -r -- "$run_dir"

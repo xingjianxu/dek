@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "hosts": {
+    "demo": {
+      "entry": "hosts/demo/default.json",
+      "target": { "local": true }
+    }
+  },
+  "profiles": { "base": "profiles/base.json" },
+  "modules": {}
+}

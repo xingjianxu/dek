@@ -430,7 +430,7 @@ dek/
 ├── scripts/check                # 开发机统一验证脚本
 ├── sdk/ruby/                    # 求值器入口与 Ruby DSL，随发行包分发
 ├── examples/minimal/            # dek.json、hosts/、profiles/
-├── docs/                        # 设计文档与 adr/
+├── docs/                        # design.md、adr/ 与 tasks/<Issue号>.md
 └── .github/                     # 工作流与 Issue/PR 模板
 ```
 
@@ -475,6 +475,8 @@ dek 采用 Cargo workspace，开发机通过 `gh` 操作 GitHub。每项独立�
 按“可独立验收的目标”划分 Issue。同一目标内的多次提交、评审修改与测试补充沿用同一 Issue；单个改动横跨多个 crate 仍算一项任务，只有出现可单独交付的新需求时再拆分关联 Issue。大型功能可拆分子 Issue，父 Issue 保留总体验收标准。
 
 任务编号直接复用 GitHub Issue 号。例如 Issue `#42` 对应的分支为 `issue-42-user-timers`，开发机上的任务 worktree 路径为 `/data/dek-dev/worktrees/42-user-timers/`，跨仓库引用写作 `owner/repo#42`。单个 PR 即可完成的任务，在合入默认分支的 PR 正文中写 `Closes #42`；拆分为多个 PR 交付时，中间 PR 普通引用 `#42`，最后一个完成全部验收条件的 PR 再关闭 Issue。
+
+本仓库实行 Issue 先行。GitHub 分配的 Issue 号是任务卡唯一编号；收到编号后才创建 `docs/tasks/<编号>.md`，文件名仅含编号，卡片和 Issue 使用相同的交付目标标题。直接依赖及执行顺序见[任务索引](tasks/README.md)。开工时按同一编号创建关联分支和 worktree，详细步骤见[协作约定](../AGENTS.md)。
 
 ### 10.2 从创建 Issue 到合并
 
@@ -546,6 +548,8 @@ cargo test --locked --workspace
 若仓库未配置必需状态检查，agent 可依据脚本退出码与验收结果按第 10.5 节执行合并。若需要由 GitHub 强制拦截未通过验证的提交，可由受信任的本地验证程序上报独立 commit status（例如 `dek/local-ci`），并在 GitHub 端将其及对应上报来源设为必需检查；如仓库已绑定特定 GitHub App 或 Actions workflow，则按现有规则保留或单独迁移。Issue 和 PR 评论用于呈现详细结果，发布与跨平台构建任务可独立选择执行环境。
 
 ### 10.7 本地开发数据目录
+
+开发机是 NixOS 主机 `wks-lab`。新增开发工具在 `/etc/nixos/hosts/wks-lab/` 对应主机配置中声明，并遵循系统配置仓库的验证与生效流程。dek 源码仓库不接纳 Nix 开发环境或 NixOS 配置。
 
 开发机统一在 `/data/dek-dev/` 下存放 dek 专用的测试环境与中间产物。脚本、测试用例、环境定义、示例配置及 `Cargo.lock` 提交到 Git，运行期生成的数据按如下目录归类：
 

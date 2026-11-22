@@ -1,0 +1,8 @@
+[package]
+name = "dek-linux"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dek-core.workspace = true
+dek-target.workspace = true
