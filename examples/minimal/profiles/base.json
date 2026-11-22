@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "imports": [],
   "options": [
-    { "path": "programs.git.enable", "value": true }
+    { "path": "programs.git.enable", "value": true },
+    { "path": "services.caddy.enable", "value": false }
   ]
 }

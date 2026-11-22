@@ -2,6 +2,7 @@
 
 mod cached;
 mod graph;
+mod host;
 mod json;
 mod languages;
 mod observations;
@@ -13,9 +14,10 @@ pub use graph::{
     CollectError, CollectRequest, CollectedUnit, Collector, DeclarationGraph, GraphError,
     collect_graph,
 };
+pub use host::{EvaluatedHost, HostEvaluationError, evaluate_host};
 pub use json::JsonCollector;
 pub use languages::LanguageCollector;
 pub use ruby::{
     EvalOutput, HttpInputProvider, RubyError, RubyProviders, RubySession, TargetAnswer,
-    TargetProvider,
+    TargetProvider, TargetSnapshotSource,
 };
