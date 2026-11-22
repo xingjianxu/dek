@@ -1,6 +1,7 @@
 //! 管理机按工作副本和求值单元保存的可重建缓存。
 
 mod digest;
+mod http;
 
 use std::{
     collections::BTreeMap,
@@ -18,6 +19,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 pub use digest::{CacheDigest, canonical_set, semantic_digest};
+pub use http::{CachedHttpInputs, RefreshHttpInputs, RefreshStats};
 
 const FORMAT_VERSION: u32 = 1;
 

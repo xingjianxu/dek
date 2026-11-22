@@ -55,6 +55,7 @@ fn labels_only_the_snapshot_used_by_target_queries() {
         None,
         true,
         &mut provider,
+        None,
     )
     .unwrap();
     let without_facts: Value = serde_json::from_slice(&output).unwrap();
@@ -75,6 +76,7 @@ fn labels_only_the_snapshot_used_by_target_queries() {
         Some(&option),
         true,
         &mut provider,
+        None,
     )
     .unwrap();
     let with_facts: Value = serde_json::from_slice(&output).unwrap();
@@ -96,6 +98,7 @@ fn labels_only_the_snapshot_used_by_target_queries() {
         Some(&option),
         false,
         &mut provider,
+        None,
     )
     .unwrap();
     let text = String::from_utf8(output).unwrap();

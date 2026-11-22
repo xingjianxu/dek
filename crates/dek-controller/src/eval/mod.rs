@@ -14,7 +14,7 @@ pub use graph::{
     CollectError, CollectRequest, CollectedUnit, Collector, DeclarationGraph, GraphError,
     collect_graph,
 };
-pub use host::{EvaluatedHost, HostEvaluationError, evaluate_host};
+pub use host::{EvaluatedHost, HostEvaluationError, evaluate_host, evaluate_host_cached};
 pub use json::JsonCollector;
 pub use languages::LanguageCollector;
 pub use ruby::{
