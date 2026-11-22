@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# != 2 ]]; then
+    printf 'Usage: %s IMAGE_ID DEK_BINARY\n' "$0" >&2
+    exit 2
+fi
+binary=$(realpath -e -- "$2")
+cd -- "$(dirname -- "$0")/.."
+script_dir=$(pwd -P)
+run_root="${DEK_DEV_ROOT:-/data/dek-dev}/runs/23"
+mkdir -p "$run_root"
+evidence=$(mktemp -d "$run_root/acceptance.XXXXXXXX")
+printf 'Evidence: %s\n' "$evidence"
+runs=()
+ports=()
+cleanup() {
+    local child file run
+    for child in $(jobs -pr); do
+        kill -TERM "$child" 2>/dev/null || true
+        wait "$child" || true
+    done
+    for file in "$evidence/a" "$evidence/b"; do
+        [[ -s "$file" ]] || continue
+        run=$(<"$file")
+        [[ -e "$run/result" ]] || "$script_dir/run-arch-vm" finish "$run" failed || true
+    done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+base=$("$script_dir/arch-vm-image" check "$1")
+base_digest=$(sha256sum -- "$base")
+sha256sum -- "$binary" > "$evidence/local-dek.sha256"
+
+"$script_dir/run-arch-vm" start 23 "$1" "$binary" > "$evidence/a" &
+first=$!
+"$script_dir/run-arch-vm" start 23 "$1" "$binary" > "$evidence/b" &
+second=$!
+status=0
+wait "$first" || status=1
+wait "$second" || status=1
+runs=("$(< "$evidence/a")" "$(< "$evidence/b")")
+((status == 0))
+a=${runs[0]}
+b=${runs[1]}
+[[ "$a" != "$b" ]]
+
+for run in "$a" "$b"; do
+    config=$("$script_dir/run-arch-vm" config "$run")
+    port=$(ssh -F "$config" -G dek-vm 2>/dev/null | awk '$1 == "port" {print $2}')
+    ss -H -ltn "sport = :$port" > "$evidence/${run##*/}.listener"
+    awk -v address="127.0.0.1:$port" '$4 == address { good++ } END { exit good != 1 || NR != 1 }' \
+        "$evidence/${run##*/}.listener"
+    ports+=("$port")
+    remote=$("$script_dir/run-arch-vm" ssh "$run" sha256sum /usr/local/bin/dek)
+    local_digest=$(cut -d ' ' -f 1 "$evidence/local-dek.sha256")
+    [[ "${remote%% *}" == "$local_digest" ]]
+    "$script_dir/run-arch-vm" ssh "$run" /usr/local/bin/dek --version
+done
+[[ "${ports[0]}" != "${ports[1]}" ]]
+"$script_dir/run-arch-vm" ssh "$a" 'printf isolated > /home/dek/sentinel'
+"$script_dir/run-arch-vm" reboot "$a"
+"$script_dir/run-arch-vm" ssh "$a" 'test "$(cat /home/dek/sentinel)" = isolated'
+"$script_dir/run-arch-vm" ssh "$b" 'test ! -e /home/dek/sentinel'
+"$script_dir/run-arch-vm" finish "$a" passed
+[[ ! -e "$a/os.qcow2" && -s "$a/serial.log" ]]
+[[ -z "$(ss -H -ltn "sport = :${ports[0]}")" ]]
+"$script_dir/run-arch-vm" ssh "$b" true
+remote_status=0
+"$script_dir/run-arch-vm" ssh "$b" false || remote_status=$?
+[[ "$remote_status" == 1 ]]
+"$script_dir/run-arch-vm" finish "$b" failed
+[[ -s "$b/os.qcow2" && -s "$b/serial.log" ]]
+[[ -z "$(ss -H -ltn "sport = :${ports[1]}")" ]]
+[[ "$(sha256sum -- "$base")" == "$base_digest" ]]
+runs=()
+printf 'Two guests, reboot, verified binary and lifecycle passed.\n'

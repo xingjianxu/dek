@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+usage() {
+    cat <<'USAGE'
+Usage: run-arch-vm start ISSUE IMAGE_ID DEK_BINARY
+       run-arch-vm ssh RUN_DIR [REMOTE_COMMAND ...]
+       run-arch-vm config RUN_DIR
+       run-arch-vm reboot RUN_DIR
+       run-arch-vm finish RUN_DIR passed|failed|keep
+
+The test guest uses loopback SSH and has no external network access.
+DEK_VM_CPUS, DEK_VM_MEMORY_MIB and DEK_VM_BOOT_TIMEOUT can override the defaults.
+USAGE
+}
+
+fail() {
+    printf 'run-arch-vm: %s\n' "$*" >&2
+    exit 1
+}
+
+require() {
+    for tool; do
+        command -v "$tool" >/dev/null || fail "missing required tool: $tool"
+    done
+}
+
+qmp() {
+    (
+        cd -- "$run"
+        python3 - "$1" <<'PY'
+import json
+import socket
+import sys
+
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.settimeout(5)
+    connection.connect("qmp.sock")
+    with connection.makefile("rb") as replies:
+        replies.readline()
+        requests = [{"execute": "qmp_capabilities"}, json.loads(sys.argv[1])]
+        for request_id, request in enumerate(requests):
+            request["id"] = request_id
+            connection.sendall((json.dumps(request) + "\n").encode())
+            for line in replies:
+                reply = json.loads(line)
+                if reply.get("id") == request_id:
+                    if "error" in reply:
+                        raise SystemExit(reply["error"]["desc"])
+                    result = reply["return"]
+                    break
+            else:
+                raise SystemExit("QEMU closed the monitor without a reply")
+        print(json.dumps(result))
+PY
+    )
+}
+
+assert_instance() {
+    local actual
+    actual=$(qmp '{"execute":"query-name"}' | jq -er .name) || return 1
+    [[ "$actual" == "$(< "$run/instance")" ]]
+}
+
+wait_stopped() {
+    local deadline=$((SECONDS + $1))
+    while [[ -S "$run/qmp.sock" ]] && ((SECONDS < deadline)); do
+        sleep 1
+    done
+    [[ ! -S "$run/qmp.sock" ]]
+}
+
+stop_instance() {
+    [[ -S "$run/qmp.sock" ]] || return 0
+    assert_instance || { [[ ! -S "$run/qmp.sock" ]]; return; }
+    if qmp '{"execute":"system_powerdown"}' >/dev/null && wait_stopped 20; then
+        return 0
+    fi
+    [[ -S "$run/qmp.sock" ]] || return 0
+    # QEMU can close the monitor before replying to quit. Its socket must go away.
+    qmp '{"execute":"quit"}' >/dev/null 2>>"$run/qemu.stderr" || true
+    wait_stopped 5
+}
+
+connect() {
+    ssh -F "$run/ssh.conf" dek-vm "$@"
+}
+
+wait_ssh() {
+    local old_boot=${1:-} boot deadline=$((SECONDS + boot_timeout))
+    while ((SECONDS < deadline)); do
+        if boot=$(timeout 4 ssh -F "$run/ssh.conf" dek-vm cat /proc/sys/kernel/random/boot_id) &&
+            [[ -n "$boot" && "$boot" != "$old_boot" ]]; then
+            printf '%s\n' "$boot"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+seed_guest() {
+    local instance=$1
+    ssh-keygen -q -t ed25519 -N '' -C "$instance-client" -f "$run/client"
+    ssh-keygen -q -t ed25519 -N '' -C "$instance-host" -f "$run/host"
+    printf 'instance-id: %s\nlocal-hostname: %s\n' "$instance" "$instance" > "$run/meta-data"
+    {
+        cat <<'YAML'
+#cloud-config
+bootcmd:
+  - [systemctl, --no-block, mask, --now, systemd-time-wait-sync.service]
+users:
+  - name: dek
+    groups: [wheel]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+YAML
+        printf '      - %s\n' "$(< "$run/client.pub")"
+        cat <<'YAML'
+ssh_pwauth: false
+disable_root: true
+ssh_deletekeys: true
+ssh_keys:
+  ed25519_private: |
+YAML
+        sed 's/^/    /' "$run/host"
+        printf '  ed25519_public: %s\n' "$(< "$run/host.pub")"
+    } > "$run/user-data"
+    truncate -s 2M "$run/seed.img"
+    mkfs.vfat -n CIDATA "$run/seed.img" >/dev/null
+    mcopy -i "$run/seed.img" "$run/meta-data" "$run/user-data" ::/
+}
+
+ssh_config_path() {
+    local value=${1//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '"%s"' "${value//%/%%}"
+}
+
+write_ssh_config() {
+    local port=$1
+    printf '[127.0.0.1]:%s %s\n' "$port" "$(< "$run/host.pub")" > "$run/known_hosts"
+    cat > "$run/ssh.conf" <<SSH
+Host dek-vm
+    HostName 127.0.0.1
+    Port $port
+    User dek
+    IdentityFile $(ssh_config_path "$run/client")
+    UserKnownHostsFile $(ssh_config_path "$run/known_hosts")
+    GlobalKnownHostsFile /dev/null
+    StrictHostKeyChecking yes
+    HostKeyAlgorithms ssh-ed25519
+    BatchMode yes
+    IdentitiesOnly yes
+    ConnectTimeout 3
+SSH
+}
+
+start_failed() {
+    stop_instance || true
+    printf 'failed\n' > "$run/result"
+    printf 'run-arch-vm: guest start failed, evidence at %s\n' "$run" >&2
+}
+
+start() {
+    [[ $# == 3 && $1 =~ ^[1-9][0-9]*$ ]] || fail "expected ISSUE IMAGE_ID DEK_BINARY"
+    [[ "$(uname -sm)" == "Linux x86_64" && -r /dev/kvm && -w /dev/kvm ]] ||
+        fail "x86_64 Linux and read/write access to /dev/kvm are required"
+    require qemu-system-x86_64 qemu-img ssh-keygen mkfs.vfat mcopy python3 jq ssh
+    local issue=$1 image=$2 binary base qemu share firmware_code firmware_vars
+    binary=$(realpath -e -- "$3") || fail "missing dek binary: $3"
+    [[ -f "$binary" && -x "$binary" ]] || fail "not an executable: $binary"
+    base=$("$script_dir/arch-vm-image" check "$image")
+    qemu=$(realpath -- "$(command -v qemu-system-x86_64)")
+    share="${qemu%/bin/*}/share/qemu"
+    firmware_code=${DEK_VM_FIRMWARE_CODE:-$share/edk2-x86_64-code.fd}
+    firmware_vars=${DEK_VM_FIRMWARE_VARS:-$share/edk2-i386-vars.fd}
+    [[ -r "$firmware_code" && -r "$firmware_vars" ]] ||
+        fail "UEFI code and variable template required (DEK_VM_FIRMWARE_CODE and DEK_VM_FIRMWARE_VARS)"
+    firmware_code=$(realpath -- "$firmware_code")
+    firmware_vars=$(realpath -- "$firmware_vars")
+
+    mkdir -p -- "$dev_root/runs/$issue"
+    run=$(mktemp -d "$dev_root/runs/$issue/arch.XXXXXXXX")
+    trap start_failed EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    local instance="dek-$issue-${run##*.}" sha port boot remote
+    instance=${instance,,}
+    printf '%s\n' "$instance" > "$run/instance"
+    sha=$(sha256sum < "$binary")
+    sha=${sha%% *}
+    qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$run/os.qcow2"
+    seed_guest "$instance"
+    cp -- "$firmware_vars" "$run/vars.fd"
+    chmod u+w -- "$run/vars.fd"
+    # QEMU removes an absolute monitor socket on guest shutdown after daemonizing.
+    local monitor="$run/qmp.sock"
+    [[ ${#monitor} -lt 108 ]] || fail "QEMU monitor path exceeds the Linux socket limit: $monitor"
+    local -a launch=(
+        "$qemu" -name "$instance" -machine q35,accel=kvm -cpu host
+        -smp "$cpus" -m "$memory" -display none -monitor none -serial file:serial.log
+        -qmp "unix:${monitor//,/,,},server=on,wait=off" -daemonize -pidfile qemu.pid
+        -drive "if=pflash,unit=0,format=raw,readonly=on,file=${firmware_code//,/,,}"
+        -drive if=pflash,unit=1,format=raw,file=vars.fd
+        -drive if=none,id=os,format=qcow2,file=os.qcow2
+        -device virtio-blk-pci,drive=os,bootindex=1
+        -drive if=none,id=seed,format=raw,file=seed.img,readonly=on
+        -device virtio-blk-pci,drive=seed
+        -netdev user,id=guest,restrict=on,hostfwd=tcp:127.0.0.1:0-:22
+        -device virtio-net-pci,netdev=guest
+    )
+    printf '%q ' "${launch[@]}" > "$run/qemu.command"
+    (cd -- "$run" && "${launch[@]}") 2>"$run/qemu.stderr"
+    port=$(qmp '{"execute":"human-monitor-command","arguments":{"command-line":"info usernet"}}' |
+        jq -r . | awk '$1=="TCP[HOST_FORWARD]" && $3=="127.0.0.1" && $6==22 {print $4}')
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] || fail "no loopback SSH forwarding port"
+    write_ssh_config "$port"
+    boot=$(wait_ssh 2>"$run/ssh.log") || fail "SSH did not become ready"
+    timeout "$boot_timeout" ssh -F "$run/ssh.conf" dek-vm cloud-init status --wait > "$run/cloud-init.log"
+    connect 'sudo sh -ec "install -m 0755 /dev/stdin /usr/local/bin/dek"' < "$binary"
+    remote=$(connect sha256sum /usr/local/bin/dek)
+    [[ "${remote%% *}" == "$sha" ]] || fail "deployed binary has a different digest"
+    connect /usr/local/bin/dek --version > "$run/dek.version"
+    jq -n --arg image "$image" --arg base "$base" --arg sha256 "$sha" --arg instance "$instance" \
+        --arg boot "$boot" --argjson port "$port" \
+        '{image: $image, base: $base, binarySha256: $sha256, instance: $instance, boot: $boot,
+          sshPort: $port, serialLog: "serial.log", qemuCommand: "qemu.command", version: "dek.version"}' > "$run/run.json"
+    printf '%s\n' "$run"
+    trap - EXIT
+}
+
+choose_run() {
+    run=$(realpath -e -- "$1") || fail "run directory is missing: $1"
+    local relative=${run#"$dev_root/runs/"}
+    [[ "$relative" =~ ^[1-9][0-9]*/arch[.][[:alnum:]]{8}$ &&
+       -d "$run" && -O "$run" && $(stat -c %a -- "$run") == 700 &&
+       -f "$run/instance" ]] || fail "invalid run directory: $run"
+}
+
+if [[ $# == 1 && ( $1 == --help || $1 == -h ) ]]; then
+    usage
+    exit 0
+fi
+[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+action=$1
+shift
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+dev_root=$(realpath -m -- "${DEK_DEV_ROOT:-/data/dek-dev}")
+cpus=${DEK_VM_CPUS:-2}
+memory=${DEK_VM_MEMORY_MIB:-2048}
+boot_timeout=${DEK_VM_BOOT_TIMEOUT:-120}
+for size in "$cpus" "$memory" "$boot_timeout"; do
+    [[ "$size" =~ ^[1-9][0-9]*$ ]] || fail "VM sizes and timeouts must be positive integers"
+done
+
+case "$action" in
+    start) start "$@" ;;
+    ssh|config|reboot|finish)
+        [[ $# -ge 1 ]] || fail "missing run directory"
+        choose_run "$1"
+        shift
+        case "$action" in
+            ssh) connect "$@" ;;
+            config)
+                [[ $# == 0 && -f "$run/ssh.conf" ]] || fail "SSH configuration unavailable"
+                printf '%s\n' "$run/ssh.conf"
+                ;;
+            reboot)
+                [[ $# == 0 ]] || fail "unexpected reboot arguments"
+                exec {operation_lock}>"$run/operation.lock"
+                flock "$operation_lock"
+                old_boot=$(connect cat /proc/sys/kernel/random/boot_id)
+                # Schedule reboot after SSH can return an exit status for the request.
+                connect sudo systemd-run --quiet --on-active=1s systemctl reboot
+                new_boot=$(wait_ssh "$old_boot" 2>>"$run/ssh.log") || fail "guest did not reboot"
+                printf '%s\n' "$new_boot" >> "$run/reboots"
+                ;;
+            finish)
+                [[ $# == 1 && ( $1 == passed || $1 == failed || $1 == keep ) ]] ||
+                    fail "expected passed, failed or keep"
+                exec {operation_lock}>"$run/operation.lock"
+                flock "$operation_lock"
+                stop_instance || fail "could not stop this guest; disk retained at $run"
+                if [[ "$1" == passed ]]; then
+                    rm -f -- "$run/os.qcow2"
+                fi
+                printf '%s\n' "$1" > "$run/result"
+                ;;
+        esac
+        ;;
+    *) usage >&2; exit 2 ;;
+esac
