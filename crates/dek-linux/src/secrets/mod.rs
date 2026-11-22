@@ -175,7 +175,7 @@ impl Backend for SecretBackend {
         }])
     }
 
-    fn execute(&self, _: &ActionKind) -> Result<(), BackendError> {
+    fn execute(&self, _: &dek_target::backend::ActionContext<'_>) -> Result<(), BackendError> {
         Err(BackendError("此后端只支持加密文件的规划与核验".into()))
     }
 

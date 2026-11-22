@@ -162,7 +162,7 @@ impl Backend for MemoryBackend {
         }))
     }
 
-    fn execute(&self, _: &ActionKind) -> Result<(), BackendError> {
+    fn execute(&self, _: &dek_target::backend::ActionContext<'_>) -> Result<(), BackendError> {
         panic!("planning must not call execute")
     }
 

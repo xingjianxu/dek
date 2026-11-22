@@ -1,5 +1,7 @@
 //! Local CLI command adapters and shared planning entry points.
 
+#[cfg(target_os = "linux")]
+pub mod applying;
 pub mod command;
 pub mod evaluation;
 pub mod local_target;

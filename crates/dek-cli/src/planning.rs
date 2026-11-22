@@ -68,8 +68,7 @@ pub fn plan_host_with_cache(
             used_inputs.push(input.clone());
         }
     }
-    let repository_id =
-        CacheDigest::of_bytes(repo.root().as_os_str().as_encoded_bytes()).to_string();
+    let repository_id = repository_id(repo);
     let plan = plan_for_host(
         registry,
         &repository_id,
@@ -83,4 +82,8 @@ pub fn plan_host_with_cache(
         expanded,
         plan,
     })
+}
+
+pub(crate) fn repository_id(repo: &Repository) -> String {
+    CacheDigest::of_bytes(repo.root().as_os_str().as_encoded_bytes()).to_string()
 }

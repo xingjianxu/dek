@@ -86,6 +86,12 @@ pub struct StateGuard<'a> {
     retention: RetentionPolicy,
 }
 
+/// Serializes execution in this target state root while short state transactions
+/// remain independently accessible to status and retention.
+pub(crate) struct ExecutionLease {
+    _lock: File,
+}
+
 #[derive(Clone, Copy)]
 pub struct PlanBinding<'a> {
     pub repository_id: &'a str,
@@ -118,6 +124,12 @@ struct Record<P, R, H> {
 type OwnedRecord = Record<Plan, ResourceSet, String>;
 
 impl StateStore {
+    pub(crate) fn execution_lease(&self) -> Result<ExecutionLease, StateError> {
+        Ok(ExecutionLease {
+            _lock: self.root.lock("execution.lock")?,
+        })
+    }
+
     /// Read a marker from the existing private state hierarchy without initializing it.
     pub fn read_secret_verification(
         path: &Path,

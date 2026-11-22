@@ -206,7 +206,7 @@ impl Backend for MemoryTarget {
         )
     }
 
-    fn execute(&self, _: &ActionKind) -> Result<(), BackendError> {
+    fn execute(&self, _: &dek_target::backend::ActionContext<'_>) -> Result<(), BackendError> {
         self.executes.set(self.executes.get() + 1);
         Ok(())
     }
