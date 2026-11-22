@@ -52,6 +52,18 @@ impl RepositoryModules {
         repo: &Repository,
         schemas: &mut SchemaRegistry,
     ) -> Result<Self, RepositoryModuleError> {
+        let original_count = schemas.options.len();
+        let result = Self::load_into(repo, schemas);
+        if result.is_err() {
+            schemas.options.truncate(original_count);
+        }
+        result
+    }
+
+    fn load_into(
+        repo: &Repository,
+        schemas: &mut SchemaRegistry,
+    ) -> Result<Self, RepositoryModuleError> {
         let mut entries = Vec::new();
         for (name, module) in &repo.manifest().modules {
             let option_path = |path: &str| {

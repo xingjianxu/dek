@@ -92,7 +92,11 @@ resource :systemdUnit,
         )
         .unwrap();
     let off = schemas.merge(&[], &UnitSpec::default()).unwrap();
+    let entry = root.path().join("modules/lab/expand.rb");
+    let disabled_entry = entry.with_extension("disabled");
+    fs::rename(&entry, &disabled_entry).unwrap();
     assert!(modules.expand(root.path(), &off).unwrap().is_empty());
+    fs::rename(disabled_entry, entry).unwrap();
 
     let profile = UnitSpec {
         options: vec![assignment("lab.backup.day", json!("Mon"), "base.json")],
