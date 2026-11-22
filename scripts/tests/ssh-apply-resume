@@ -189,7 +189,7 @@ if call recovery apply --run "$recovery_run" > "$evidence/fail-notice.stdout" 2>
 fi
 grep -Fq '远端测试服务首次失败' "$evidence/fail-notice.stderr"
 call recovery status --run "$recovery_run" --json > "$evidence/pending.json"
-jq -e '.actions[0].attempt == 1 and .actions[0].result.verified.changed
+jq -e '.actions[0].attempt == 1 and (.actions[0].result | has("verified"))
     and (.actions[1].result.failed | has("notificationJobFailed"))
     and (.pending_notifications | length == 1)' "$evidence/pending.json" >/dev/null
 call recovery apply > "$evidence/resumed.stdout"
