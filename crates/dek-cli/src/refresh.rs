@@ -1,6 +1,6 @@
 use std::{error::Error, io::Write};
 
-use dek_cli::evaluation::{evaluate_options, expand_host};
+use crate::evaluation::{evaluate_options, expand_host};
 use dek_controller::{
     cache::{CacheStore, RefreshHttpInputs},
     eval::{RubyProviders, RubySession, TargetProvider},
