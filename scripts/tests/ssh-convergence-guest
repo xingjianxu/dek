@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+grep -qx 'ID=arch' /etc/os-release
+[[ "$(id -u)" = 0 && -e /run/cloud-init/instance-data.json ]]
+if command -v ruby || [[ -e /home/dek/dek.json || -e /root/dek.json ]]; then
+    printf 'Guest must start without Ruby or a configuration repository.\n' >&2
+    exit 1
+fi
+root=/run/dek-ssh-convergence
+mkdir -p -- "$root" /usr/local/libexec
+install -d -m 0700 /var/lib/dek
+printf 'fact-%s\n' "$1" > "$root/fact"
+printf 'initial-%s\n' "$1" > "$root/managed.conf"
+: > "$root/reloads"
+cat > "$root/reload" <<'SH'
+#!/bin/sh
+printf 'reload\n' >> /run/dek-ssh-convergence/reloads
+SH
+cat > /etc/systemd/system/dek-ssh-convergence.service <<'UNIT'
+[Unit]
+Description=dek SSH convergence fixture
+
+[Service]
+ExecStart=/usr/bin/sleep infinity
+ExecReload=/usr/bin/bash /run/dek-ssh-convergence/reload
+UNIT
+systemctl daemon-reload
+systemctl start dek-ssh-convergence.service
+systemctl is-active dek-ssh-convergence.service
+# The fresh VM grants its test account passwordless sudo. Execute only the
+# shipped target binary, with the root-owned state required by system services.
+mv /usr/local/bin/dek /usr/local/libexec/dek-ssh-convergence
+cat > /usr/local/bin/dek <<'SH'
+#!/bin/sh
+exec sudo -n /usr/local/libexec/dek-ssh-convergence "$@"
+SH
+chmod 0755 /usr/local/bin/dek
+printf 'Arch target %s has no Ruby or configuration repository.\n' "$1"
