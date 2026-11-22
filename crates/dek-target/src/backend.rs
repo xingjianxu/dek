@@ -38,6 +38,14 @@ pub struct PlannedNotification {
     pub preconditions: Vec<Precondition>,
 }
 
+pub type RepositoryCommit = Box<dyn FnOnce() -> Result<(), BackendError>>;
+
+/// A native transaction held ready under its database lock, or evidence of drift.
+pub enum RepositoryPreparation {
+    Ready(RepositoryCommit),
+    Changed,
+}
+
 /// The current disposition of a reviewed action against live target state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActionReadiness {
@@ -237,6 +245,14 @@ pub trait Backend {
         Err(BackendError("后端未提供此动作的执行能力".into()))
     }
 
+    /// Prepare the reviewed repository transaction at its native mutation boundary.
+    fn prepare_repository_transaction(
+        &self,
+        _: &Action,
+    ) -> Result<RepositoryPreparation, BackendError> {
+        Err(BackendError("后端未提供仓库事务的准备能力".into()))
+    }
+
     /// Validate reviewed inputs that must be checked together before any action runs.
     fn validate_batch(&self, _: &ResourceSet, _: &[ActionContext<'_>]) -> Result<(), BackendError> {
         Ok(())
@@ -271,6 +287,11 @@ pub trait Backend {
         };
         Ok(match self.inspect_action(action)? {
             ActionReadiness::Conflict(reason) => RecoveryReadiness::Conflict(reason),
+            ActionReadiness::Satisfied
+                if matches!(action.kind, ActionKind::RepositoryTransaction(_)) =>
+            {
+                RecoveryReadiness::Satisfied
+            }
             _ if ambiguous => RecoveryReadiness::Indeterminate(
                 "无法从当前状态确认包事务或服务动作的结果，请在目标机查核后查看 dek status".into(),
             ),
