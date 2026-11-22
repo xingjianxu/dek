@@ -1,5 +1,4 @@
 use std::{
-    env,
     error::Error,
     io::{self, Write},
     path::PathBuf,
@@ -7,8 +6,19 @@ use std::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
+use dek_cli::{
+    local_target::{LocalEvaluationTarget, LocalFileBackend, local_registry},
+    plan_output::write_plan,
+    planning::plan_host,
+};
 use dek_controller::repo::{EntryLanguage, HostSelector, Repository, Target, initialize};
+use dek_core::OptionPath;
 use serde_json::json;
+
+mod repository;
+mod show;
+
+use repository::{HostSelection, discover_repo, local_hostname};
 
 #[derive(Parser)]
 #[command(name = "dek", version, about = "声明式主机配置管理器")]
@@ -42,6 +52,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// 查看生效配置和选项定义来源。
+    Show {
+        /// 要追溯的完整选项路径，省略时显示整机配置。
+        #[arg(value_name = "选项")]
+        option: Option<OptionPath>,
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
+    },
+    /// 观测本机目标并预览配置差异。
+    Plan {
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -71,10 +96,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 return Err("初始化目录只能通过位置参数或 --repo 指定一次".into());
             }
             let root = directory.or(cli.repo).unwrap_or_else(|| PathBuf::from("."));
-            let hostname = hostname::get()
-                .map_err(|err| format!("无法读取当前主机名：{err}"))?
-                .into_string()
-                .map_err(|name| format!("当前主机名不是有效的 UTF-8：{name:?}"))?;
+            let hostname = local_hostname()?;
             let language = match lang {
                 Language::Json => EntryLanguage::Json,
                 Language::Ruby => EntryLanguage::Ruby,
@@ -83,8 +105,28 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             writeln!(out, "已初始化配置仓库 {}", root.display())?;
         }
         Command::Hosts { json } => {
-            let repo = Repository::discover(&env::current_dir()?, cli.repo.as_deref())?;
+            let repo = discover_repo(cli.repo.as_deref())?;
             list_hosts(&mut out, &repo, cli.host.as_deref(), json)?;
+        }
+        Command::Show { option, json } => {
+            let repo = discover_repo(cli.repo.as_deref())?;
+            let selected = HostSelection::from_arg(cli.host)?;
+            show::show(
+                &mut out,
+                &repo,
+                selected.selector(),
+                option.as_ref(),
+                json,
+                &mut show::UnavailableTarget,
+            )?;
+        }
+        Command::Plan { json } => {
+            let repo = repository::discover_repo(cli.repo.as_deref())?;
+            let selection = repository::HostSelection::from_arg(cli.host)?;
+            let registry = local_registry(&LocalFileBackend)?;
+            let mut provider = LocalEvaluationTarget(&registry);
+            let planned = plan_host(&repo, selection.selector(), &registry, &mut provider)?;
+            write_plan(&mut out, &planned.name, &planned.plan, json)?;
         }
     }
     Ok(())

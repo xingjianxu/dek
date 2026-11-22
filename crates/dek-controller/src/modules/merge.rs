@@ -44,6 +44,14 @@ impl SchemaRegistry {
     /// Merge the supplied profile units in graph order, followed by the host.
     /// A named option exists once a concrete path has been assigned.
     pub fn merge(&self, profiles: &[UnitSpec], host: &UnitSpec) -> Result<HostConfig, MergeError> {
+        self.merge_profiles(profiles, host)
+    }
+
+    pub(crate) fn merge_profiles<'a>(
+        &self,
+        profiles: impl IntoIterator<Item = &'a UnitSpec>,
+        host: &'a UnitSpec,
+    ) -> Result<HostConfig, MergeError> {
         let mut groups = BTreeMap::new();
         for registered in &self.options {
             if !registered.dynamic
@@ -54,7 +62,7 @@ impl SchemaRegistry {
         }
 
         let units = profiles
-            .iter()
+            .into_iter()
             .map(|unit| (Priority::Profile, unit))
             .chain(std::iter::once((Priority::Host, host)));
         for (priority, unit) in units {
