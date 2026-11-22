@@ -240,7 +240,12 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             &reviewed.resources,
             &reviewed.plan.used_inputs,
         )?;
-        let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh) else {
+        let resumed = match &application {
+            Application::Resume(run) => Some(run.as_ref()),
+            Application::New { .. } => None,
+        };
+        let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh, resumed)
+        else {
             return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
         };
         if let Application::Resume(run) = &application
@@ -373,6 +378,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         live: &BTreeSet<&str>,
     ) -> Result<(), ExecutionError> {
         let mut triggered = BTreeSet::new();
+        let mut deferred = BTreeSet::new();
         for item in &run.actions {
             let action = &item.action;
             if let ActionResult::Verified { changed } = item.result {
@@ -401,7 +407,29 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                         continue;
                     }
                 }
+                ActionResult::Deferred { .. } => {
+                    deferred.insert(action.id.as_str());
+                    continue;
+                }
                 ActionResult::Verified { .. } => unreachable!("verified actions were handled"),
+            }
+            let deferred_reason = if let Some(dependency) = action
+                .depends_on
+                .iter()
+                .find(|id| deferred.contains(id.as_str()))
+            {
+                Some(format!("依赖动作 {dependency} 待激活"))
+            } else {
+                backend
+                    .deferred_reason(action)
+                    .map_err(|error| ExecutionError::action(action, error.0))?
+            };
+            if let Some(message) = deferred_reason {
+                self.store
+                    .lock()?
+                    .defer_action(&run.id, binding, &action.id, message)?;
+                deferred.insert(action.id.as_str());
+                continue;
             }
             let readiness = backend
                 .inspect_action(action)

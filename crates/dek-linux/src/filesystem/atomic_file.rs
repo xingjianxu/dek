@@ -68,6 +68,36 @@ impl TargetPath {
         Ok(())
     }
 
+    pub(crate) fn create_home(&self, uid: Uid, gid: Gid) -> io::Result<()> {
+        match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {
+                return Ok(());
+            }
+            Ok(_) => return Err(io::Error::other("home is not a real directory")),
+            Err(Errno::NOENT) => {}
+            Err(err) => return Err(err.into()),
+        }
+        let parent = fstat(&self.parent)?;
+        if parent.st_uid != 0 || parent.st_mode & 0o022 != 0 {
+            return Err(io::Error::other(
+                "home parent requires administrator ownership",
+            ));
+        }
+        let staged = StagingDirectory::new(self)?;
+        fchown(&staged.directory, Some(uid), Some(gid))?;
+        fchmod(&staged.directory, Mode::from_bits_truncate(0o700))?;
+        rustix::fs::fsync(&staged.directory)?;
+        renameat_with(
+            &self.parent,
+            &staged.directory_name,
+            &self.parent,
+            &self.name,
+            RenameFlags::NOREPLACE,
+        )?;
+        rustix::fs::fsync(&self.parent)?;
+        Ok(())
+    }
+
     pub(crate) fn observe(&self) -> io::Result<Option<Stat>> {
         match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {

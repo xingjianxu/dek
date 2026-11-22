@@ -174,6 +174,11 @@ pub trait Backend {
         Err(BackendError("后端未提供此动作的前置条件核对".into()))
     }
 
+    /// Explain why a reviewed action must wait for an unavailable manager.
+    fn deferred_reason(&self, _: &Action) -> Result<Option<String>, BackendError> {
+        Ok(None)
+    }
+
     /// Reobserve a recorded attempt. Backends may override this when they can
     /// independently determine the outcome of a package transaction or effect.
     fn inspect_recovery(
