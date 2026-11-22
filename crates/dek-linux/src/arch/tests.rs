@@ -1,4 +1,4 @@
-use std::{fs, os::unix::fs::PermissionsExt};
+use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 
 use dek_core::{
     Action, ActionKind, DesiredResource, PackageId, PackageResource, PackageSource, Precondition,
@@ -21,10 +21,8 @@ fn request(name: &str, state: Presence) -> DesiredResource {
 fn fixture(preview: &str) -> (tempfile::TempDir, PacmanBackend) {
     let root = tempfile::tempdir().unwrap();
     let program = root.path().join("pacman");
-    fs::write(
-        &program,
-        format!(
-            r#"#!/bin/sh
+    let script = format!(
+        r#"#!/bin/sh
 state_dir=$(dirname "$0")
 printf '%s\n' "$*" >> "$state_dir/argv"
 case "$1:${{2:-}}" in
@@ -33,10 +31,17 @@ case "$1:${{2:-}}" in
     *) printf 'hook diagnostic\n'; printf 'unexpected invocation\n' >&2; exit 49 ;;
 esac
 "#,
-            preview
-        ),
-    )
-    .unwrap();
+        preview
+    );
+    // Keep writable executable descriptors out of the test runner while other
+    // tests spawn child processes. A child can inherit them until it execs.
+    let status = Command::new("/bin/sh")
+        .args(["-c", "printf '%s' \"$1\" > \"$2\"", "pacman-fixture"])
+        .arg(script)
+        .arg(&program)
+        .status()
+        .unwrap();
+    assert!(status.success());
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
     (root, PacmanBackend { program })
 }
