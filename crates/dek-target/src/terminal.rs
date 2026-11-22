@@ -30,6 +30,10 @@ pub(crate) const TERMINAL_REQUIRED: &str =
 pub struct TerminalCommand {
     program: OsString,
     arguments: Vec<OsString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment: Option<Vec<(OsString, OsString)>>,
 }
 
 impl TerminalCommand {
@@ -40,12 +44,41 @@ impl TerminalCommand {
         Self {
             program: program.into(),
             arguments: arguments.into_iter().map(Into::into).collect(),
+            directory: None,
+            environment: None,
         }
     }
 
+    pub fn in_environment(
+        mut self,
+        directory: PathBuf,
+        variables: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Self {
+        self.directory = Some(directory);
+        self.environment = Some(variables.into_iter().collect());
+        self
+    }
+
+    pub fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.arguments);
+        if let Some(directory) = &self.directory {
+            command.current_dir(directory);
+        }
+        if let Some(environment) = &self.environment {
+            command.env_clear().envs(environment.iter().cloned());
+        }
+        command
+    }
+
     fn run(&self) -> Result<(), String> {
-        let status = Command::new(&self.program)
-            .args(&self.arguments)
+        let mut command = self.command();
+        if self.environment.is_some()
+            && let Some(term) = std::env::var_os("TERM")
+        {
+            command.env("TERM", term);
+        }
+        let status = command
             .status()
             .map_err(|error| format!("无法启动交互程序 {:?}：{error}", self.program))?;
         if status.success() {
@@ -54,6 +87,14 @@ impl TerminalCommand {
             Err(format!("交互程序 {:?} 结束：{status}", self.program))
         }
     }
+}
+
+pub(crate) fn available() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal()
+}
+
+pub(crate) fn run_locally(command: &TerminalCommand) -> Result<(), BackendError> {
+    command.run().map_err(BackendError)
 }
 
 pub(crate) type TerminalRunner<'a> =
@@ -97,7 +138,7 @@ fn start_attachment(
 /// Run the pending helper in this SSH session's controlling terminal.
 pub fn attach(root: &Path, token: &str) -> Result<(), Box<dyn std::error::Error>> {
     let path = attachment_path(root, token)?;
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+    if !available() {
         return Err("此入口需要独立的 SSH 终端".into());
     }
     let _store = StateStore::open(root)?;

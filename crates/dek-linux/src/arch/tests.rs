@@ -29,6 +29,8 @@ case "$1:${{2:-}}" in
     --query:--color)
         if [ -f "$state_dir/query-diagnostic" ]; then cat "$state_dir/query-diagnostic" >&2; fi
         printf 'ripgrep 15.2.0-1\ntree 2.3.2-1\n' ;;
+    --query:--info)
+        if [ -f "$state_dir/record-diagnostic" ]; then cat "$state_dir/record-diagnostic" >&2; fi ;;
     --remove:--print) printf '%s\n' '{}' ;;
     *) printf 'hook diagnostic\n'; printf 'unexpected invocation\n' >&2; exit 49 ;;
 esac
@@ -167,4 +169,38 @@ fn local_query_tolerates_missing_sync_metadata_and_reports_local_read_errors() {
             .0
             .contains("cannot read local")
     );
+}
+
+#[test]
+fn aur_recovery_checks_the_complete_installed_package_record() {
+    let (fixture, backend) = fixture("");
+    let package = PackageId {
+        source: PackageSource::Aur,
+        name: "tree".into(),
+    };
+    let action = Action {
+        id: "build".into(),
+        kind: ActionKind::BuildAurPackage {
+            package: package.clone(),
+            candidate_version: Some("2.3.2-1".into()),
+            dependencies: Default::default(),
+        },
+        reason: String::new(),
+        origins: Vec::new(),
+        depends_on: Vec::new(),
+        preconditions: vec![Precondition::PackageVersion {
+            package,
+            expected: None,
+        }],
+    };
+    let broken = fixture.path().join("record-diagnostic");
+    fs::write(&broken, "error: missing local package description\n").unwrap();
+    assert!(backend.inspect_action(&action).is_err());
+    assert!(backend.verify(&action.kind).is_err());
+    fs::remove_file(broken).unwrap();
+    assert_eq!(
+        backend.inspect_action(&action).unwrap(),
+        ActionReadiness::Satisfied
+    );
+    assert!(backend.verify(&action.kind).unwrap());
 }

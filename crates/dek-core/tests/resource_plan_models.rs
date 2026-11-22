@@ -229,3 +229,20 @@ fn repository_transaction_round_trips_as_an_atomic_reviewed_action() {
     );
     assert_eq!(serde_json::from_value::<ActionKind>(json).unwrap(), kind);
 }
+
+#[test]
+fn aur_rebuild_plan_preserves_same_version_baseline() {
+    let mut plan = serde_json::from_str::<Value>(PLAN).unwrap();
+    plan["aurMode"] = json!("rebuildAur");
+    plan["actions"][0]["kind"] = json!({
+        "rebuildAurPackage": {
+            "package": {"source": "aur", "name": "fixture"},
+            "candidateVersion": "1-1",
+            "rebuildFrom": {"device": 1, "inode": 2, "changedAt": 3, "changedAtNsec": 4}
+        }
+    });
+    let plan: Plan = serde_json::from_value(plan).unwrap();
+    assert!(plan.mode().rebuild_aur());
+    let encoded = rmp_serde::to_vec(&plan).unwrap();
+    assert_eq!(rmp_serde::from_slice::<Plan>(&encoded).unwrap(), plan);
+}

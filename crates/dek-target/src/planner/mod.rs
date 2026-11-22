@@ -86,7 +86,7 @@ pub fn plan(
         resources,
         used_inputs,
         &BTreeMap::new(),
-        PlanMode::Normal,
+        (PlanMode::Normal, None),
     )
 }
 
@@ -145,7 +145,24 @@ pub fn plan_for_host_with_contents_mode(
         resources,
         used_inputs,
         contents,
-        mode,
+        (mode, None),
+    )
+}
+
+pub(crate) fn recheck_plan(
+    registry: &BackendRegistry<'_>,
+    logical_host: &str,
+    reviewed: &crate::state::ReviewedPlan,
+    mode: PlanMode,
+) -> Result<Plan, PlanError> {
+    plan_with_host(
+        registry,
+        &reviewed.plan.repository_id,
+        Some(logical_host),
+        &reviewed.resources,
+        &reviewed.plan.used_inputs,
+        &reviewed.contents,
+        (mode, Some(&reviewed.plan.actions)),
     )
 }
 
@@ -156,12 +173,12 @@ fn plan_with_host(
     resources: &ResourceSet,
     used_inputs: &[InputObservation],
     contents: &BTreeMap<ContentDigest, Vec<u8>>,
-    mode: PlanMode,
+    (mode, reviewed_actions): (PlanMode, Option<&[Action]>),
 ) -> Result<Plan, PlanError> {
     let (prepared, mut used_capabilities) = prepare(registry, resources)?;
     let order = topological_order(registry, &prepared)?;
     let mut actions = Actions::default();
-    let mut packages = plan_packages(registry, resources, mode)?;
+    let mut packages = plan_packages(registry, resources, mode, reviewed_actions)?;
     let transaction = packages.transaction.take().map(|draft| {
         let origins = packages
             .covered
@@ -259,6 +276,10 @@ fn plan_with_host(
         resource_digest: resource_digest(resources)?,
         used_capabilities,
         used_inputs: used_inputs.to_vec(),
+        aur_mode: match mode {
+            PlanMode::Normal | PlanMode::Upgrade => PlanMode::Normal,
+            _ => mode.after_repository_upgrade(),
+        },
         actions,
     };
     reviewed.id = plan_id(&reviewed, logical_host)?;
@@ -269,6 +290,7 @@ fn plan_packages(
     registry: &BackendRegistry<'_>,
     resources: &ResourceSet,
     mode: PlanMode,
+    reviewed: Option<&[Action]>,
 ) -> Result<PlannedPackages, PlanError> {
     let error = |message| PlanError::Packages {
         target: registry.target().id.clone(),
@@ -284,12 +306,12 @@ fn plan_packages(
     };
     let planned = match registry.backend(ResourceKind::Package) {
         Some((_, backend)) => backend
-            .plan_packages(resources, mode)
+            .plan_packages(resources, mode, reviewed)
             .map_err(|err| error(err.0))?,
         None => None,
     };
-    if planned.is_none() && mode == PlanMode::Upgrade {
-        return Err(error("目标未提供完整仓库升级预览能力".into()));
+    if planned.is_none() && (mode.repository_upgrade() || mode.rebuild_aur()) {
+        return Err(error("目标未提供请求的软件包预览能力".into()));
     }
     Ok(planned.unwrap_or_default())
 }

@@ -63,6 +63,7 @@ fn save_review(guard: &StateGuard<'_>, target: &TargetIdentity) -> Plan {
         resource_digest: resource_digest(&resources).unwrap(),
         used_capabilities: Vec::new(),
         used_inputs: Vec::new(),
+        aur_mode: Default::default(),
         actions: vec![
             Action {
                 id: "write".into(),

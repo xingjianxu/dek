@@ -798,6 +798,28 @@ fn a_changed_tracked_target_input_requires_review_of_a_fresh_plan() {
     assert!(error(&report).contains(replacement), "{report}");
     assert!(events(&report).is_empty());
     assert!(!Path::new(&fixture.target("first")).exists());
+
+    let repo = fixture.repo().canonicalize().unwrap();
+    let repository_id = CacheDigest::of_bytes(repo.as_os_str().as_encoded_bytes()).to_string();
+    let registry = local_registry(&LocalFileBackend).unwrap();
+    let store = StateStore::open(&fixture.state()).unwrap();
+    let run = store
+        .lock()
+        .unwrap()
+        .begin_run(
+            &id,
+            PlanBinding {
+                repository_id: &repository_id,
+                logical_host: "server",
+                target: registry.target(),
+            },
+            "track-input-on-resume",
+        )
+        .unwrap();
+    let resumed = fixture.run("", &["apply", "--run", &run.id]);
+    assert!(stdout(&resumed).contains(replacement), "{resumed}");
+    assert!(error(&resumed).contains(replacement), "{resumed}");
+    assert!(events(&resumed).is_empty());
 }
 
 #[test]
@@ -1171,4 +1193,18 @@ fn interruption_during_read_only_inspection_leaves_the_action_pending() {
     assert_eq!(run_id(&resumed), pending["run_id"].as_str().unwrap());
     assert_eq!(events(&resumed).len(), 4);
     assert_eq!(status_for(&fixture, None)["actions"][0]["attempt"], 1);
+}
+
+#[test]
+fn plan_accepts_explicit_aur_rebuild() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dek"))
+        .args(["plan", "--upgrade", "--rebuild-aur", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--rebuild-aur"));
 }

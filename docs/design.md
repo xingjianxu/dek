@@ -367,11 +367,12 @@ dek hosts
 | `dek apply -H server --plan <计划ID>` | 执行已审阅的普通计划或升级计划。计划绑定仓库、目标主机标识、资源、文件摘要及包事务；目标不匹配时报错，若执行前实际所需变更超出原计划范围，则返回新计划供审阅。 |
 | `dek apply -H server --run <执行ID>` | 续办指定执行。复用已审阅内容和原执行 ID。 |
 | `dek plan --upgrade -H server` | 主动预览完整系统升级，列出仓库包、受管 AUR 包以及可预见的配置动作。 |
+| `dek plan --rebuild-aur -H server` | 预览重建已安装的受管 AUR 包。可与 `--upgrade` 组合，按计划 ID 执行。 |
 | `dek upgrade -H server` | 交互终端下展示完整升级计划，确认后执行；非交互环境下直接返回待审阅计划，供后续 `apply --plan` 使用。包升级完成后复核配置，若出现计划外的新动作则返回新计划。 |
 | `dek refresh -H server` | 更新主机配置显式引用的外部输入（如通过 SDK 拉取的 HTTP 内容），供下一次规划使用。 |
 | `dek status -H server [--run <执行ID>]` | 查看最近一次或指定 ID 的执行结果，包括已完成、失败及待重试项；SSH 重连后仍可查询。 |
 
-`apply --plan` 可带 `--request-id <标识>`。同一标识重发使用原执行，且绑定原计划。SSH 目标的 `apply --interactive` 允许受审阅动作使用独立终端完成 helper 交互。目标记录无法确认曾尝试的包事务或服务动作时，`status` 保留结果待核验及诊断。`plan` 也显示目标记录中的待续办通知和其原执行 ID。
+`apply --plan` 可带 `--request-id <标识>`。同一标识重发使用原执行，且绑定原计划。本机目标直接使用当前终端与 helper 交互。SSH 目标的 `apply --interactive` 允许受审阅动作使用独立终端完成 helper 交互。目标记录无法确认曾尝试的包事务或服务动作时，`status` 保留结果待核验及诊断。`plan` 也显示目标记录中的待续办通知和其原执行 ID。
 
 主机参数的完整写法为 `--host server`。首版中 `hosts`、`show`、`plan` 和 `status` 均支持 `--json` 输出，便于脚本集成（例如将升级预览输出的 `plan_id` 直接传给 `apply --plan`）。`apply` 与 `upgrade` 开始执行时会输出 `run_id` 供后续追踪。所有子命令均支持 `--help`。
 

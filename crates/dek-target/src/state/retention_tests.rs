@@ -74,6 +74,7 @@ impl Fixture {
             resource_digest: resource_digest(&resources).unwrap(),
             used_capabilities: Vec::new(),
             used_inputs: Vec::new(),
+            aur_mode: Default::default(),
             actions: vec![
                 Action {
                     id: "write".into(),
@@ -311,6 +312,7 @@ fn dangling_run_blocks_collection_before_deleting_other_plans() {
         resource_digest: resource_digest(&ResourceSet::default()).unwrap(),
         used_capabilities: Vec::new(),
         used_inputs: Vec::new(),
+        aur_mode: Default::default(),
         actions: Vec::new(),
     };
     let plan = Plan {

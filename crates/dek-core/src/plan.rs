@@ -55,6 +55,42 @@ pub enum PlanMode {
     #[default]
     Normal,
     Upgrade,
+    /// Query updates for managed AUR packages after a repository transaction.
+    AurUpgrade,
+    RebuildAur,
+    UpgradeRebuildAur,
+}
+
+impl PlanMode {
+    pub fn repository_upgrade(self) -> bool {
+        matches!(self, Self::Upgrade | Self::UpgradeRebuildAur)
+    }
+
+    pub fn rebuild_aur(self) -> bool {
+        matches!(self, Self::RebuildAur | Self::UpgradeRebuildAur)
+    }
+
+    pub fn after_repository_upgrade(self) -> Self {
+        if self.rebuild_aur() {
+            Self::RebuildAur
+        } else {
+            Self::AurUpgrade
+        }
+    }
+
+    fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
+}
+
+/// Identity of the local package database entry before a same-version rebuild.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AurBuildStamp {
+    pub device: u64,
+    pub inode: u64,
+    pub changed_at: i64,
+    pub changed_at_nsec: i64,
 }
 
 /// The exact actions and inputs that were reviewed for one repository and target.
@@ -69,6 +105,8 @@ pub struct Plan {
     pub used_capabilities: Vec<ResourceCapability>,
     pub used_inputs: Vec<InputObservation>,
     pub actions: Vec<Action>,
+    #[serde(default, skip_serializing_if = "PlanMode::is_normal")]
+    pub aur_mode: PlanMode,
 }
 
 impl Plan {
@@ -77,9 +115,13 @@ impl Plan {
             .repository_transaction()
             .is_some_and(|transaction| transaction.scope == RepositoryTransactionScope::Upgrade)
         {
-            PlanMode::Upgrade
+            if self.aur_mode.rebuild_aur() {
+                PlanMode::UpgradeRebuildAur
+            } else {
+                PlanMode::Upgrade
+            }
         } else {
-            PlanMode::Normal
+            self.aur_mode
         }
     }
 
@@ -195,6 +237,13 @@ pub enum ActionKind {
     BuildAurPackage {
         package: PackageId,
         candidate_version: Option<String>,
+        #[serde(default, skip_serializing_if = "AurBuildDependencies::is_empty")]
+        dependencies: AurBuildDependencies,
+    },
+    RebuildAurPackage {
+        package: PackageId,
+        candidate_version: String,
+        rebuild_from: AurBuildStamp,
         #[serde(default, skip_serializing_if = "AurBuildDependencies::is_empty")]
         dependencies: AurBuildDependencies,
     },
