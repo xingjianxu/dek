@@ -32,11 +32,11 @@ pub fn register_app_modules(registry: &mut ModuleRegistry<'_>) -> Result<(), Exp
         (SYSTEM_PACKAGES, PackageSource::Official),
         (AUR_PACKAGES, PackageSource::Aur),
     ] {
-        registry.register(module(path, &[path], None), move |context| {
+        registry.register_builtin(module(path, &[path], None), move |context| {
             expand_packages(context, path, source)
         })?;
     }
-    registry.register(
+    registry.register_builtin(
         module(
             "programs.git",
             &[GIT_ENABLED, GIT_CONFIG],
@@ -44,7 +44,7 @@ pub fn register_app_modules(registry: &mut ModuleRegistry<'_>) -> Result<(), Exp
         ),
         expand_git,
     )?;
-    registry.register(
+    registry.register_builtin(
         module(
             "services.openssh",
             &[OPENSSH_ENABLED],
@@ -52,7 +52,7 @@ pub fn register_app_modules(registry: &mut ModuleRegistry<'_>) -> Result<(), Exp
         ),
         expand_openssh,
     )?;
-    registry.register(
+    registry.register_builtin(
         module(
             "services.caddy",
             &[CADDY_ENABLED, CADDY_CONFIG],

@@ -12,7 +12,7 @@ use dek_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{ExpansionError, ModuleExpansion};
+use super::{ExpansionError, ModuleDefinition, ModuleExpansion};
 
 /// An expansion can retain deferred file references across evaluation runs.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -27,6 +27,47 @@ pub struct ModuleOutput {
 }
 
 impl ModuleOutput {
+    pub(super) fn validate_contents(
+        &self,
+        definition: &ModuleDefinition,
+    ) -> Result<(), ExpansionError> {
+        for (address, bytes) in &self.contents {
+            if *address != digest(bytes) {
+                return Err(ExpansionError(format!(
+                    "expand {} at {} returned bytes that do not match {}",
+                    definition.name, definition.origin, address.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn map_origins(&mut self, mut map: impl FnMut(&mut Origin)) {
+        for resource in &mut self.resources {
+            for origin in &mut resource.origins {
+                map(origin);
+            }
+            match &mut resource.desired {
+                ResourceDraft::File {
+                    content: FileSource::Relative { origin, .. },
+                    ..
+                } => map(origin),
+                ResourceDraft::AuthorizedKeys { key_files, .. } => {
+                    for file in key_files {
+                        map(&mut file.origin);
+                    }
+                }
+                ResourceDraft::AgeSecret { ciphertext, .. } => map(&mut ciphertext.origin),
+                _ => {}
+            }
+        }
+        for input in &mut self.inputs {
+            if let Some(origin) = &mut input.origin {
+                map(origin);
+            }
+        }
+    }
+
     pub fn add_content(&mut self, bytes: Vec<u8>) -> ContentDigest {
         let address = digest(&bytes);
         self.contents.insert(address.clone(), bytes);
@@ -117,15 +158,14 @@ pub fn assemble_resources(
     let mut contents = BTreeMap::new();
     let mut file_inputs = Vec::new();
     for expansion in expansions {
-        for (address, bytes) in &expansion.output.contents {
-            if *address != digest(bytes) {
-                return Err(ExpansionError(format!(
-                    "expand {} at {} returned bytes that do not match {}",
-                    expansion.definition.name, expansion.definition.origin, address.0
-                )));
-            }
-            contents.insert(address.clone(), bytes.clone());
-        }
+        expansion.output.validate_contents(&expansion.definition)?;
+        contents.extend(
+            expansion
+                .output
+                .contents
+                .iter()
+                .map(|(address, bytes)| (address.clone(), bytes.clone())),
+        );
         for declaration in &expansion.output.resources {
             let resource = materialize(
                 repo_root,

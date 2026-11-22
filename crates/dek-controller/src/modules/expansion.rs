@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::Path};
 use dek_core::{HostConfig, OptionPath, Origin};
 use thiserror::Error;
 
-use super::ModuleOutput;
+use super::{ExpansionCache, ModuleOutput, expansion_cache::ModuleCache};
 
 #[derive(Clone, Debug)]
 pub struct ModuleDefinition {
@@ -32,9 +32,25 @@ pub struct ExpansionError(pub(crate) String);
 
 type Expander<'a> = dyn FnMut(&ExpandContext<'_>) -> Result<ModuleOutput, String> + 'a;
 
-struct RegisteredModule<'a> {
-    definition: ModuleDefinition,
+pub(super) struct RegisteredModule<'a> {
+    pub(super) definition: ModuleDefinition,
     expand: Box<Expander<'a>>,
+    pub(super) cache: ModuleCache<'a>,
+}
+
+impl RegisteredModule<'_> {
+    pub(super) fn evaluate(
+        &mut self,
+        repo_root: &Path,
+        options: &HostConfig,
+    ) -> Result<ModuleOutput, ExpansionError> {
+        (self.expand)(&ExpandContext { repo_root, options }).map_err(|message| {
+            ExpansionError(format!(
+                "expand {} at {}: {message}",
+                self.definition.name, self.definition.origin
+            ))
+        })
+    }
 }
 
 #[derive(Default)]
@@ -48,6 +64,23 @@ impl<'a> ModuleRegistry<'a> {
         definition: ModuleDefinition,
         expand: impl FnMut(&ExpandContext<'_>) -> Result<ModuleOutput, String> + 'a,
     ) -> Result<(), ExpansionError> {
+        self.register_with_cache(definition, expand, ModuleCache::Dynamic)
+    }
+
+    pub(super) fn register_builtin(
+        &mut self,
+        definition: ModuleDefinition,
+        expand: impl FnMut(&ExpandContext<'_>) -> Result<ModuleOutput, String> + 'a,
+    ) -> Result<(), ExpansionError> {
+        self.register_with_cache(definition, expand, ModuleCache::Builtin)
+    }
+
+    pub(super) fn register_with_cache(
+        &mut self,
+        definition: ModuleDefinition,
+        expand: impl FnMut(&ExpandContext<'_>) -> Result<ModuleOutput, String> + 'a,
+        cache: ModuleCache<'a>,
+    ) -> Result<(), ExpansionError> {
         if let Some(prior) = self.modules.get(&definition.name) {
             return Err(ExpansionError(format!(
                 "duplicate module {} at {} and {}",
@@ -59,6 +92,7 @@ impl<'a> ModuleRegistry<'a> {
             RegisteredModule {
                 definition,
                 expand: Box::new(expand),
+                cache,
             },
         );
         Ok(())
@@ -68,6 +102,25 @@ impl<'a> ModuleRegistry<'a> {
         &mut self,
         repo_root: &Path,
         config: &HostConfig,
+    ) -> Result<Vec<ModuleExpansion>, ExpansionError> {
+        self.expand_inner(repo_root, config, None)
+    }
+
+    /// Reuse eligible module outputs. Deferred files remain for resource assembly.
+    pub fn expand_cached(
+        &mut self,
+        cache: &ExpansionCache<'_>,
+        config: &HostConfig,
+    ) -> Result<Vec<ModuleExpansion>, ExpansionError> {
+        cache.verify_graph()?;
+        self.expand_inner(cache.repository_root(), config, Some(cache))
+    }
+
+    fn expand_inner(
+        &mut self,
+        repo_root: &Path,
+        config: &HostConfig,
+        cache: Option<&ExpansionCache<'_>>,
     ) -> Result<Vec<ModuleExpansion>, ExpansionError> {
         let mut results = Vec::new();
         for module in self.modules.values_mut() {
@@ -90,18 +143,12 @@ impl<'a> ModuleRegistry<'a> {
                     .map(|(path, option)| (path.clone(), option.clone()))
                     .collect(),
             };
-            let output = (module.expand)(&ExpandContext {
-                repo_root,
-                options: &options,
-            })
-            .map_err(|message| {
-                ExpansionError(format!(
-                    "expand {} at {}: {message}",
-                    definition.name, definition.origin
-                ))
-            })?;
+            let output = match cache {
+                Some(cache) => cache.expand(module, &options)?,
+                None => module.evaluate(repo_root, &options)?,
+            };
             results.push(ModuleExpansion {
-                definition: definition.clone(),
+                definition: module.definition.clone(),
                 options,
                 output,
             });

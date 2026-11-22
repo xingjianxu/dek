@@ -77,6 +77,12 @@ pub struct CacheLookup<T> {
     revision: Option<CacheDigest>,
 }
 
+impl<T> CacheLookup<T> {
+    pub(crate) fn revision(&self) -> Option<CacheDigest> {
+        self.revision
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Publication {
     Published,
@@ -162,6 +168,12 @@ impl CacheStore {
         &self.repository
     }
 
+    pub(crate) fn revision(&self, key: &UnitKey) -> Result<Option<CacheDigest>, CacheError> {
+        Ok(read_record(&self.record_path(key))?
+            .as_deref()
+            .map(CacheDigest::of_bytes))
+    }
+
     pub fn record_path(&self, key: &UnitKey) -> PathBuf {
         let key = serde_json::to_value(key).expect("unit keys contain JSON values");
         let digest = semantic_digest(&key).to_string();
@@ -206,6 +218,16 @@ impl CacheStore {
         entry: &CacheEntry<T>,
         recheck: impl FnOnce(&[CacheDependency]) -> Result<bool, RecheckError>,
     ) -> Result<Publication, CacheError> {
+        self.publish_with_revision(lookup, entry, recheck)
+            .map(|(result, _)| result)
+    }
+
+    pub(crate) fn publish_with_revision<T: Serialize>(
+        &self,
+        lookup: &CacheLookup<T>,
+        entry: &CacheEntry<T>,
+        recheck: impl FnOnce(&[CacheDependency]) -> Result<bool, RecheckError>,
+    ) -> Result<(Publication, Option<CacheDigest>), CacheError> {
         let path = &lookup.path;
         if self.record_path(&lookup.key) != *path {
             return Err(CacheError::ForeignLookup(path.clone()));
@@ -234,13 +256,13 @@ impl CacheStore {
 
         let _lock = lock_record(path)?;
         if read_record(path)?.as_deref().map(CacheDigest::of_bytes) != lookup.revision {
-            return Ok(Publication::Superseded);
+            return Ok((Publication::Superseded, None));
         }
         if !recheck(&entry.dependencies).map_err(|source| CacheError::Recheck {
             path: path.clone(),
             source,
         })? {
-            return Ok(Publication::InputsChanged);
+            return Ok((Publication::InputsChanged, None));
         }
 
         staged
@@ -249,7 +271,7 @@ impl CacheStore {
         File::open(parent)
             .and_then(|dir| dir.sync_all())
             .map_err(|err| CacheError::io("缓存已替换但无法同步目录", parent, err))?;
-        Ok(Publication::Published)
+        Ok((Publication::Published, Some(CacheDigest::of_bytes(&data))))
     }
 }
 
