@@ -1,6 +1,6 @@
 //! Plan age resources from ciphertext metadata and target-local verification markers.
 
-mod accounts;
+pub(crate) mod accounts;
 mod marker;
 mod path;
 
