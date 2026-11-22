@@ -246,8 +246,7 @@ fn caddy_repo(root: &Path) -> Repository {
         "schemaVersion":1,
         "hosts":{
             "server":{"entry":"hosts/server/default.json","target":{"local":true}},
-            "server-ruby":{"entry":"hosts/server/default.rb","target":{"local":true}},
-            "server-remote":{"entry":"hosts/server/default.rb","target":{"ssh":"lab-server"}}
+            "server-ruby":{"entry":"hosts/server/default.rb","target":{"local":true}}
         },
         "profiles":{"base":"profiles/base.json","other":"profiles/other.rb"}
     }"#,
@@ -431,7 +430,6 @@ fn cli_fails_for_unknown_mistyped_and_conflicting_declarations_without_printing_
         }
     };
     run_failure("server", &["missing Package capability", "default.json"]);
-    run_failure("server-remote", &["SSH", "lab-server"]);
 
     write(
         root.path(),

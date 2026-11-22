@@ -1,6 +1,7 @@
 use std::{error::Error, io::Write};
 
-use dek_core::{ActionKind, Plan, ServiceEffect, UnitId, UnitScope};
+use dek_core::{ActionKind, PendingRunNotification, Plan, ServiceEffect, UnitId, UnitScope};
+use serde_json::json;
 
 pub fn write_plan(
     mut out: impl Write,
@@ -14,7 +15,7 @@ pub fn write_plan(
         return Ok(());
     }
 
-    writeln!(out, "主机 {host}（本机 {}）", plan.target.id)?;
+    writeln!(out, "主机 {host}（目标 {}）", plan.target.id)?;
     writeln!(out, "计划 {}", plan.id)?;
     writeln!(out)?;
     if plan.actions.is_empty() {
@@ -112,4 +113,38 @@ fn scope_name(scope: &UnitScope) -> &str {
         UnitScope::UserGlobal => "全局用户级",
         UnitScope::User { user } => user,
     }
+}
+
+pub(crate) fn write_plan_with_pending(
+    mut out: impl Write,
+    host: &str,
+    plan: &Plan,
+    json_output: bool,
+    pending: &[PendingRunNotification],
+) -> Result<(), Box<dyn Error>> {
+    if pending.is_empty() {
+        return write_plan(out, host, plan, json_output);
+    }
+    if json_output {
+        let mut document = plan_document(host, plan)?;
+        document["pending_notifications"] = json!(pending);
+        serde_json::to_writer_pretty(&mut out, &document)?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    write_plan(&mut out, host, plan, false)?;
+    for item in pending {
+        writeln!(
+            out,
+            "待续办 [{}] {}，执行 {}",
+            item.notification.action_id,
+            description(&ActionKind::NotifyService {
+                unit: item.notification.unit.clone(),
+                effect: item.notification.effect,
+                sources: Vec::new(),
+            }),
+            item.run_id,
+        )?;
+    }
+    Ok(())
 }
