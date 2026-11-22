@@ -1,0 +1,84 @@
+{
+  "formatVersion": 1,
+  "id": "backup-plan",
+  "repositoryId": "repo-backup",
+  "target": {
+    "id": "target-server",
+    "os": "linux",
+    "distribution": "arch",
+    "architecture": "x86_64"
+  },
+  "resourceDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "usedCapabilities": [
+    { "kind": "file", "version": 1, "attributes": ["group", "mode", "owner"] },
+    { "kind": "systemdUnit", "version": 1, "attributes": [] }
+  ],
+  "usedInputs": [
+    {
+      "kind": "targetFact",
+      "id": "architecture",
+      "observation": { "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444" },
+      "origin": null
+    }
+  ],
+  "actions": [
+    {
+      "id": "write-config",
+      "kind": {
+        "writeFile": {
+          "path": "/etc/backup.conf",
+          "content": {
+            "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "attributes": { "owner": "root", "group": "root", "mode": "0644" }
+          }
+        }
+      },
+      "reason": "backup configuration content changed",
+      "origins": [
+        {
+          "module": "backup",
+          "origin": { "file": "hosts/server/default.rb", "line": 12 }
+        }
+      ],
+      "dependsOn": [],
+      "preconditions": [
+        {
+          "file": {
+            "path": "/etc/backup.conf",
+            "expected": {
+              "present": {
+                "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "attributes": { "owner": "root", "group": "root", "mode": "0644" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "restart-backup",
+      "kind": {
+        "notifyService": {
+          "unit": { "scope": "system", "name": "backup.service" },
+          "effect": "restart"
+        }
+      },
+      "reason": "backup configuration was replaced",
+      "origins": [
+        {
+          "module": "backup",
+          "origin": { "file": "profiles/backup.json", "pointer": "/options/0" }
+        }
+      ],
+      "dependsOn": ["write-config"],
+      "preconditions": [
+        {
+          "unitRunning": {
+            "unit": { "scope": "system", "name": "backup.service" },
+            "expected": true
+          }
+        }
+      ]
+    }
+  ]
+}
