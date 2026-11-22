@@ -83,8 +83,9 @@ impl TargetPath {
                 "home parent requires administrator ownership",
             ));
         }
-        let staged = StagedFile::private_directory(self)?;
+        let staged = StagingDirectory::new(self)?;
         fchown(&staged.directory, Some(uid), Some(gid))?;
+        fchmod(&staged.directory, Mode::from_bits_truncate(0o700))?;
         rustix::fs::fsync(&staged.directory)?;
         renameat_with(
             &self.parent,
