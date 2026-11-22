@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "hosts": {
+    "server": {"entry": "host.rb", "inputs": "sdk", "target": {"ssh": "dek-vm"}},
+    "worker": {"entry": "host.rb", "inputs": "sdk", "target": {"ssh": "dek-vm"}}
+  },
+  "profiles": {
+    "base": {"entry": "profiles/base.rb", "inputs": "sdk"},
+    "journal": {"entry": "profiles/journal.rb", "inputs": "sdk"},
+    "audit": {"entry": "profiles/audit.rb", "inputs": "sdk"}
+  },
+  "modules": {
+    "lab.journal": {
+      "schema": "modules/journal.json",
+      "expand": "modules/journal.rb",
+      "inputs": "sdk",
+      "readsOptions": ["lab.journal"]
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "options": [{
+    "path": "lab.journal.enable",
+    "type": "boolean",
+    "default": false,
+    "description": "Use a host-specific systemd journal retention policy"
+  }]
+}

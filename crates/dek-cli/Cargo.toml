@@ -3,6 +3,9 @@ name = "dek-cli"
 version.workspace = true
 edition.workspace = true
 
+[features]
+benchmark-cache = ["dek-controller/benchmark-cache"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 dek-core.workspace = true

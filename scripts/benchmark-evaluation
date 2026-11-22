@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Benchmark the same remote planning workload with both evaluation cache encodings."""
+
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+import shutil
+import statistics
+import subprocess
+import tempfile
+import time
+
+
+SCRIPTS = Path(__file__).resolve().parent
+ROOT = SCRIPTS.parent
+VM = SCRIPTS / "run-arch-vm"
+FIXTURE = SCRIPTS / "fixtures/benchmark-evaluation"
+FORMATS = {"msgpack": ".mpk", "json": ".json"}
+SCENARIOS = ("cold", "warm", "static-file", "shared-profile")
+
+
+def command(*args, **kwargs):
+    return subprocess.run(args, cwd=ROOT, check=True, **kwargs)
+
+
+def output(*args):
+    return command(*args, capture_output=True, text=True).stdout.strip()
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def build(run, dev_root):
+    target = dev_root / "cargo/target" / ROOT.name
+    cache = dev_root / "cache/cargo"
+    cache.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, CARGO_HOME=str(cache), CARGO_TARGET_DIR=str(target))
+    with (run / "build.log").open("w") as log:
+        command("cargo", "build", "--locked", "--release", "-p", "dek-cli",
+                "-p", "dek-controller", "--features", "dek-cli/benchmark-cache", "--bins",
+                stdout=log, stderr=subprocess.STDOUT, env=env)
+        command("cargo", "rustc", "--locked", "--release", "-p", "dek-cli", "--bin", "dek",
+                "--target", "x86_64-unknown-linux-gnu", "--",
+                "-C", "link-arg=-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2",
+                stdout=log, stderr=subprocess.STDOUT,
+                env=dict(env, NIX_DONT_SET_RPATH_x86_64_unknown_linux_gnu="1"))
+    return (
+        target / "release/dek",
+        target / "release/dek-cache-benchmark",
+        target / "x86_64-unknown-linux-gnu/release/dek",
+    )
+
+
+def probes(run, ssh_config):
+    shims = run / "bin"
+    shims.mkdir()
+    for name, body in {
+        "ruby": 'printf "start\n" >> "$DEK_BENCH_RUBY_LOG"\nexec "$DEK_BENCH_RUBY" "$@"\n',
+        "ssh": 'tee "$DEK_BENCH_WIRE" | "$DEK_BENCH_SSH" -F "$DEK_BENCH_SSH_CONFIG" "$@"\n',
+    }.items():
+        shim = shims / name
+        shim.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        shim.chmod(0o700)
+    ruby = output("ruby", "-rrbconfig", "-e", "print RbConfig.ruby")
+    return dict(os.environ, PATH=f"{shims}{os.pathsep}{os.environ['PATH']}",
+                DEK_BENCH_RUBY=ruby, DEK_BENCH_SSH=shutil.which("ssh"),
+                DEK_BENCH_SSH_CONFIG=ssh_config)
+
+
+def records(cache, encoding):
+    selected = {}
+    for path in cache.glob("dek/*/units/*/*"):
+        if path.suffix in FORMATS.values():
+            if path.suffix != FORMATS[encoding] or path.stem in selected:
+                raise ValueError(f"unexpected cache record {path}")
+            selected[path.stem] = path
+    return selected
+
+
+def stamp(paths):
+    result = {}
+    for key, path in paths.items():
+        stat = path.stat()
+        result[key] = {"inode": stat.st_ino, "bytes": stat.st_size,
+                       "allocated_bytes": stat.st_blocks * 512}
+    return result
+
+
+def measure(manager, repo, trial, encoding, scenario, env):
+    directory = trial / scenario
+    directory.mkdir()
+    cache = trial / "cache"
+    before = stamp(records(cache, encoding))
+    wire = directory / "requests.jsonl"
+    ruby = directory / "ruby.starts"
+    env = dict(env, XDG_CACHE_HOME=str(cache), DEK_BENCH_CACHE_ENCODING=encoding,
+               DEK_BENCH_RUBY_LOG=str(ruby), DEK_BENCH_WIRE=str(wire))
+    plan_path = directory / "plan.json"
+    with plan_path.open("wb") as out, (directory / "stderr").open("wb") as err:
+        start = time.perf_counter_ns()
+        command(manager, "--repo", repo, "-H", "server", "plan", "--json",
+                stdout=out, stderr=err, env=env)
+        elapsed_ns = time.perf_counter_ns() - start
+    after = stamp(records(cache, encoding))
+    frames = [json.loads(line) for line in wire.read_bytes().splitlines()]
+    if len(frames) < 3 or "hello" not in frames[0]:
+        raise ValueError(f"missing target protocol exchange in {wire}")
+    uploads = [op["uploadContent"] for frame in frames[1:]
+               if isinstance(op := frame["request"]["operation"], dict) and "uploadContent" in op]
+    changed = sorted(key for key, info in after.items()
+                     if info["inode"] != before.get(key, {}).get("inode"))
+    result = {
+        "scenario": scenario,
+        "elapsed_ns": elapsed_ns,
+        "ruby_starts": len(ruby.read_bytes().splitlines()) if ruby.exists() else 0,
+        "rebuilt_units": changed,
+        "ssh_round_trips": len(frames),
+        "content_bytes": sum(len(base64.b64decode(item["chunk"], validate=True)) for item in uploads),
+        "cache_bytes": sum(item["bytes"] for item in after.values()),
+        "cache_allocated_bytes": sum(item["allocated_bytes"] for item in after.values()),
+        "records": after,
+    }
+    write_json(directory / "metrics.json", result)
+    return result, json.loads(plan_path.read_bytes())
+
+
+def scenario_runs(manager, repo, guest, trial, encoding, env, ordinal):
+    # The VM is dedicated to this benchmark. Retain each prior target cache in its
+    # own directory until the VM run is finished, then dispose of the overlay.
+    command(VM, "ssh", guest,
+            f"if test -e /var/lib/dek; then sudo -n mv /var/lib/dek /var/lib/dek-trial-{ordinal}; fi"
+            " && sudo -n install -d -m 0700 -o dek /var/lib/dek")
+    trial.mkdir()
+    static_file = repo / "modules/journald.conf"
+    public_profile = repo / "profiles/audit.rb"
+    static_original = (FIXTURE / "modules/journald.conf").read_bytes()
+    profile_original = (FIXTURE / "profiles/audit.rb").read_bytes()
+    edited = static_original.replace(b"256M", b"384M")
+    static_file.write_bytes(static_original)
+    public_profile.write_bytes(profile_original)
+
+    cold, initial = measure(manager, repo, trial, encoding, "cold", env)
+    warm, cached = measure(manager, repo, trial, encoding, "warm", env)
+    static_file.write_bytes(edited)
+    static, changed = measure(manager, repo, trial, encoding, "static-file", env)
+    static_file.write_bytes(static_original)
+    public_profile.write_bytes(profile_original.replace(b'"daily"', b'"weekly"'))
+    profile, revised = measure(manager, repo, trial, encoding, "shared-profile", env)
+
+    if cold["ruby_starts"] < 1 or cold["content_bytes"] < 1 or not cold["rebuilt_units"]:
+        raise ValueError("cold planning did not start Ruby, upload content and publish units")
+    if warm["ruby_starts"] or warm["content_bytes"] or warm["rebuilt_units"] or cached != initial:
+        raise ValueError("warm planning did not reuse the unchanged cache and objects")
+    if (static["ruby_starts"] or static["rebuilt_units"] or static["content_bytes"] != len(edited)
+            or changed["resourceDigest"] == initial["resourceDigest"]):
+        raise ValueError("static edit did not reuse evaluation while uploading only the edited file")
+    if (not profile["rebuilt_units"] or not profile["ruby_starts"]
+            or revised["resourceDigest"] == initial["resourceDigest"]):
+        raise ValueError("shared profile edit did not rebuild the affected declarations")
+    return [cold, warm, static, profile]
+
+
+def compare_round(comparator, directory, iterations):
+    mpk = records(directory / "msgpack/cache", "msgpack")
+    js = records(directory / "json/cache", "json")
+    if not mpk or mpk.keys() != js.keys():
+        raise ValueError("the codecs did not publish the same set of units")
+    for scenario in SCENARIOS:
+        path = f"{scenario}/plan.json"
+        if json.loads((directory / "msgpack" / path).read_bytes()) != json.loads(
+                (directory / "json" / path).read_bytes()):
+            raise ValueError(f"plans differ across encodings in {scenario}")
+    comparisons = [json.loads(output(comparator, mpk[key], js[key], str(iterations)))
+                   for key in sorted(mpk)]
+    write_json(directory / "codec-samples.json", comparisons)
+    return comparisons
+
+
+def report(run, metadata, trials, comparisons):
+    iterations = metadata["codec_iterations"]
+    lines = [
+        "# Incremental remote planning benchmark", "",
+        f"Source `{metadata['commit']}` ({'dirty' if metadata['dirty'] else 'clean'}).",
+        f"Host {metadata['host']} · {metadata['kernel']} · {metadata['cpu']}.",
+        f"Guest {metadata['image']} · same offline Arch VM for all trials.",
+        f"Replay with `{metadata['replay']}`.",
+        "", "The wall clock starts immediately before launching `dek plan` and stops after "
+        "its SSH session and CLI exit. Application caches and target objects start empty per "
+        "trial. Timing includes the SSH and Ruby counting shims. The operating system page "
+        "cache stays in place. Encoding order alternates.",
+        "", "| Encoding | Scenario | Wall ms median [min–max] | Ruby starts | Rebuilt units | "
+        "Protocol round trips | Raw content bytes | Cache bytes / allocated bytes |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    wall = {}
+    for encoding in FORMATS:
+        for scenario in SCENARIOS:
+            samples = [row for trial in trials for row in trial[encoding]
+                       if row["scenario"] == scenario]
+            elapsed = [row["elapsed_ns"] / 1e6 for row in samples]
+            wall[encoding, scenario] = statistics.median(elapsed)
+            medians = [statistics.median(row[key] for row in samples)
+                       for key in ("ruby_starts", "ssh_round_trips", "content_bytes",
+                                   "cache_bytes", "cache_allocated_bytes")]
+            units = statistics.median(len(row["rebuilt_units"]) for row in samples)
+            ruby, trips, content, size, allocated = medians
+            lines.append(f"| {encoding} | {scenario} | {wall[encoding, scenario]:.2f} "
+                         f"[{min(elapsed):.2f}–{max(elapsed):.2f}] | {ruby:g} | {units:g} | "
+                         f"{trips:g} | {content:g} | {size:g} / {allocated:g} |")
+    lines.extend([
+        "", "One protocol round trip is one hello or request and its response. Content counts "
+        "the decoded upload bytes. A rebuilt unit is a new or atomically replaced cache record. "
+        "Disk allocation sums the regular records' `st_blocks × 512` and excludes locks "
+        "and directories.",
+        "", "## Typed cache records", "",
+        f"Each trial compares {len(comparisons[0])} typed records, including format versions, "
+        f"dependencies, and origins. Each record gets {iterations} in-memory encode loops and "
+        f"{iterations} warm decode loops per codec. Below are median total microseconds to "
+        "process one complete batch of records once.",
+        "", "| Encoding | Encode μs | Warm decode μs | Serialized bytes |",
+        "|---|---:|---:|---:|",
+    ])
+    for encoding in FORMATS:
+        encode = [sum(item[encoding]["encode_ns"] for item in batch) / (iterations * 1000)
+                  for batch in comparisons]
+        decode = [sum(item[encoding]["decode_ns"] for item in batch) / (iterations * 1000)
+                  for batch in comparisons]
+        size = [sum(item[encoding]["bytes"] for item in batch) for batch in comparisons]
+        lines.append(f"| {encoding} | {statistics.median(encode):.2f} | "
+                     f"{statistics.median(decode):.2f} | {statistics.median(size):g} |")
+    cold = wall["msgpack", "cold"]
+    warm = wall["msgpack", "warm"]
+    static = wall["msgpack", "static-file"]
+    profile = wall["msgpack", "shared-profile"]
+    lines.extend([
+        "", "## Indicators for follow-up runs", "",
+        f"For MessagePack, the warm median was {warm / cold:.1%} of the cold median. "
+        f"The static edit and shared profile edit took {static:.2f} ms and {profile:.2f} ms "
+        f"at the median, compared with {warm:.2f} ms warm. Track these four wall-time "
+        "distributions with their Ruby, cache, and protocol counts in repeat runs. "
+        "Use the observed ranges for this configuration when reviewing timing targets.",
+        "", "Raw artifacts include per-scenario metrics, cache stamps, SSH frames, Ruby starts, "
+        "plan JSON, codec samples, build output, and the guest's initial state.", "",
+    ])
+    (run / "report.md").write_text("\n".join(lines), encoding="utf-8")
+    write_json(run / "samples.json", trials)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("image")
+    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--codec-iterations", type=int, default=2000)
+    args = parser.parse_args()
+    if args.rounds < 1 or args.codec_iterations < 1:
+        parser.error("rounds and codec iterations must be positive")
+
+    dev_root = Path(os.environ.get("DEK_DEV_ROOT", "/data/dek-dev")).resolve()
+    run_root = dev_root / "runs/52"
+    run_root.mkdir(parents=True, exist_ok=True)
+    run = Path(tempfile.mkdtemp(prefix="evaluation.", dir=run_root))
+    print(f"Evidence: {run}", flush=True)
+    files = sorted(path for path in FIXTURE.rglob("*") if path.is_file())
+    metadata = {
+        "commit": output("git", "rev-parse", "HEAD"),
+        "dirty": bool(output("git", "status", "--porcelain")),
+        "host": output("hostname"),
+        "kernel": output("uname", "-smr"),
+        "cpu": next(line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines()
+                    if line.startswith("model name")),
+        "filesystem": output("stat", "-f", "-c", "%T", run),
+        "rustc": output("rustc", "--version"),
+        "ruby": output("ruby", "--version"),
+        "ssh": command("ssh", "-V", capture_output=True, text=True).stderr.strip(),
+        "qemu": output("qemu-system-x86_64", "--version").splitlines()[0],
+        "image": args.image,
+        "rounds": args.rounds,
+        "codec_iterations": args.codec_iterations,
+        "configuration_bytes": {str(path.relative_to(FIXTURE)): path.stat().st_size for path in files},
+        "replay": f"scripts/benchmark-evaluation {args.image} --rounds {args.rounds} "
+                  f"--codec-iterations {args.codec_iterations}",
+    }
+    write_json(run / "metadata.json", metadata)
+    manager, comparator, guest_binary = build(run, dev_root)
+    metadata["binary_sha256"] = {
+        name: output("sha256sum", binary).split()[0]
+        for name, binary in [("manager", manager), ("guest", guest_binary), ("comparator", comparator)]
+    }
+    write_json(run / "metadata.json", metadata)
+    guest = output(VM, "start", "52", args.image, guest_binary)
+    try:
+        (run / "guest").write_text(guest + "\n", encoding="utf-8")
+        env = probes(run, output(VM, "config", guest))
+        repo = run / "repo"
+        shutil.copytree(FIXTURE, repo)
+        manifest = json.loads((repo / "dek.json").read_bytes())
+        for host in manifest["hosts"].values():
+            host["targetId"] = (Path(guest) / "instance").read_text().strip()
+        write_json(repo / "dek.json", manifest)
+        command(VM, "ssh", guest, "test ! -e /var/lib/dek")
+        observe = ("pacman -Q bash openssh systemd && systemctl is-active sshd.service && "
+                   "test ! -e /etc/systemd/journald.conf.d/90-dek-retention.conf && "
+                   "test ! -e /etc/systemd/system/dek-journal-audit.timer && cat /etc/os-release")
+        initial = output(VM, "ssh", guest, observe)
+        (run / "guest-initial-state").write_text(initial + "\n", encoding="utf-8")
+
+        trials, comparisons = [], []
+        for i in range(args.rounds):
+            print(f"Round {i + 1}/{args.rounds}", flush=True)
+            directory = run / f"round-{i + 1}"
+            directory.mkdir()
+            order = list(FORMATS) if i % 2 == 0 else list(reversed(FORMATS))
+            trial = {}
+            for j, encoding in enumerate(order):
+                trial[encoding] = scenario_runs(manager, repo, guest, directory / encoding,
+                                                 encoding, env, i * len(order) + j)
+            trials.append(trial)
+            comparisons.append(compare_round(comparator, directory, args.codec_iterations))
+
+        final = output(VM, "ssh", guest, observe)
+        (run / "guest-final-state").write_text(final + "\n", encoding="utf-8")
+        if final != initial:
+            raise ValueError("guest package or service state changed during planning")
+        report(run, metadata, trials, comparisons)
+    except BaseException:
+        subprocess.run([VM, "finish", guest, "failed"], cwd=ROOT, check=False)
+        raise
+    command(VM, "finish", guest, "passed")
+    print(f"Report: {run / 'report.md'}")
+
+
+if __name__ == "__main__":
+    main()
