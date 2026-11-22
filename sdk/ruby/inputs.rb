@@ -91,9 +91,15 @@ module DekEvaluator
     end
 
     def self.file_digest(path)
-      raise IOError, "not a regular file: #{path}" unless File.file?(path)
+      raise IOError, "not a regular file: #{path}" unless File.stat(path).file?
 
       { digest: "sha256:#{Digest::SHA256.hexdigest(File.binread(path))}" }
+    end
+
+    def self.file_observation(path)
+      file_digest(path)
+    rescue Errno::ENOENT
+      "missing"
     end
 
     private
@@ -141,9 +147,12 @@ module DekEvaluator
       key = require_key(feature)
       before = $LOADED_FEATURES.dup
       previously_loaded = loaded_feature(feature, before)
-      if !previously_loaded && (source = source_path(feature))
-        real_source = File.realpath(source)
-        previous_digest = Inputs.file_digest(source)
+      unless previously_loaded
+        source, missing = source_path(feature)
+        if source
+          real_source = File.realpath(source)
+          previous_digest = Inputs.file_digest(source)
+        end
       end
       files = {}
       @stack.push(files)
@@ -160,6 +169,7 @@ module DekEvaluator
               raise IOError, "loaded Ruby source changed during evaluation: #{source}"
             end
             files[source] ||= previous_digest
+            missing.each { |file| files[file] ||= "missing" }
           end
           @requires[key] = files
           @loaded[selected] = files if selected
@@ -167,7 +177,7 @@ module DekEvaluator
           file = previously_loaded || loaded_feature(feature, $LOADED_FEATURES)
           if (known = @requires[key] || @loaded[file])
             known.each do |dependency, observation|
-              if Inputs.file_digest(dependency) != observation
+              if Inputs.file_observation(dependency) != observation
                 raise IOError, "loaded Ruby source changed during evaluation: #{dependency}"
               end
               files[dependency] ||= observation
@@ -226,11 +236,19 @@ module DekEvaluator
     end
 
     def source_path(feature)
-      return nil if feature.end_with?(".so", ".bundle")
+      return [nil, []] if feature.end_with?(".so", ".bundle")
 
       candidates = feature_paths(feature)
       candidates.map! { |path| "#{path}.rb" } unless feature.end_with?(".rb")
-      candidates.find { |path| File.file?(path) }
+      missing = []
+      candidates.each do |candidate|
+        return [candidate, missing] if File.stat(candidate).file?
+      rescue Errno::ENOENT
+        missing << candidate
+      rescue SystemCallError
+        # Leave inaccessible candidates to Ruby's ordinary lookup.
+      end
+      [nil, missing]
     end
 
     def feature_paths(feature)

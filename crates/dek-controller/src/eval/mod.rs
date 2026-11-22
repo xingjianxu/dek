@@ -1,10 +1,14 @@
 //! 采集主机和 profile 声明。
 
+mod cached;
 mod graph;
 mod json;
 mod languages;
+mod observations;
 mod ruby;
+mod ruby_runtime;
 
+pub use cached::{CachedCollector, collection_semantic_digest};
 pub use graph::{
     CollectError, CollectRequest, CollectedUnit, Collector, DeclarationGraph, GraphError,
     collect_graph,
