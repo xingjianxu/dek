@@ -5,8 +5,11 @@ edition.workspace = true
 
 [dependencies]
 dek-core.workspace = true
+rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 serde_json = "1"
 serde_path_to_error = "0.1"
+sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
