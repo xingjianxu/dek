@@ -8,3 +8,5 @@ pub use config::{
     OptionAssignment, OptionDefinition, OptionPath, Priority, ProfileRef, UnitSpec,
 };
 pub use origin::{InvalidJsonPointer, JsonPointer, Origin};
+
+pub mod protocol;
