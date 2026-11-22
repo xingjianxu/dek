@@ -16,3 +16,6 @@ pub use resources::{
     DeclaredResource, ExpandedResources, FileSource, ModuleOutput, ResourceDraft,
     assemble_resources,
 };
+
+mod repository_modules;
+pub use repository_modules::{RepositoryModuleError, RepositoryModules};

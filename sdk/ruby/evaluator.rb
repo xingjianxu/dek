@@ -101,11 +101,13 @@ module DekEvaluator
   end
 end
 
-input = STDIN.dup
-STDIN.reopen(File::NULL)
-$stdin = STDIN
-wire = STDOUT.dup
-wire.sync = true
-STDOUT.reopen(STDERR)
-$stdout = STDERR
-DekEvaluator.run(input, wire)
+def DekEvaluator.start
+  input = STDIN.dup
+  STDIN.reopen(File::NULL)
+  $stdin = STDIN
+  wire = STDOUT.dup
+  wire.sync = true
+  STDOUT.reopen(STDERR)
+  $stdout = STDERR
+  DekEvaluator.run(input, wire)
+end

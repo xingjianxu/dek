@@ -17,7 +17,12 @@ use dek_core::{
 use serde::Serialize;
 use serde_json::Value;
 
-const EVALUATOR: &str = include_str!("../../../../sdk/ruby/evaluator.rb");
+const EVALUATOR: &str = concat!(
+    include_str!("../../../../sdk/ruby/evaluator.rb"),
+    "\n",
+    include_str!("../../../../sdk/ruby/expansion.rb"),
+    "\nDekEvaluator.start\n",
+);
 
 pub trait TargetProvider {
     fn query(&mut self, query: &TargetQuery) -> Result<TargetAnswer, String>;
