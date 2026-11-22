@@ -126,7 +126,7 @@ pub struct InputObservation {
     pub origin: Option<Origin>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum InputKind {
     /// Includes the evaluation entry, loaded code, and other local file reads.

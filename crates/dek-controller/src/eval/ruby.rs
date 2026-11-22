@@ -7,6 +7,7 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 
+use super::{observations, ruby_runtime};
 use dek_core::{
     InputKind, InputObservation, Observation, Origin,
     protocol::{
@@ -16,7 +17,6 @@ use dek_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 const EVALUATOR: &str = concat!(
     include_str!("../../../../sdk/ruby/inputs.rb"),
@@ -106,6 +106,8 @@ impl Error for RubyError {}
 /// One evaluator session per controller run. The first request starts the child.
 #[derive(Default)]
 pub struct RubySession {
+    executable: Option<PathBuf>,
+    started_signature: Option<String>,
     process: Option<Process>,
     next_id: u64,
     failed: bool,
@@ -114,6 +116,28 @@ pub struct RubySession {
 impl RubySession {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Select the interpreter used to launch this evaluation session.
+    pub fn with_executable(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: Some(executable.into()),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn runtime_signature(&self) -> Option<String> {
+        let current = ruby_runtime::signature(self.program(), EVALUATOR)?;
+        if self.process.is_some() && self.started_signature.as_deref() != Some(current.as_str()) {
+            return None;
+        }
+        Some(current)
+    }
+
+    fn program(&self) -> &Path {
+        self.executable
+            .as_deref()
+            .unwrap_or_else(|| Path::new("ruby"))
     }
 
     pub fn evaluate(
@@ -198,7 +222,8 @@ impl RubySession {
         mut providers: RubyProviders<'_>,
     ) -> Result<EvalOutput, EvalFailure> {
         if self.process.is_none() {
-            self.process = Some(Process::start(EVALUATOR)?);
+            self.started_signature = self.runtime_signature();
+            self.process = Some(Process::start(self.program(), EVALUATOR)?);
         }
         let process = self.process.as_mut().expect("evaluator process started");
         process.send(request)?;
@@ -243,6 +268,25 @@ impl RubySession {
 }
 
 impl RubyProviders<'_> {
+    pub(super) fn reobserve(&mut self, input: &InputObservation) -> Result<Observation, String> {
+        let kind = match input.kind {
+            InputKind::TargetFact => QueryKind::Target(TargetQueryKind::Fact),
+            InputKind::TargetCapability => QueryKind::Target(TargetQueryKind::Capability),
+            InputKind::TargetFile => QueryKind::Target(TargetQueryKind::ReadText),
+            InputKind::Http => QueryKind::Http(HttpKind::Http),
+            _ => unreachable!("only provider inputs are re-observed here"),
+        };
+        self.answer(&InputQuery {
+            protocol_version: EVALUATOR_PROTOCOL_VERSION,
+            parent_id: "cache-recheck".into(),
+            id: input.id.clone(),
+            kind,
+            key: input.id.clone(),
+            origin: input.origin.clone(),
+        })
+        .map(|(_, answer)| answer.observation)
+    }
+
     fn answer(
         &mut self,
         query: &InputQuery<QueryKind>,
@@ -271,10 +315,7 @@ impl RubyProviders<'_> {
                     None => None,
                 }
                 .ok_or_else(|| format!("HTTP input {url:?} is unavailable; run dek refresh"))?;
-                let observation = Observation::Digest(format!(
-                    "sha256:{:x}",
-                    Sha256::digest(response.as_bytes())
-                ));
+                let observation = observations::digest(response.as_bytes());
                 Ok((
                     InputKind::Http,
                     TargetAnswer {
@@ -327,8 +368,8 @@ struct Process {
 }
 
 impl Process {
-    fn start(script: &str) -> Result<Self, EvalFailure> {
-        let mut child = Command::new("ruby")
+    fn start(executable: &Path, script: &str) -> Result<Self, EvalFailure> {
+        let mut child = Command::new(executable)
             .args(["-e", script])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -412,6 +453,7 @@ mod tests {
     #[test]
     fn closing_output_also_closes_the_request_pipe() {
         let mut process = Process::start(
+            Path::new("ruby"),
             "require 'timeout'; STDIN.gets; STDOUT.reopen(File::NULL); Timeout.timeout(2) { STDIN.read }; exit! 23",
         )
         .unwrap();
@@ -443,7 +485,7 @@ mod tests {
         ] {
             let script = format!("STDIN.gets\nSTDOUT.puts {}", serde_json::json!(frame));
             let mut session = RubySession {
-                process: Some(Process::start(&script).unwrap()),
+                process: Some(Process::start(Path::new("ruby"), &script).unwrap()),
                 ..RubySession::default()
             };
             let entry = Path::new("fixtures/bad.rb");

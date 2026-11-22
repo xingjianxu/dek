@@ -1,8 +1,7 @@
 use std::{collections::BTreeMap, ffi::OsStr, fmt, fs};
 
 use dek_core::{
-    InputKind, InputObservation, Observation, OptionAssignment, OptionPath, Origin, ProfileRef,
-    UnitSpec,
+    InputKind, InputObservation, OptionAssignment, OptionPath, Origin, ProfileRef, UnitSpec,
 };
 use serde::{
     Deserialize, Deserializer,
@@ -10,9 +9,8 @@ use serde::{
 };
 use serde_json::Value;
 use serde_path_to_error::Segment;
-use sha2::{Digest, Sha256};
 
-use super::{CollectError, CollectRequest, Collector};
+use super::{CollectError, CollectRequest, Collector, observations};
 use crate::json_object::Object;
 
 const SCHEMA_VERSION: u64 = 1;
@@ -71,7 +69,7 @@ impl Collector for JsonCollector {
         let inputs = vec![InputObservation {
             kind: InputKind::File,
             id: request.entry.to_owned(),
-            observation: Observation::Digest(format!("sha256:{:x}", Sha256::digest(contents))),
+            observation: observations::digest(&contents),
             origin: None,
         }];
         Ok(UnitSpec {

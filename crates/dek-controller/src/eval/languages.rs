@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use dek_core::{UnitSpec, protocol::EvalOperation};
+use dek_core::{InputObservation, Observation, UnitSpec, protocol::EvalOperation};
 use serde_json::json;
 
 use super::{
@@ -25,6 +25,17 @@ impl<'a> LanguageCollector<'a> {
     pub fn with_http_provider(mut self, http: &'a mut dyn HttpInputProvider) -> Self {
         self.providers.http = Some(http);
         self
+    }
+
+    pub(super) fn ruby_signature(&self) -> Option<String> {
+        self.ruby.runtime_signature()
+    }
+
+    pub(super) fn reobserve_provider_input(
+        &mut self,
+        input: &InputObservation,
+    ) -> Result<Observation, String> {
+        self.providers.reobserve(input)
     }
 }
 
