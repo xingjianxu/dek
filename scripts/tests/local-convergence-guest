@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ "$(id -u)" == 0 && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+dek --version
+systemctl --version
+ruby --version
+repo=$(mktemp -d)
+printf 'Guest fixture directory %s\n' "$repo"
+export XDG_CACHE_HOME="$repo/cache" LC_ALL=C
+state="$repo/state"
+unit=dek-test-convergence.service
+file=/etc/dek-test-convergence.conf
+package=/run/dek-convergence-fixture/ripgrep.pkg.tar.zst
+[[ ! -e "$file" ]]
+seed_config="$repo/pacman-seed.conf"
+printf '[options]\nArchitecture = auto\nLocalFileSigLevel = Required TrustedOnly\n' > "$seed_config"
+/usr/bin/pacman --config "$seed_config" -U --noconfirm -- "$package"
+installed=$(/usr/bin/pacman -Q ripgrep)
+[[ "$installed" == 'ripgrep '* ]]
+package_record=$(find /var/lib/pacman/local -path '*/ripgrep-*/desc')
+[[ -f "$package_record" ]]
+package_snapshot=$(stat -c '%i %y %z' "$package_record")
+package_digest=$(sha256sum "$package_record")
+
+cat > "/etc/systemd/system/$unit" <<UNIT
+[Service]
+ExecStartPre=/usr/bin/rg --version
+ExecStart=/usr/bin/sleep infinity
+ExecReload=/usr/bin/bash $repo/reload.sh
+[Install]
+WantedBy=multi-user.target
+UNIT
+cat > "$repo/reload.sh" <<SCRIPT
+#!/usr/bin/env bash
+set -euo pipefail
+/usr/bin/cmp -s $file $repo/expected
+printf 'loaded\\n' >> $repo/reloads
+SCRIPT
+printf 'setting=reviewed\n' > "$repo/expected"
+touch "$repo/reloads"
+systemctl daemon-reload
+systemctl enable --now "$unit"
+systemctl is-enabled --quiet "$unit"
+systemctl is-active --quiet "$unit"
+[[ $(wc -l < "$repo/reloads") == 0 ]]
+
+cat > "$repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"lab":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.converge":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$repo/options.json" <<'JSON'
+{"options":[{"path":"lab.converge.enable","type":"boolean","description":"Enable local convergence fixture"}]}
+JSON
+cat > "$repo/expand.rb" <<'RUBY'
+unit = {scope: "system", name: "dek-test-convergence.service"}
+resource("systemdUnit", unit: unit, enabled: true, running: true)
+file_resource "/etc/dek-test-convergence.conf", content: "setting=reviewed\n",
+  notifications: [{unit: unit, effect: "reload", when: "contentChanged"}]
+RUBY
+cat > "$repo/entry.json" <<'JSON'
+{"schemaVersion":1,"imports":[],"options":[
+  {"path":"environment.systemPackages","value":["ripgrep"]},
+  {"path":"lab.converge.enable","value":true}
+]}
+JSON
+
+plan() { dek --repo "$repo" -H lab plan --state-dir "$state" --json | tee "$repo/plan.json"; }
+apply() {
+    local changes=$1
+    shift
+    dek --repo "$repo" -H lab apply --state-dir "$state" "$@" | tee "$repo/apply.log"
+    grep -Fxq "已核验完成，实际变更 $changes 项" "$repo/apply.log"
+}
+review() {
+    python3 - "$repo/plan.json" "$1" "$file" "$unit" <<'PY'
+import json
+import socket
+import sys
+
+with open(sys.argv[1], encoding="UTF-8") as source:
+    plan = json.load(source)
+actions = plan["actions"]
+phase = sys.argv[2]
+assert plan["host"] == "lab" and plan["target"]["id"] == socket.gethostname(), plan
+used = {capability["kind"] for capability in plan["usedCapabilities"]}
+expected = set() if phase == "withdrawn" else {"package", "file", "systemdUnit"}
+assert used == expected, plan
+if phase == "notify":
+    assert len(actions) == 2, actions
+    write, notice = actions
+    assert write["kind"]["writeFile"]["path"] == sys.argv[3], write
+    effect = notice["kind"]["notifyService"]
+    assert effect["unit"] == {"scope": "system", "name": sys.argv[4]}, notice
+    assert effect["effect"] == "reload", notice
+    assert write["id"] in notice["dependsOn"], notice
+else:
+    assert not actions, actions
+print(plan["plan_id"])
+PY
+}
+file_snapshot() { stat -c '%i %y %z %s' "$file"; }
+snapshot() {
+    printf 'Phase %s, file stat %s, reload count %s\n' \
+        "$1" "$(file_snapshot)" "$(wc -l < "$repo/reloads")"
+    sha256sum "$file"
+}
+
+plan
+apply 2 --plan "$(review notify)"
+cmp "$repo/expected" "$file"
+[[ $(wc -l < "$repo/reloads") == 1 ]]
+first_write=$(file_snapshot)
+first_digest=$(sha256sum "$file")
+snapshot initial
+plan
+review none
+apply 0
+[[ $(wc -l < "$repo/reloads") == 1 && $(file_snapshot) == "$first_write" ]]
+[[ $(sha256sum "$file") == "$first_digest" ]]
+snapshot repeated
+printf 'Offline first apply wrote once and reloaded once. Reapply left inode, timestamps and reload count unchanged.\n'
+
+printf 'setting=drifted\n' > "$file"
+plan
+apply 2 --plan "$(review notify)"
+[[ $(sha256sum "$file") == "$first_digest" && $(wc -l < "$repo/reloads") == 2 ]]
+plan
+review none
+snapshot repaired
+printf 'Drift plan linked the reviewed file write to the same service. Apply restored the digest and added one reload.\n'
+
+repaired=$(file_snapshot)
+invocation=$(systemctl show --property=InvocationID --value -- "$unit")
+printf '{"schemaVersion":1,"imports":[],"options":[]}\n' > "$repo/entry.json"
+plan
+review withdrawn
+apply 0
+[[ $(file_snapshot) == "$repaired" && $(sha256sum "$file") == "$first_digest" ]]
+[[ $(wc -l < "$repo/reloads") == 2 ]]
+[[ $(/usr/bin/pacman -Q ripgrep) == "$installed" ]]
+[[ $(stat -c '%i %y %z' "$package_record") == "$package_snapshot" ]]
+[[ $(sha256sum "$package_record") == "$package_digest" ]]
+systemctl is-enabled --quiet "$unit"
+systemctl is-active --quiet "$unit"
+[[ $(systemctl show --property=InvocationID --value -- "$unit") == "$invocation" ]]
+snapshot withdrawn
+printf 'Package %s, database record stat %s\n' "$installed" "$package_snapshot"
+printf '%s\n' "$package_digest"
+printf 'Service invocation %s; final enablement and activity:\n' "$invocation"
+systemctl is-enabled "$unit"
+systemctl is-active "$unit"
+printf 'Withdrawal preserved the package record, file, systemd enablement and running service.\n'
