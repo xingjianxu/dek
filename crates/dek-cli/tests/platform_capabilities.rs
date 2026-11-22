@@ -297,6 +297,10 @@ fn execution_rechecks_the_reviewed_file_capability_before_any_action() {
         assert!(error.contains(reason), "{error}");
         assert!(out.is_empty(), "incompatible plan started a run");
         assert!(backend.files.borrow().is_empty());
+        fixture
+            .run(&backend, false, "memory", &["status", "--json"], &mut out)
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), Value::Null);
     }
 
     out.clear();
