@@ -1,0 +1,22 @@
+{
+  "options": {
+    "programs.git.config": {
+      "value": { "init": { "defaultBranch": "trunk" } },
+      "priority": "host",
+      "effectiveDefinitions": [
+        {
+          "value": { "init": { "defaultBranch": "trunk" } },
+          "origin": { "file": "hosts/server/default.rb", "line": 5 },
+          "priority": "host"
+        }
+      ],
+      "overriddenDefinitions": [
+        {
+          "value": { "init": { "defaultBranch": "main" } },
+          "origin": { "file": "profiles/base.json", "pointer": "/options/0" },
+          "priority": "profile"
+        }
+      ]
+    }
+  }
+}

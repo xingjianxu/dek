@@ -1,0 +1,43 @@
+{
+  "imports": [
+    {
+      "name": "base",
+      "params": {
+        "backup": {
+          "paths": ["/srv/projects", "/srv/data"],
+          "schedule": { "days": ["Mon", "Fri"], "hour": 3 }
+        },
+        "label": null
+      },
+      "origin": { "file": "hosts/server/default.rb", "line": 2 }
+    }
+  ],
+  "options": [
+    {
+      "path": "programs.git.config",
+      "value": { "init": { "defaultBranch": "main" } },
+      "origin": { "file": "profiles/base.json", "pointer": "/options/0" }
+    },
+    {
+      "path": "programs.git.config",
+      "value": { "init": { "defaultBranch": "trunk" } },
+      "origin": { "file": "hosts/server/default.rb", "line": 5 }
+    }
+  ],
+  "inputs": [
+    {
+      "kind": "file",
+      "id": "hosts/server/default.rb",
+      "observation": {
+        "digest": "sha256:92bf36edd88e44192ab261c63f2f006cb36e665d4c45cfbcf00a72692e360d2c6"
+      },
+      "origin": null
+    },
+    {
+      "kind": "targetFile",
+      "id": "/etc/dek/override",
+      "observation": "missing",
+      "origin": { "file": "hosts/server/default.rb", "line": 8 }
+    }
+  ]
+}
