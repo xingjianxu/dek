@@ -3,16 +3,15 @@
 use std::error::Error;
 
 use dek_controller::{
-    cache::CacheDigest,
-    eval::{LanguageCollector, RubyProviders, RubySession, TargetProvider, evaluate_host},
-    modules::{
-        ExpandedResources, ModuleRegistry, assemble_resources, register_app_modules,
-        register_key_modules, register_system_modules,
-    },
+    cache::{CacheDigest, CacheStore, CachedHttpInputs},
+    eval::{HttpInputProvider, RubyProviders, RubySession, TargetProvider},
+    modules::{ExpandedResources, assemble_resources},
     repo::{HostSelector, Repository, Target},
 };
 use dek_core::{HostConfig, InputKind, Plan};
 use dek_target::{backend::BackendRegistry, planner::plan};
+
+use crate::evaluation::{evaluate_options, expand_host};
 
 pub struct PlannedHost {
     pub name: String,
@@ -27,6 +26,16 @@ pub fn plan_host(
     registry: &BackendRegistry<'_>,
     provider: &mut dyn TargetProvider,
 ) -> Result<PlannedHost, Box<dyn Error>> {
+    plan_host_with_cache(repo, selector, registry, provider, None)
+}
+
+pub fn plan_host_with_cache(
+    repo: &Repository,
+    selector: HostSelector<'_>,
+    registry: &BackendRegistry<'_>,
+    provider: &mut dyn TargetProvider,
+    cache: Option<&CacheStore>,
+) -> Result<PlannedHost, Box<dyn Error>> {
     let (name, entry) = repo.select_host(selector)?;
     if let Target::Ssh(alias) = &entry.target {
         return Err(
@@ -34,25 +43,15 @@ pub fn plan_host(
         );
     }
     let mut ruby = RubySession::new();
-    let evaluated = evaluate_host(
-        repo,
-        selector,
-        &mut LanguageCollector::new(&mut ruby, provider),
-    )?;
-
-    let mut modules = ModuleRegistry::default();
-    register_app_modules(&mut modules)?;
-    register_system_modules(&mut modules)?;
-    register_key_modules(&mut modules)?;
-    evaluated.repository_modules.register(
-        &mut modules,
-        &mut ruby,
-        RubyProviders {
-            target: provider,
-            http: None,
-        },
-    )?;
-    let expansions = modules.expand(repo.root(), &evaluated.config)?;
+    let mut http = cache.map(CachedHttpInputs::new);
+    let mut providers = RubyProviders {
+        target: provider,
+        http: http
+            .as_mut()
+            .map(|inputs| inputs as &mut dyn HttpInputProvider),
+    };
+    let evaluated = evaluate_options(repo, selector, &mut ruby, providers.reborrow(), cache)?;
+    let expansions = expand_host(repo.root(), &evaluated, &mut ruby, providers)?;
     let expanded = assemble_resources(repo.root(), &expansions)?;
 
     let mut used_inputs = Vec::new();

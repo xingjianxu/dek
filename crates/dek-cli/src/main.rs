@@ -7,14 +7,16 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dek_cli::{
+    evaluation::normal_cache,
     local_target::{LocalEvaluationTarget, LocalFileBackend, local_registry},
     plan_output::write_plan,
-    planning::plan_host,
+    planning::plan_host_with_cache,
 };
 use dek_controller::repo::{EntryLanguage, HostSelector, Repository, Target, initialize};
 use dek_core::OptionPath;
 use serde_json::json;
 
+mod refresh;
 mod repository;
 mod show;
 
@@ -52,6 +54,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// 刷新选定主机显式使用的 HTTP 输入。
+    Refresh,
     /// 查看生效配置和选项定义来源。
     Show {
         /// 要追溯的完整选项路径，省略时显示整机配置。
@@ -111,6 +115,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Show { option, json } => {
             let repo = discover_repo(cli.repo.as_deref())?;
             let selected = HostSelection::from_arg(cli.host)?;
+            let cache = normal_cache(&repo)?;
             show::show(
                 &mut out,
                 &repo,
@@ -118,14 +123,34 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 option.as_ref(),
                 json,
                 &mut show::UnavailableTarget,
+                cache.as_ref(),
             )?;
         }
+        Command::Refresh => {
+            let repo = discover_repo(cli.repo.as_deref())?;
+            let selected = HostSelection::from_arg(cli.host)?;
+            let selector = selected.selector();
+            if repo.select_host(selector)?.1.target == Target::Local {
+                let registry = local_registry(&LocalFileBackend)?;
+                let mut provider = LocalEvaluationTarget(&registry);
+                refresh::refresh(&mut out, &repo, selector, &mut provider)?;
+            } else {
+                refresh::refresh(&mut out, &repo, selector, &mut show::UnavailableTarget)?;
+            }
+        }
         Command::Plan { json } => {
-            let repo = repository::discover_repo(cli.repo.as_deref())?;
-            let selection = repository::HostSelection::from_arg(cli.host)?;
+            let repo = discover_repo(cli.repo.as_deref())?;
+            let selection = HostSelection::from_arg(cli.host)?;
             let registry = local_registry(&LocalFileBackend)?;
             let mut provider = LocalEvaluationTarget(&registry);
-            let planned = plan_host(&repo, selection.selector(), &registry, &mut provider)?;
+            let cache = normal_cache(&repo)?;
+            let planned = plan_host_with_cache(
+                &repo,
+                selection.selector(),
+                &registry,
+                &mut provider,
+                cache.as_ref(),
+            )?;
             write_plan(&mut out, &planned.name, &planned.plan, json)?;
         }
     }

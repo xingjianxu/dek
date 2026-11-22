@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, error::Error, io::Write};
 
+use dek_cli::evaluation::evaluate_options;
 use dek_controller::{
-    eval::{LanguageCollector, RubySession, TargetAnswer, TargetProvider, evaluate_host},
+    cache::{CacheStore, CachedHttpInputs},
+    eval::{HttpInputProvider, RubyProviders, RubySession, TargetAnswer, TargetProvider},
     repo::{HostSelector, Repository},
 };
 use dek_core::{InputKind, OptionPath, Priority, protocol::TargetQuery};
@@ -25,12 +27,16 @@ pub(super) fn show(
     path: Option<&OptionPath>,
     as_json: bool,
     target_provider: &mut dyn TargetProvider,
+    cache: Option<&CacheStore>,
 ) -> Result<(), Box<dyn Error>> {
-    let evaluated = evaluate_host(
-        repo,
-        selector,
-        &mut LanguageCollector::new(&mut RubySession::new(), target_provider),
-    )?;
+    let mut http = cache.map(CachedHttpInputs::new);
+    let providers = RubyProviders {
+        target: target_provider,
+        http: http
+            .as_mut()
+            .map(|inputs| inputs as &mut dyn HttpInputProvider),
+    };
+    let evaluated = evaluate_options(repo, selector, &mut RubySession::new(), providers, cache)?;
     let options: BTreeMap<_, _> = if let Some(path) = path {
         let pair = evaluated
             .config
