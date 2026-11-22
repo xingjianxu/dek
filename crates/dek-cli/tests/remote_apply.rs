@@ -83,6 +83,7 @@ impl Fixture {
             .env("PATH", path)
             .env("XDG_CACHE_HOME", self.root().join("cache"))
             .env("DEK_TEST_BINARY", binary)
+            .env("DEK_TEST_ROOT", self.root())
             .env("DEK_TEST_STATE", self.root().join("state"))
             .output()
             .unwrap()
@@ -136,5 +137,71 @@ fn ssh_apply_replays_reviewed_content_and_exposes_bound_status() {
             .run("beta", &["status", "--json", "--run", run])
             .status
             .success()
+    );
+}
+
+#[test]
+fn implicit_ssh_apply_displays_upgrade_without_executing_it() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root().join("bin/ssh"),
+        "#!/bin/sh\nexec ruby \"$DEK_TEST_ROOT/upgrade-peer.rb\"\n",
+    )
+    .unwrap();
+    let target_id = hostname::get().unwrap().into_string().unwrap();
+    let target = json!({"id": target_id, "os": "linux", "architecture": "x86_64"});
+    let plan = json!({
+        "formatVersion": 1, "id": "review-upgrade", "target": target,
+        "resourceDigest": "sha256:fixture", "usedCapabilities": [], "usedInputs": [],
+        "actions": [{"id": "upgrade", "kind": {"repositoryTransaction": {
+            "scope": "upgrade", "targets": [], "changes": []
+        }}, "reason": "review required", "origins": [], "dependsOn": [], "preconditions": []}]
+    });
+    let trace = fixture.root().join("upgrade-requests");
+    fs::write(
+        fixture.root().join("upgrade-peer.rb"),
+        format!(
+            r#"
+require 'json'
+STDIN.gets
+plan = JSON.parse({encoded:?})
+puts JSON.generate(hello: {{capabilities: {{target: plan.fetch('target'), protocolVersion: 1, resources: []}}}})
+STDOUT.flush
+STDIN.each_line do |line|
+  request = JSON.parse(line).fetch('request')
+  operation = request.fetch('operation')
+  name = operation.is_a?(Hash) ? operation.keys.fetch(0) : operation
+  File.open({trace:?}, 'a') {{ |log| log.puts name }}
+  reply = case name
+  when 'runStatus'
+    {{executionStatus: nil}}
+  when 'preparePlan'
+    plan['repositoryId'] = operation.fetch(name).fetch('request').fetch('repositoryId')
+    {{missingContents: {{digests: []}}}}
+  when 'finishPlan'
+    {{planned: {{plan: plan, pendingNotifications: []}}}}
+  else
+    abort "unexpected operation #{{name}}"
+  end
+  puts JSON.generate(response: {{id: request.fetch('id'), result: reply}})
+  STDOUT.flush
+end
+"#,
+            encoded = plan.to_string(),
+            trace = trace.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    let output = fixture.run("alpha", &["apply"]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("完整仓库升级事务"), "{stdout}");
+    assert!(
+        stdout.contains("dek apply -H alpha --plan review-upgrade"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(trace).unwrap(),
+        "runStatus\npreparePlan\nfinishPlan\n"
     );
 }

@@ -100,7 +100,9 @@ pub fn apply_local_with_loader(
             Some(id) => id,
             None => {
                 current = create_plan()?;
-                require_explicit_upgrade(out, name, &current)?;
+                if needs_upgrade_review(&current) {
+                    return write_upgrade_review(out, name, &current);
+                }
                 &current.id
             }
         };
@@ -189,23 +191,22 @@ pub(crate) fn write_finished(
     Ok(())
 }
 
-pub(crate) fn require_explicit_upgrade(
+pub(crate) fn needs_upgrade_review(plan: &Plan) -> bool {
+    plan.repository_transaction()
+        .is_some_and(|transaction| transaction.scope == RepositoryTransactionScope::Upgrade)
+}
+
+pub(crate) fn write_upgrade_review(
     mut out: impl Write,
     name: &str,
     plan: &Plan,
 ) -> Result<(), Box<dyn Error>> {
-    if plan
-        .repository_transaction()
-        .is_some_and(|transaction| transaction.scope == RepositoryTransactionScope::Upgrade)
-    {
-        write_plan(&mut out, name, plan, false)?;
-        writeln!(
-            out,
-            "请审阅升级计划并运行 dek apply -H {name} --plan {}",
-            plan.id
-        )?;
-        out.flush()?;
-        return Err(format!("等待审阅计划 {}", plan.id).into());
-    }
-    Ok(())
+    write_plan(&mut out, name, plan, false)?;
+    writeln!(
+        out,
+        "请审阅升级计划并运行 dek apply -H {name} --plan {}",
+        plan.id
+    )?;
+    out.flush()?;
+    Err(format!("等待审阅计划 {}", plan.id).into())
 }

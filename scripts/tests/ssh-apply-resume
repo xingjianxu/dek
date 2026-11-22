@@ -136,9 +136,9 @@ for name in recovery slow-a slow-b; do
     }' > "$repo/$name.json"
 done
 
-export XDG_CACHE_HOME="$evidence/cache" PATH="$evidence/bin:$PATH"
+export XDG_CACHE_HOME="$evidence/cache"
 call() {
-    "$manager" --repo "$repo" -H "$@"
+    PATH="$evidence/bin:$PATH" "$manager" --repo "$repo" -H "$@"
 }
 run_id() {
     awk '$1 == "run_id" { print $2 }' "$1"
@@ -228,7 +228,7 @@ grep -Fq -- '--interactive' "$evidence/no-tty.stderr"
 tty_run=$(run_id "$evidence/no-tty.stdout")
 call tty status --run "$tty_run" --json > "$evidence/waiting-for-tty.json"
 jq -e '(.finished | not) and .actions[0].attempt == 0 and .actions[0].result == "pending"'     "$evidence/waiting-for-tty.json" >/dev/null
-python3 - "$manager" "$repo" "$tty_run" "$evidence" <<'PY'
+PATH="$evidence/bin:$PATH" python3 - "$manager" "$repo" "$tty_run" "$evidence" <<'PY'
 import errno
 import os
 import pty

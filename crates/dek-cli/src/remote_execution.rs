@@ -10,7 +10,9 @@ use dek_core::{
 };
 
 use crate::{
-    applying::{ApplySelection, new_request_id, require_explicit_upgrade, write_finished},
+    applying::{
+        ApplySelection, needs_upgrade_review, new_request_id, write_finished, write_upgrade_review,
+    },
     evaluation::normal_cache,
     plan_output::write_plan,
     planning::{plan_remote_host, repository_id},
@@ -61,7 +63,10 @@ pub(crate) fn apply_remote(
                     normal_cache(repo)?.as_ref(),
                     PlanMode::Normal,
                 )?;
-                require_explicit_upgrade(&mut *out, name, &review.plan)?;
+                if needs_upgrade_review(&review.plan) {
+                    session.finish()?;
+                    return write_upgrade_review(out, name, &review.plan);
+                }
                 review.plan.id
             }
         };
