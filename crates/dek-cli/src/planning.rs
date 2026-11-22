@@ -7,7 +7,7 @@ use dek_controller::{
     eval::{HttpInputProvider, RubyProviders, RubySession, TargetProvider},
     modules::{ExpandedResources, assemble_resources},
     repo::{HostSelector, Repository, Target},
-    transport::SshSession,
+    transport::{RemoteTarget, SshSession},
 };
 use dek_core::{
     HostConfig, InputKind, InputObservation, Plan,
@@ -68,8 +68,10 @@ pub fn plan_remote_host(
     cache: Option<&CacheStore>,
 ) -> Result<RemotePlan, Box<dyn Error>> {
     let (name, _) = repo.select_host(selector)?;
-    let (_, expanded, used_inputs) =
-        evaluate_resources(repo, selector, &mut crate::show::UnavailableTarget, cache)?;
+    let (_, expanded, used_inputs) = {
+        let mut provider = RemoteTarget::new(session, cache, name);
+        evaluate_resources(repo, selector, &mut provider, cache)?
+    };
     let request = PlanRequest {
         repository_id: repository_id(repo),
         logical_host: name.into(),
