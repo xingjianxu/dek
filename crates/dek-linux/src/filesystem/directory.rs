@@ -1,5 +1,7 @@
 use std::{
+    ffi::OsStr,
     io,
+    os::fd::AsRawFd,
     path::{Component, Path, PathBuf},
 };
 
@@ -9,11 +11,12 @@ use dek_core::{
 };
 use dek_target::backend::{ActionContext, ActionReadiness, Backend, BackendError, PlannedAction};
 use rustix::{
-    fd::OwnedFd,
+    fd::{AsFd, BorrowedFd, OwnedFd},
     fs::{
-        AtFlags, FileType, Mode, OFlags, RenameFlags, Stat, fchmod, fchown, fstat, fsync, mkdirat,
-        openat, renameat_with, statat, unlinkat,
+        AtFlags, FileType, Mode, OFlags, RenameFlags, Stat, chownat, fchmod, fchown, fstat, fsync,
+        mkdirat, openat, renameat_with, statat, unlinkat,
     },
+    io::Errno,
     process::{Gid, Uid},
 };
 
@@ -155,13 +158,13 @@ impl Backend for DirectoryBackend {
         let problem = |err| path_error(directory, err);
 
         let updated = if let Some(observed) = before.stat {
-            let fd = open_directory(&target.parent, &target.name).map_err(problem)?;
+            let fd = DirectoryFd::open(&target.parent, &target.name).map_err(problem)?;
             let actual = fstat(&fd).map_err(|err| problem(err.into()))?;
             if metadata(&actual, desired) != metadata(&observed, desired) {
                 return Err(BackendError(conflict(directory)));
             }
             let result = set_attributes(&fd, &actual, &attributes).map_err(problem)?;
-            fsync(&fd).map_err(|err| problem(err.into()))?;
+            fd.sync().map_err(problem)?;
             result
         } else {
             create(&target, &attributes).map_err(problem)?
@@ -293,7 +296,7 @@ fn snapshot(directory: &DirectoryResource) -> Result<Snapshot, BackendError> {
                     directory.path
                 )));
             }
-            Err(rustix::io::Errno::NOENT) => None,
+            Err(Errno::NOENT) => None,
             Err(err) => return Err(path_error(directory, err.into())),
         },
         None => None,
@@ -328,13 +331,83 @@ fn matches(
     Ok(declaration.mode.is_none() || mode(declaration.mode.as_deref())? == observation.mode)
 }
 
-fn open_directory(fd: &OwnedFd, name: impl rustix::path::Arg) -> io::Result<OwnedFd> {
-    Ok(openat(
-        fd,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?)
+enum DirectoryFd {
+    Readable(OwnedFd),
+    Metadata(OwnedFd),
+}
+
+impl DirectoryFd {
+    fn open(parent: &OwnedFd, name: &OsStr) -> io::Result<Self> {
+        let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        match openat(parent, name, flags | OFlags::RDONLY, Mode::empty()) {
+            Ok(fd) => Ok(Self::Readable(fd)),
+            // Owners can repair permissions without permission to read the directory.
+            Err(Errno::ACCESS) => Ok(Self::Metadata(openat(
+                parent,
+                name,
+                flags | OFlags::PATH,
+                Mode::empty(),
+            )?)),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn chown(&self, uid: Option<Uid>, gid: Option<Gid>) -> io::Result<()> {
+        match self {
+            Self::Readable(fd) => Ok(fchown(fd, uid, gid)?),
+            Self::Metadata(fd) => Ok(chownat(fd, "", uid, gid, AtFlags::EMPTY_PATH)?),
+        }
+    }
+
+    fn chmod(&self, mode: Mode) -> io::Result<()> {
+        match self {
+            Self::Readable(fd) => Ok(fchmod(fd, mode)?),
+            Self::Metadata(fd) => {
+                // SAFETY: the owned O_PATH descriptor pins the directory inode.
+                // AT_EMPTY_PATH acts on that descriptor using a valid empty C string.
+                let result = unsafe {
+                    libc::fchmodat(
+                        fd.as_raw_fd(),
+                        c"".as_ptr(),
+                        mode.bits(),
+                        libc::AT_EMPTY_PATH,
+                    )
+                };
+                if result < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        match self {
+            Self::Readable(fd) => Ok(fsync(fd)?),
+            // Reopen the pinned inode if the new permissions allow reading it.
+            Self::Metadata(fd) => {
+                let read = openat(
+                    fd,
+                    ".",
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                );
+                match read {
+                    Ok(directory) => Ok(fsync(&directory)?),
+                    Err(Errno::ACCESS) => Ok(()),
+                    Err(err) => Err(err.into()),
+                }
+            }
+        }
+    }
+}
+
+impl AsFd for DirectoryFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Readable(fd) | Self::Metadata(fd) => fd.as_fd(),
+        }
+    }
 }
 
 struct Attributes {
@@ -351,11 +424,11 @@ impl Attributes {
     }
 }
 
-fn set_attributes(fd: &OwnedFd, initial: &Stat, attrs: &Attributes) -> io::Result<Stat> {
+fn set_attributes(fd: &DirectoryFd, initial: &Stat, attrs: &Attributes) -> io::Result<Stat> {
     let uid = attrs.uid.filter(|uid| *uid != initial.st_uid);
     let gid = attrs.gid.filter(|gid| *gid != initial.st_gid);
     let current = if uid.is_some() || gid.is_some() {
-        fchown(fd, uid.map(Uid::from_raw), gid.map(Gid::from_raw))?;
+        fd.chown(uid.map(Uid::from_raw), gid.map(Gid::from_raw))?;
         fstat(fd)?
     } else {
         *initial
@@ -363,7 +436,7 @@ fn set_attributes(fd: &OwnedFd, initial: &Stat, attrs: &Attributes) -> io::Resul
     // chown can clear special permission bits even when mode is undeclared.
     let mode = attrs.mode.unwrap_or(initial.st_mode & 0o7777);
     let updated = if current.st_mode & 0o7777 != mode {
-        fchmod(fd, Mode::from_bits_truncate(mode))?;
+        fd.chmod(Mode::from_bits_truncate(mode))?;
         fstat(fd)?
     } else {
         current
@@ -384,10 +457,10 @@ fn create(target: &TargetPath, attrs: &Attributes) -> io::Result<Stat> {
     let name = "directory";
     mkdirat(&stage.directory, name, Mode::from_bits_truncate(0o755))?;
     let result = (|| {
-        let fd = open_directory(&stage.directory, name)?;
+        let fd = DirectoryFd::open(&stage.directory, OsStr::new(name))?;
         let initial = fstat(&fd)?;
         let updated = set_attributes(&fd, &initial, attrs)?;
-        fsync(&fd)?;
+        fd.sync()?;
         renameat_with(
             &stage.directory,
             name,

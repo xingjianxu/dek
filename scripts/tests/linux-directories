@@ -98,6 +98,25 @@ PY
         [[ "$(id -u "$alice"):$(id -g "$alice")" == "$uid_before:$gid_before" ]]
         assert_empty_plan
 
+        readless=$(mktemp -d)
+        mkdir -m 000 "$readless/managed"
+        cat > "$readless/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"target":{"local":true},"entry":"host.json"}}}
+JSON
+        python3 - "$readless" > "$readless/host.json" <<'PYTHON'
+import json, sys
+print(json.dumps({"schemaVersion": 1, "imports": [], "options": [
+    {"path": "systemd.tmpfiles.settings.fixture", "value": {
+        sys.argv[1] + "/managed": {"d": {"mode": "0700"}},
+    }},
+]}))
+PYTHON
+        chown "$alice:$research" "$readless" "$readless/managed"
+        runuser -u "$alice" -- env XDG_CACHE_HOME="$readless/cache" \
+            /usr/local/bin/dek --repo "$readless" -H fixture apply --state-dir "$readless/state"
+        stat -c 'Unprivileged directory repair %U:%G:%a' "$readless/managed"
+        [[ "$(stat -c '%U:%G:%a' "$readless/managed")" == "$alice:$research:700" ]]
+
         configuration normal
         dek_command apply
         stat -c '%n %U:%G:%a' "$primary" "$pending"

@@ -166,3 +166,14 @@ fn a_replaced_directory_requires_a_fresh_plan_even_with_the_same_metadata() {
     assert_eq!(mode(&saved), 0o777);
     assert_eq!(mode(&path), 0o750);
 }
+
+#[test]
+fn an_owner_can_repair_a_directory_with_no_read_permission() {
+    let fixture = Fixture::new();
+    let path = fixture.root.path().join("managed");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    fixture.set_directories(json!({ (path.to_str().unwrap()): {"d": {"mode": "0700"}} }));
+    require_success(&fixture.command(&["apply"]));
+    assert_eq!(mode(&path), 0o700);
+}
