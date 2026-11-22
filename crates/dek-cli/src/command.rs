@@ -145,10 +145,15 @@ fn run_command<'target>(
         dek_linux::secrets::SecretBackend::new(root)
     };
     #[cfg(target_os = "linux")]
+    let pacman = dek_linux::arch::PacmanBackend::default();
+    #[cfg(target_os = "linux")]
     let local_target = || {
         let mut registry = local_target()?;
         if _production {
             registry.register(&secrets)?;
+            if registry.target().distribution.as_deref() == Some("arch") && pacman.available() {
+                registry.register(&pacman)?;
+            }
         }
         Ok::<_, Box<dyn Error>>(registry)
     };
