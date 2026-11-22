@@ -14,6 +14,7 @@ use dek_core::{
     FileResource, FileState, Observation, Precondition, ResourceCapability, ResourceKind,
     TargetIdentity,
     protocol::{TargetQuery, TargetQueryKind},
+    target_protocol::TARGET_PROTOCOL_VERSION,
 };
 use dek_target::backend::{Backend, BackendError, BackendRegistry, PlannedAction};
 use serde_json::{Value, json};
@@ -44,7 +45,7 @@ pub fn local_registry(backend: &LocalFileBackend) -> Result<BackendRegistry<'_>,
             distribution,
             architecture: env::consts::ARCH.into(),
         },
-        1,
+        TARGET_PROTOCOL_VERSION,
         normalize_path,
     );
     registry.register(backend)?;
