@@ -28,8 +28,9 @@ definition = content_object(<<~UNIT)
   [Unit]
   Description=#{description}
   [Service]
+  ExecStartPre=/usr/bin/bash #{root}/observe-config.sh #{root} start
   ExecStart=/usr/bin/sleep infinity
-  ExecReload=/usr/bin/bash #{root}/reload.sh #{root}
+  ExecReload=/usr/bin/bash #{root}/observe-config.sh #{root} reload
 UNIT
 resource("systemdUnit", unit: unit, definition: {content: definition}, running: true)
 
@@ -39,9 +40,13 @@ resource("systemdUnit", unit: unit, definition: {content: definition}, running: 
     notifications: [{unit: unit, effect: effect, when: "contentChanged"}]
 end
 RUBY
-cat > "$repo/reload.sh" <<'SH'
+cat > "$repo/observe-config.sh" <<'SH'
 set -euo pipefail
 root=$1
+if [[ "$2" == start ]]; then
+    cat "$root/a.conf" "$root/b.conf" > "$root/started"
+    exit
+fi
 printf 'attempt\n' >> "$root/attempts"
 if [[ -e "$root/fail-once" ]]; then
     rm -- "$root/fail-once"
@@ -100,6 +105,7 @@ plan
 apply --plan "$(review initial)"
 systemctl is-active --quiet "$unit"
 [[ ! -s "$repo/attempts" ]]
+diff -u <(printf 'a-initial\nb-initial\n') "$repo/started"
 printf 'First start read the current files with zero reloads.\n'
 
 entry update
@@ -164,4 +170,5 @@ invocation=$(systemctl show --property=InvocationID --value -- "$unit")
 apply --plan "$(review restart)"
 [[ $(systemctl show --property=InvocationID --value -- "$unit") != "$invocation" ]]
 [[ $(wc -l < "$repo/attempts") == 3 ]]
+diff -u <(printf 'a-restart\nb-restart\n') "$repo/started"
 printf 'Mixed reload and restart triggers produced one restart and no reload.\n'
