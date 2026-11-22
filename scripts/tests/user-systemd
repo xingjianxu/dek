@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -e /run/cloud-init/instance-data.json && "$(id -u)" == 0 ]]
+grep -Fx 'ID=arch' /etc/os-release
+repo=$(mktemp -d)
+state="$repo/state"
+export XDG_CACHE_HOME="$repo/cache"
+
+useradd -m alice
+useradd -m bob
+as_user() {
+    local user=$1 uid home
+    shift
+    uid=$(id -u "$user")
+    home=$(getent passwd "$user" | cut -d: -f6)
+    runuser -u "$user" -- env -i HOME="$home" PATH=/usr/bin XDG_RUNTIME_DIR="/run/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user "$@"
+}
+wait_manager() {
+    local user=$1
+    for ((attempt=0; attempt<30; attempt++)); do
+        if as_user "$user" show --property=Version >/dev/null 2>&1; then return; fi
+        sleep 1
+    done
+    return 1
+}
+
+runuser -u bob -- mkdir -p /home/bob/.config/systemd/user
+for scope in /etc/systemd/system /home/bob/.config/systemd/user; do
+    cat > "$scope/backup.service" <<'UNIT'
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/true
+UNIT
+    cat > "$scope/backup.timer" <<'UNIT'
+[Timer]
+OnActiveSec=1h
+[Install]
+WantedBy=timers.target
+UNIT
+done
+chown bob:bob /home/bob/.config/systemd/user/backup.{service,timer}
+systemctl daemon-reload
+systemctl enable --now backup.timer
+loginctl enable-linger bob
+wait_manager bob
+as_user bob enable --now backup.timer
+sha256sum /etc/systemd/system/backup.{service,timer} /home/bob/.config/systemd/user/backup.{service,timer} > "$repo/other.sha"
+
+cat > "$repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"lab":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.userUnits":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$repo/options.json" <<'JSON'
+{"options":[
+  {"path":"lab.userUnits.enable","type":"boolean","description":"Enable test module"},
+  {"path":"lab.userUnits.user","type":"string","description":"Target user"},
+  {"path":"lab.userUnits.declare","type":"boolean","description":"Declare target user"},
+  {"path":"lab.userUnits.revision","type":"string","description":"Change both definitions"}
+]}
+JSON
+cat > "$repo/expand.rb" <<'RUBY'
+user = option("lab.userUnits.user")
+revision = option("lab.userUnits.revision")
+resource("user", name: user, home: "/home/#{user}") if option("lab.userUnits.declare")
+scope = {user: {user: user}}
+service = {scope: scope, name: "backup.service"}
+timer = {scope: scope, name: "backup.timer"}
+service_content = content_object("[Unit]\nDescription=Backup #{revision}\n[Service]\nType=oneshot\nExecStart=/usr/bin/touch %h/dek-backup-fired\n")
+timer_content = content_object("[Unit]\nDescription=Backup schedule #{revision}\n[Timer]\nOnActiveSec=1sec\nAccuracySec=1ms\n[Install]\nWantedBy=timers.target\n")
+resource("systemdUnit", unit: service, definition: {content: service_content})
+resource("systemdUnit", unit: timer, definition: {content: timer_content}, enabled: true,
+  running: true, activates: service)
+RUBY
+entry() {
+    python3 - "$1" "$2" "${3:-initial}" > "$repo/entry.json" <<'PY'
+import json
+import sys
+
+json.dump({"schemaVersion": 1, "imports": [], "options": [
+    {"path": "lab.userUnits.enable", "value": True},
+    {"path": "lab.userUnits.user", "value": sys.argv[1]},
+    {"path": "lab.userUnits.declare", "value": sys.argv[2] == "true"},
+    {"path": "lab.userUnits.revision", "value": sys.argv[3]},
+]}, sys.stdout)
+PY
+}
+plan() { dek --repo "$repo" -H lab plan --state-dir "$state" --json; }
+apply() { dek --repo "$repo" -H lab apply --state-dir "$state" "$@"; }
+status() { dek --repo "$repo" -H lab status --state-dir "$state" --json; }
+assert_actions() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="UTF-8") as source:
+    actions = json.load(source)["actions"]
+assert not actions, actions
+PY
+}
+
+entry alice false
+[[ ! -S "/run/user/$(id -u alice)/systemd/private" ]]
+plan > "$repo/offline.plan"
+grep -q '待激活' "$repo/offline.plan"
+apply | tee "$repo/offline.log"
+grep -q '待激活' "$repo/offline.log"
+status > "$repo/offline.status"
+python3 - "$repo/offline.status" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="UTF-8") as source:
+    actions = json.load(source)["actions"]
+results = [(next(iter(a["action"]["kind"])), next(iter(a["result"]))) for a in actions]
+assert results.count(("deployUnit", "verified")) == 2, results
+assert ("setUnitEnabled", "verified") in results, results
+assert ("setUnitRunning", "deferred") in results, results
+PY
+alice_root=/home/alice/.config/systemd/user
+as_user alice --root=/ is-enabled --quiet backup.timer
+test ! -e /home/alice/dek-backup-fired
+for file in "$alice_root/backup.service" "$alice_root/backup.timer" "$alice_root/timers.target.wants/backup.timer"; do
+    [[ "$(stat -c %U "$file")" == alice ]]
+done
+
+loginctl enable-linger alice
+wait_manager alice
+as_user alice stop backup.timer
+rm -f /home/alice/dek-backup-fired
+apply
+as_user alice is-active --quiet backup.timer
+for ((attempt=0; attempt<15; attempt++)); do
+    if [[ -f /home/alice/dek-backup-fired ]]; then break; fi
+    sleep 1
+done
+if [[ ! -f /home/alice/dek-backup-fired ]]; then
+    as_user alice status backup.timer backup.service || true
+    exit 1
+fi
+if as_user alice is-active --quiet backup.service; then exit 1; fi
+plan > "$repo/converged.plan"
+assert_actions "$repo/converged.plan"
+
+alice_reloads=$(as_user alice show --property=ReloadCount --value)
+bob_reloads=$(as_user bob show --property=ReloadCount --value)
+system_reloads=$(systemctl show --property=ReloadCount --value)
+entry alice false updated
+apply
+[[ "$(as_user alice show --property=ReloadCount --value)" == "$((alice_reloads + 1))" ]]
+[[ "$(as_user bob show --property=ReloadCount --value)" == "$bob_reloads" ]]
+[[ "$(systemctl show --property=ReloadCount --value)" == "$system_reloads" ]]
+plan > "$repo/online-converged.plan"
+assert_actions "$repo/online-converged.plan"
+
+entry charlie false
+if plan > "$repo/missing.plan" 2> "$repo/missing.log"; then exit 1; fi
+grep -F 'charlie' "$repo/missing.log"
+entry charlie true
+plan > "$repo/account.plan"
+apply
+[[ "$(stat -c %U /home/charlie/.config/systemd/user/backup.timer)" == charlie ]]
+as_user charlie --root=/ is-enabled --quiet backup.timer
+
+sha256sum --check "$repo/other.sha"
+systemctl is-enabled --quiet backup.timer
+systemctl is-active --quiet backup.timer
+as_user bob is-enabled --quiet backup.timer
+as_user bob is-active --quiet backup.timer
+printf 'User scope, offline activation, online timer, account dependency and scope isolation passed.\n'

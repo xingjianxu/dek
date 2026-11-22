@@ -1,6 +1,8 @@
 use std::{
     ffi::{CStr, CString},
     mem::MaybeUninit,
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
     ptr,
 };
 
@@ -24,6 +26,13 @@ pub(super) trait NameService {
 }
 
 pub(super) struct SystemNss;
+
+pub(crate) struct UserAccount {
+    pub(crate) name: String,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) home: PathBuf,
+}
 
 impl NameService for SystemNss {
     fn user(&self, key: Key<'_>) -> Result<Option<Identity>, BackendError> {
@@ -67,6 +76,29 @@ pub fn group_id(name: &str) -> Result<Option<u32>, BackendError> {
     Ok(SystemNss.group(Key::Name(name))?.map(|entry| entry.id))
 }
 
+pub(crate) fn user_account(name: &str) -> Result<Option<UserAccount>, BackendError> {
+    let name = lookup_name(Key::Name(name))?;
+    lookup(
+        |entry: *mut libc::passwd, buf, size, found| {
+            // NSS keeps these pointers valid while extracting the account below.
+            unsafe { libc::getpwnam_r(name.as_ptr(), entry, buf, size, found) }
+        },
+        |entry| {
+            if entry.pw_dir.is_null() {
+                return Err(BackendError("NSS 结果缺少 home 目录".into()));
+            }
+            let home = unsafe { CStr::from_ptr(entry.pw_dir) };
+            let identity = identity(entry.pw_name, entry.pw_uid)?;
+            Ok(UserAccount {
+                name: identity.name,
+                uid: identity.id,
+                gid: entry.pw_gid,
+                home: PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())),
+            })
+        },
+    )
+}
+
 fn lookup_name(key: Key<'_>) -> Result<CString, BackendError> {
     let name = match key {
         Key::Name(name) => name,
@@ -89,10 +121,10 @@ fn identity(name: *const libc::c_char, id: u32) -> Result<Identity, BackendError
     })
 }
 
-fn lookup<T>(
+fn lookup<T, V>(
     call: impl Fn(*mut T, *mut libc::c_char, usize, *mut *mut T) -> i32,
-    extract: impl Fn(&T) -> Result<Identity, BackendError>,
-) -> Result<Option<Identity>, BackendError> {
+    extract: impl Fn(&T) -> Result<V, BackendError>,
+) -> Result<Option<V>, BackendError> {
     let mut bytes = vec![0_u8; 4096];
     loop {
         let mut entry = MaybeUninit::uninit();

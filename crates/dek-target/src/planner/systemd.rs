@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use dek_core::{Action, ActionKind, TargetIdentity, UnitScope};
+use dek_core::{Action, ActionKind, ResourceOrigin, TargetIdentity, UnitScope};
 
 use super::{PlanError, action_id};
 
@@ -8,12 +8,12 @@ pub(super) fn coalesce_reload(
     mut actions: Vec<Action>,
     target: &TargetIdentity,
 ) -> Result<Vec<Action>, PlanError> {
-    let mut definitions = Vec::new();
-    let mut origins = Vec::new();
+    let mut managers = BTreeMap::<UnitScope, (Vec<String>, Vec<ResourceOrigin>)>::new();
     for action in &actions {
         if let ActionKind::DeployUnit { unit, .. } = &action.kind
-            && unit.scope == UnitScope::System
+            && unit.scope != UnitScope::UserGlobal
         {
+            let (definitions, origins) = managers.entry(unit.scope.clone()).or_default();
             definitions.push(action.id.clone());
             for origin in &action.origins {
                 if !origins.contains(origin) {
@@ -22,30 +22,35 @@ pub(super) fn coalesce_reload(
             }
         }
     }
-    if definitions.is_empty() {
+    if managers.is_empty() {
         return Ok(actions);
     }
 
-    let id = action_id(actions.len());
-    for action in &mut actions {
-        if matches!(
-            &action.kind,
-            ActionKind::SetUnitEnabled { unit, .. }
-                | ActionKind::SetUnitRunning { unit, .. }
-                | ActionKind::NotifyService { unit, .. }
-                if unit.scope == UnitScope::System
-        ) {
-            action.depends_on.push(id.clone());
+    for (scope, (definitions, origins)) in managers {
+        let id = action_id(actions.len());
+        for action in &mut actions {
+            let after_reload = match &action.kind {
+                ActionKind::SetUnitRunning { unit, .. }
+                | ActionKind::NotifyService { unit, .. } => unit.scope == scope,
+                ActionKind::SetUnitEnabled { unit, .. } => {
+                    // User enablement is an on-disk action and remains available offline.
+                    scope == UnitScope::System && unit.scope == scope
+                }
+                _ => false,
+            };
+            if after_reload {
+                action.depends_on.push(id.clone());
+            }
         }
+        actions.push(Action {
+            id,
+            kind: ActionKind::ReloadManager(scope),
+            reason: "此 manager 的单元定义发生变化".into(),
+            origins,
+            depends_on: definitions,
+            preconditions: Vec::new(),
+        });
     }
-    actions.push(Action {
-        id,
-        kind: ActionKind::ReloadManager(UnitScope::System),
-        reason: "本批系统级单元定义发生变化".into(),
-        origins,
-        depends_on: definitions,
-        preconditions: Vec::new(),
-    });
     order(actions, target)
 }
 

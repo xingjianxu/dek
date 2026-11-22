@@ -77,6 +77,7 @@ pub(crate) fn show_status(
             ActionResult::Verified { .. } => "已核验",
             ActionResult::Failed { .. } => "失败",
             ActionResult::Unverified => "结果待核验",
+            ActionResult::Deferred { .. } => "待激活",
             ActionResult::Pending => "待执行",
         };
         writeln!(
@@ -85,7 +86,8 @@ pub(crate) fn show_status(
             item.action.id,
             description(&item.action.kind)
         )?;
-        if let ActionResult::Failed { message } = &item.result {
+        if let ActionResult::Failed { message } | ActionResult::Deferred { message } = &item.result
+        {
             writeln!(out, "  {message}")?;
         }
         if let Some(diagnostic) = &item.recovery_diagnostic {
