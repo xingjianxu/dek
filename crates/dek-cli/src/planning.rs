@@ -51,7 +51,7 @@ pub fn plan_host_with_cache(
             .map(|inputs| inputs as &mut dyn HttpInputProvider),
     };
     let evaluated = evaluate_options(repo, selector, &mut ruby, providers.reborrow(), cache)?;
-    let expansions = expand_host(repo.root(), &evaluated, &mut ruby, providers)?;
+    let expansions = expand_host(repo.root(), &evaluated, &mut ruby, providers, cache)?;
     let expanded = assemble_resources(repo.root(), &expansions)?;
 
     let mut used_inputs = Vec::new();

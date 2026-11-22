@@ -2,9 +2,10 @@ use dek_core::HostConfig;
 use thiserror::Error;
 
 use crate::{
+    cache::CacheStore,
     modules::{
-        MergeError, RepositoryModuleError, RepositoryModules, SchemaError, SchemaRegistry,
-        register_app_schemas, register_key_schemas, register_system_schemas,
+        CachedMergeError, MergeError, RepositoryModuleError, RepositoryModules, SchemaError,
+        SchemaRegistry, register_app_schemas, register_key_schemas, register_system_schemas,
     },
     repo::{HostSelector, Repository},
 };
@@ -28,6 +29,8 @@ pub enum HostEvaluationError {
     Collect(#[from] GraphError),
     #[error(transparent)]
     Merge(#[from] MergeError),
+    #[error(transparent)]
+    CachedMerge(#[from] CachedMergeError),
 }
 
 /// 采集选定主机及其依赖并合并选项，返回可供后续展开的模块注册。
@@ -36,6 +39,24 @@ pub fn evaluate_host(
     selector: HostSelector<'_>,
     collector: &mut dyn Collector,
 ) -> Result<EvaluatedHost, HostEvaluationError> {
+    evaluate_host_using(repo, selector, collector, None)
+}
+
+pub fn evaluate_host_cached(
+    repo: &Repository,
+    selector: HostSelector<'_>,
+    collector: &mut dyn Collector,
+    cache: &CacheStore,
+) -> Result<EvaluatedHost, HostEvaluationError> {
+    evaluate_host_using(repo, selector, collector, Some(cache))
+}
+
+fn evaluate_host_using(
+    repo: &Repository,
+    selector: HostSelector<'_>,
+    collector: &mut dyn Collector,
+    cache: Option<&CacheStore>,
+) -> Result<EvaluatedHost, HostEvaluationError> {
     let mut schemas = SchemaRegistry::default();
     register_app_schemas(&mut schemas)?;
     register_system_schemas(&mut schemas)?;
@@ -43,10 +64,13 @@ pub fn evaluate_host(
     let repository_modules = RepositoryModules::load(repo, &mut schemas)?;
 
     let graph = collect_graph(repo, selector, collector)?;
-    let config = schemas.merge_profiles(
-        graph.profiles.iter().map(|profile| &profile.spec),
-        &graph.host.spec,
-    )?;
+    let config = match cache {
+        Some(cache) => schemas.merge_cached(cache, &graph)?,
+        None => schemas.merge_profiles(
+            graph.profiles.iter().map(|profile| &profile.spec),
+            &graph.host.spec,
+        )?,
+    };
     Ok(EvaluatedHost {
         graph,
         config,

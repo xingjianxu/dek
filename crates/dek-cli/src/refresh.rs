@@ -21,7 +21,7 @@ pub(super) fn refresh(
         http: Some(&mut http),
     };
     let evaluated = evaluate_options(repo, selector, &mut ruby, providers.reborrow(), None)?;
-    expand_host(repo.root(), &evaluated, &mut ruby, providers)?;
+    expand_host(repo.root(), &evaluated, &mut ruby, providers, None)?;
     let stats = http.stats();
     writeln!(
         out,
