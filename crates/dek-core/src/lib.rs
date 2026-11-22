@@ -28,4 +28,4 @@ pub use resource::{
     ResourceSet, ServiceEffect, ServiceNotification, SystemdUnitResource, UnitDefinition, UnitId,
     UnitScope, UserKind, UserResource,
 };
-pub use run::{ActionResult, PendingRunNotification, RunNotification};
+pub use run::{ActionResult, PendingRunNotification, RunAction, RunNotification, RunStatus};

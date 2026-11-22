@@ -8,6 +8,9 @@ use dek_core::{
 };
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+use crate::terminal::{TERMINAL_REQUIRED, TerminalCommand, TerminalRunner};
+
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct BackendError(pub String);
@@ -73,6 +76,8 @@ pub enum NotificationError {
 pub struct ActionContext<'a> {
     pub action: &'a Action,
     contents: &'a BTreeMap<ContentDigest, Vec<u8>>,
+    #[cfg(target_os = "linux")]
+    terminal: Option<&'a TerminalRunner<'a>>,
     before_content_change: Option<&'a (dyn Fn(bool) -> Result<(), BackendError> + Sync)>,
 }
 
@@ -97,8 +102,24 @@ impl<'a> ActionContext<'a> {
         Self {
             action,
             contents,
+            terminal: None,
             before_content_change: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_terminal(mut self, terminal: Option<&'a TerminalRunner<'a>>) -> Self {
+        self.terminal = terminal;
+        self
+    }
+
+    /// Run a helper using the approved action's interactive terminal.
+    #[cfg(target_os = "linux")]
+    pub fn run_interactive(&self, command: &TerminalCommand) -> Result<(), BackendError> {
+        let terminal = self
+            .terminal
+            .ok_or_else(|| BackendError(TERMINAL_REQUIRED.into()))?;
+        terminal(command)
     }
 
     #[cfg(target_os = "linux")]
@@ -256,6 +277,12 @@ pub trait Backend {
             ActionReadiness::Ready => RecoveryReadiness::Retry,
             ActionReadiness::Satisfied => RecoveryReadiness::Satisfied,
         })
+    }
+
+    /// Declare a helper's TTY requirement before the executor records an attempt.
+    #[cfg(target_os = "linux")]
+    fn requires_terminal(&self, _: &Action) -> bool {
+        false
     }
 
     /// Apply the reviewed action. Backends check the supplied preconditions at

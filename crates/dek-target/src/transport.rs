@@ -3,10 +3,15 @@
 use std::io::{self, BufRead, Write};
 
 use dek_core::target_protocol::{
-    ClientFrame, ServerFrame, TargetRequest, TargetResult, read_frame, write_frame,
+    ClientFrame, ServerFrame, TargetEvent, TargetRequest, TargetResult, read_frame, write_frame,
 };
 
 use crate::backend::BackendRegistry;
+
+#[cfg(target_os = "linux")]
+mod execution;
+#[cfg(target_os = "linux")]
+pub use execution::dispatch_execution;
 
 pub fn dispatch(registry: &BackendRegistry<'_>, operation: TargetRequest) -> TargetResult {
     match operation {
@@ -49,6 +54,32 @@ pub fn serve_with(
     output: &mut impl Write,
     mut dispatch: impl FnMut(TargetRequest) -> TargetResult,
 ) -> io::Result<()> {
+    serve_requests(registry, input, output, |_, operation, _| {
+        dispatch(operation)
+    })
+}
+
+pub type EventSender<'a> = dyn FnMut(TargetEvent) -> io::Result<()> + Send + 'a;
+
+pub fn serve_events<W: Write + Send>(
+    registry: &BackendRegistry<'_>,
+    input: &mut impl BufRead,
+    output: &mut W,
+    mut dispatch: impl FnMut(TargetRequest, &mut EventSender<'_>) -> TargetResult,
+) -> io::Result<()> {
+    serve_requests(registry, input, output, |id, operation, output| {
+        dispatch(operation, &mut |event| {
+            write_frame(output, &ServerFrame::Event { id, event })
+        })
+    })
+}
+
+fn serve_requests<W: Write>(
+    registry: &BackendRegistry<'_>,
+    input: &mut impl BufRead,
+    output: &mut W,
+    mut dispatch: impl FnMut(u64, TargetRequest, &mut W) -> TargetResult,
+) -> io::Result<()> {
     let Some(ClientFrame::Hello { versions }) = read_frame(input)? else {
         return Err(invalid("expected a target protocol hello"));
     };
@@ -72,7 +103,7 @@ pub fn serve_with(
             return Err(invalid("target protocol request IDs must increase"));
         }
         last_id = id;
-        let result = dispatch(operation);
+        let result = dispatch(id, operation, output);
         write_frame(output, &ServerFrame::Response { id, result })?;
     }
     Ok(())

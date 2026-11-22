@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+if [[ $# != 4 ]]; then
+    printf 'Usage: %s IMAGE_ID MANAGER_DEK GUEST_DEK GUEST_APPLY_PROBE\n' "$0" >&2
+    exit 2
+fi
+image=$1
+manager=$(realpath -e -- "$2")
+guest=$(realpath -e -- "$3")
+probe=$(realpath -e -- "$4")
+cd -- "$(dirname -- "$0")/../.."
+vm=$PWD/scripts/run-arch-vm
+run_root="${DEK_DEV_ROOT:-/data/dek-dev}/runs/43"
+mkdir -p -- "$run_root"
+evidence=$(mktemp -d "$run_root/acceptance.XXXXXXXX")
+printf 'Evidence: %s\n' "$evidence"
+
+a=
+b=
+cleanup() {
+    local run
+    for run in "$a" "$b"; do
+        if [[ -n "$run" && ! -e "$run/result" ]]; then
+            "$vm" finish "$run" failed || true
+        fi
+    done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+a=$("$vm" start 43 "$image" "$guest")
+printf '%s\n' "$a" > "$evidence/guest-a"
+b=$("$vm" start 43 "$image" "$guest")
+printf '%s\n' "$b" > "$evidence/guest-b"
+a_id=$(<"$a/instance")
+b_id=$(<"$b/instance")
+guest_data=/home/dek/remote-apply-probe
+
+for run in "$a" "$b"; do
+    "$vm" ssh "$run" sudo -n install -d -m 0700 -o dek /var/lib/dek "$guest_data"
+    "$vm" ssh "$run" "cat > $guest_data/endpoint && chmod 0700 $guest_data/endpoint" < "$probe"
+    "$vm" ssh "$run" 'sudo -n mv /usr/local/bin/dek /usr/local/bin/dek-real && sudo -n install -m 0755 /dev/stdin /usr/local/bin/dek' <<'SH'
+#!/bin/sh
+if [ "$1" = __target-stdio ]; then
+    export DEK_TEST_SSH_PROBE_ROOT=/home/dek/remote-apply-probe
+    exec "$DEK_TEST_SSH_PROBE_ROOT/endpoint" --exact serve_remote_probe 3>&1 >&2
+fi
+exec /usr/local/bin/dek-real "$@"
+SH
+done
+
+a_conf=$("$vm" config "$a")
+b_conf=$("$vm" config "$b")
+{
+    sed 's/^Host dek-vm$/Host dek-a/' "$a_conf"
+    sed 's/^Host dek-vm$/Host dek-b/' "$b_conf"
+} > "$evidence/ssh.conf"
+
+export DEK_TEST_REAL_SSH DEK_TEST_PYTHON DEK_TEST_SSH_CONFIG="$evidence/ssh.conf"
+DEK_TEST_REAL_SSH=$(command -v ssh)
+DEK_TEST_PYTHON=$(command -v python3)
+export DEK_TEST_SHIM="$evidence/ssh.py" DEK_TEST_WIRE="$evidence/protocol.jsonl"
+mkdir -- "$evidence/bin" "$evidence/repo"
+cat > "$evidence/bin/ssh" <<'SH'
+#!/bin/sh
+exec "$DEK_TEST_PYTHON" "$DEK_TEST_SHIM" "$@"
+SH
+chmod 0700 -- "$evidence/bin/ssh"
+cat > "$evidence/ssh.py" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+args = sys.argv[1:]
+command = [os.environ["DEK_TEST_REAL_SSH"], "-F", os.environ["DEK_TEST_SSH_CONFIG"], *args]
+if args[0] == "-tt":
+    assert args[-1].startswith("dek __target-terminal ")
+    os.execv(command[0], command)
+assert args[0] == "-T" and args[-1] == "dek __target-stdio", args
+with subprocess.Popen(command, stdout=subprocess.PIPE) as session:
+    for line in session.stdout:
+        with open(os.environ["DEK_TEST_WIRE"], "ab") as log:
+            log.write(line)
+        frame = json.loads(line)
+        result = frame.get("response", {}).get("result")
+        if os.environ.get("DEK_TEST_DROP_FINAL") and isinstance(result, dict) and "executionFinished" in result:
+            session.kill()
+            session.wait(timeout=10)
+            sys.exit(255)
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
+    code = session.wait()
+    sys.exit(code if code >= 0 else 128 - code)
+PY
+
+repo=$evidence/repo
+jq -n --arg a "$a_id" --arg b "$b_id" '{
+  schemaVersion: 1,
+  hosts: ((["package", "recovery", "slow-a", "slow-b", "tty"] | map({
+    key: ., value: {entry: (. + ".json"), target: {ssh: "dek-a"}, targetId: $a}
+  }) | from_entries) + {other: {entry: "package.json", target: {ssh: "dek-b"}, targetId: $b}}),
+  modules: {"lab.probe": {schema: "options.json", expand: "expand.rb", inputs: "sdk"}}
+}' > "$repo/dek.json"
+cat > "$repo/options.json" <<'JSON'
+{"options": [
+    {"path":"lab.probe.enable", "type":"boolean", "default":true, "description":"fixture"},
+    {"path":"lab.probe.path", "type":"string", "description":"fixture file"},
+    {"path":"lab.probe.notify", "type":"boolean", "default":false, "description":"fixture notice"}
+]}
+JSON
+cat > "$repo/expand.rb" <<'RUBY'
+path = option('lab.probe.path')
+if path
+  notice = {unit: {scope: 'system', name: 'probe.service'}, when: 'contentChanged', effect: 'reload'}
+  file_resource path, content: 'reviewed', notifications: option('lab.probe.notify') ? [notice] : []
+else
+  { resources: [] }
+end
+RUBY
+for package in replay-probe terminal-probe; do
+    name=package
+    if [[ "$package" == terminal-probe ]]; then name=tty; fi
+    jq -n --arg package "$package" '{
+        schemaVersion: 1, imports: [],
+        options: [{path: "environment.systemPackages", value: [$package]}]
+    }' > "$repo/$name.json"
+done
+for name in recovery slow-a slow-b; do
+    jq -n --arg path "$guest_data/$name" --arg name "$name" '{
+        schemaVersion: 1, imports: [],
+        options: [{path: "lab.probe.path", value: $path}, {path: "lab.probe.notify", value: ($name == "recovery")}]
+    }' > "$repo/$name.json"
+done
+
+export XDG_CACHE_HOME="$evidence/cache" PATH="$evidence/bin:$PATH"
+call() {
+    "$manager" --repo "$repo" -H "$@"
+}
+run_id() {
+    awk '$1 == "run_id" { print $2 }' "$1"
+}
+review() {
+    call "$1" plan --json > "$evidence/$1-plan.json"
+    jq -er .plan_id "$evidence/$1-plan.json"
+}
+
+package_plan=$(review package)
+if DEK_TEST_DROP_FINAL=1 call package apply --plan "$package_plan" --request-id replay-1 \
+    > "$evidence/lost.stdout" 2> "$evidence/lost.stderr"; then
+    printf 'Expected loss of final response\n' >&2
+    exit 1
+fi
+package_run=$(run_id "$evidence/lost.stdout")
+[[ -n "$package_run" ]]
+grep -Fq "$package_run" "$evidence/lost.stderr"
+call package status --run "$package_run" --json > "$evidence/durable.json"
+call package apply --plan "$package_plan" --request-id replay-1 > "$evidence/replayed.stdout"
+[[ "$(run_id "$evidence/replayed.stdout")" == "$package_run" ]]
+jq -e '.finished and .actions[0].attempt == 1 and .actions[0].result.verified.changed' \
+    "$evidence/durable.json" >/dev/null
+if call other apply --plan "$package_plan" --request-id replay-1 \
+    > "$evidence/wrong-target.stdout" 2> "$evidence/wrong-target.stderr"; then
+    printf 'A plan from another target was accepted\n' >&2
+    exit 1
+fi
+! grep -q '^run_id ' "$evidence/wrong-target.stdout"
+
+recovery_plan=$(review recovery)
+"$vm" ssh "$a" touch "$guest_data/interrupt" "$guest_data/fail-notice"
+if call recovery apply --plan "$recovery_plan" --request-id resume-1 \
+    > "$evidence/interrupted.stdout" 2> "$evidence/interrupted.stderr"; then
+    printf 'Expected interruption before the action receipt\n' >&2
+    exit 1
+fi
+recovery_run=$(run_id "$evidence/interrupted.stdout")
+[[ -n "$recovery_run" ]]
+call recovery status --json > "$evidence/unverified.json"
+jq -e --arg run "$recovery_run" '.run_id == $run and (.finished | not)
+    and .actions[0].result == "unverified" and .actions[1].result == "pending"' \
+    "$evidence/unverified.json" >/dev/null
+"$vm" ssh "$a" rm "$guest_data/interrupt"
+if call recovery apply --run "$recovery_run" > "$evidence/fail-notice.stdout" 2> "$evidence/fail-notice.stderr"; then
+    printf 'Expected test service failure\n' >&2
+    exit 1
+fi
+grep -Fq '远端测试服务首次失败' "$evidence/fail-notice.stderr"
+call recovery status --run "$recovery_run" --json > "$evidence/pending.json"
+jq -e '.actions[0].attempt == 1 and .actions[0].result.verified.changed
+    and (.actions[1].result.failed | has("notificationJobFailed"))
+    and (.pending_notifications | length == 1)' "$evidence/pending.json" >/dev/null
+call recovery apply > "$evidence/resumed.stdout"
+[[ "$(run_id "$evidence/resumed.stdout")" == "$recovery_run" ]]
+call recovery status --run "$recovery_run" --json > "$evidence/resumed.json"
+jq -e '.finished and .actions[0].attempt == 1 and .actions[1].attempt == 2
+    and (.pending_notifications | length == 0)' "$evidence/resumed.json" >/dev/null
+
+slow_a_plan=$(review slow-a)
+slow_b_plan=$(review slow-b)
+call slow-a apply --plan "$slow_a_plan" > "$evidence/slow-a.stdout" 2> "$evidence/slow-a.stderr" &
+first=$!
+call slow-b apply --plan "$slow_b_plan" > "$evidence/slow-b.stdout" 2> "$evidence/slow-b.stderr" &
+second=$!
+wait "$first"
+wait "$second"
+
+tty_plan=$(review tty)
+"$vm" ssh "$a" "cat > $guest_data/terminal-helper && chmod 0700 $guest_data/terminal-helper" <<'SH'
+#!/bin/sh
+set -eu
+test -t 0 && test -t 1 && test -t 2
+test "$(id -u)" -ne 0
+printf 'DEK fixture prompt: '
+IFS= read -r reply < /dev/tty
+test "$reply" = 'one confirmation'
+sudo -n /usr/bin/true
+printf 'DEK fixture accepted\n'
+SH
+if call tty apply --plan "$tty_plan" --request-id tty-1 \
+    > "$evidence/no-tty.stdout" 2> "$evidence/no-tty.stderr"; then
+    printf 'Expected the command to request an interactive terminal\n' >&2
+    exit 1
+fi
+grep -Fq -- '--interactive' "$evidence/no-tty.stderr"
+tty_run=$(run_id "$evidence/no-tty.stdout")
+call tty status --run "$tty_run" --json > "$evidence/waiting-for-tty.json"
+jq -e '(.finished | not) and .actions[0].attempt == 0 and .actions[0].result == "pending"'     "$evidence/waiting-for-tty.json" >/dev/null
+python3 - "$manager" "$repo" "$tty_run" "$evidence" <<'PY'
+import errno
+import os
+import pty
+import select
+import sys
+import time
+from pathlib import Path
+
+manager, repo, run, evidence = sys.argv[1:]
+evidence = Path(evidence)
+pid, terminal = pty.fork()
+if pid == 0:
+    with (evidence / "tty.stdout").open("wb") as output:
+        os.dup2(output.fileno(), 1)
+    os.execv(manager, [manager, "--repo", repo, "-H", "tty", "apply", "--run", run, "--interactive"])
+log = bytearray()
+sent = False
+deadline = time.monotonic() + 45
+try:
+    while time.monotonic() < deadline:
+        if not select.select([terminal], [], [], 1)[0]:
+            continue
+        try:
+            data = os.read(terminal, 4096)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not data:
+            break
+        log.extend(data)
+        if not sent and b"DEK fixture prompt:" in log:
+            os.write(terminal, b"one confirmation\n")
+            sent = True
+    else:
+        os.kill(pid, 9)
+        raise AssertionError("terminal attachment timed out")
+finally:
+    os.close(terminal)
+    _, status = os.waitpid(pid, 0)
+    (evidence / "tty.log").write_bytes(log)
+assert status == 0 and sent and b"DEK fixture accepted" in log, log
+PY
+[[ "$(run_id "$evidence/tty.stdout")" == "$tty_run" ]]
+call tty status --json > "$evidence/tty.json"
+jq -e '.finished and .actions[0].attempt == 1' "$evidence/tty.json" >/dev/null
+! grep -Fq 'DEK fixture' "$evidence/protocol.jsonl"
+! grep -Fq 'DEK fixture' "$evidence/tty.stdout"
+jq -es 'any(.[]; .event.event.terminalRequired.token | strings | test("^[0-9a-f]{32}$"))' \
+    "$evidence/protocol.jsonl" >/dev/null
+
+"$vm" ssh "$a" cat "$guest_data/events" > "$evidence/actions.log"
+python3 - "$evidence/actions.log" "$guest_data" <<'PY'
+import sys
+from pathlib import Path
+
+events = Path(sys.argv[1]).read_text().splitlines()
+root = sys.argv[2]
+assert events.count("install replay-probe") == 1, events
+assert events.count(f"write {root}/recovery") == 1, events
+assert events.count("notify probe.service") == 2, events
+assert events.index(f"verify {root}/recovery") < events.index("notify probe.service"), events
+critical = [event.split(" ", 1) for event in events if "/slow-" in event and event.startswith(("begin ", "end "))]
+assert [operation for operation, _ in critical] == ["begin", "end", "begin", "end"], critical
+assert critical[0][1] == critical[1][1] and critical[2][1] == critical[3][1], critical
+PY
+"$vm" finish "$a" passed
+"$vm" finish "$b" passed
+printf 'Replay, recovery, execution serialization and isolated terminal passed.\n'

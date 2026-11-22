@@ -7,18 +7,13 @@ use std::{
     path::Path,
 };
 
-use dek_controller::{
-    eval::TargetProvider,
-    repo::{HostSelector, Repository, Target},
-};
-use dek_core::{
-    InputKind, InputObservation, Observation, Plan, RepositoryTransactionScope,
-    protocol::{EVALUATOR_PROTOCOL_VERSION, TargetQuery, TargetQueryKind},
-};
+use dek_controller::repo::{HostSelector, Repository, Target};
+use dek_core::{ActionResult, Plan, RepositoryTransactionScope, RunAction};
 use dek_target::{
     backend::BackendRegistry,
     executor::{ExecutionOutcome, ExecutionRequest, Executor, LoadedPlan, load_plan_for_execution},
-    state::{ActionResult, PlanBinding, StateError, StateGuard, StateStore},
+    inputs::reobserve,
+    state::{PlanBinding, StateError, StateGuard, StateStore},
 };
 
 use crate::{
@@ -90,7 +85,6 @@ pub fn apply_local_with_loader(
     };
 
     let executor = Executor::new(&store, registry);
-    let mut provider = LocalEvaluationTarget(registry);
     let started = |id: &str| {
         if resume.is_some() {
             writeln!(out, "恢复已审阅的执行 {id}")?;
@@ -99,25 +93,14 @@ pub fn apply_local_with_loader(
         out.flush()
     };
     let outcome = if let Some(id) = &resume {
-        executor.resume(binding, id, |input| observe(&mut provider, input), started)?
+        executor.resume(binding, id, |input| reobserve(registry, input), started)?
     } else {
         let current;
         let plan_id = match selection.plan {
             Some(id) => id,
             None => {
                 current = create_plan()?;
-                if current.repository_transaction().is_some_and(|transaction| {
-                    transaction.scope == RepositoryTransactionScope::Upgrade
-                }) {
-                    write_plan(&mut *out, name, &current, false)?;
-                    writeln!(
-                        out,
-                        "请审阅升级计划并运行 dek apply -H {name} --plan {}",
-                        current.id
-                    )?;
-                    out.flush()?;
-                    return Err(format!("等待审阅计划 {}", current.id).into());
-                }
+                require_explicit_upgrade(out, name, &current)?;
                 &current.id
             }
         };
@@ -126,9 +109,7 @@ pub fn apply_local_with_loader(
             Some(id) if id.trim().is_empty() => return Err("请求标识不能为空".into()),
             Some(id) => id,
             None => {
-                let mut nonce = [0; 16];
-                File::open("/dev/urandom")?.read_exact(&mut nonce)?;
-                generated = format!("{:032x}", u128::from_ne_bytes(nonce));
+                generated = new_request_id()?;
                 &generated
             }
         };
@@ -138,31 +119,14 @@ pub fn apply_local_with_loader(
                 plan_id,
                 request_id,
             },
-            |input| observe(&mut provider, input),
+            |input| reobserve(registry, input),
             started,
             load,
         )?
     };
 
     match outcome {
-        ExecutionOutcome::Finished(run) => {
-            let changes = run
-                .actions
-                .iter()
-                .filter(|action| action.result == ActionResult::Verified { changed: true })
-                .count();
-            let deferred = run
-                .actions
-                .iter()
-                .filter(|action| matches!(action.result, ActionResult::Deferred { .. }))
-                .count();
-            if deferred == 0 {
-                writeln!(out, "已核验完成，实际变更 {changes} 项")?;
-            } else {
-                writeln!(out, "实际变更 {changes} 项，待激活 {deferred} 项")?;
-            }
-            Ok(())
-        }
+        ExecutionOutcome::Finished(run) => write_finished(out, &run.actions),
         ExecutionOutcome::ReviewRequired {
             reason,
             replacement,
@@ -199,24 +163,49 @@ fn create_plan(
     )?)
 }
 
-fn observe(
-    provider: &mut LocalEvaluationTarget<'_, '_>,
-    input: &InputObservation,
-) -> Result<Observation, String> {
-    let kind = match input.kind {
-        InputKind::TargetFact => TargetQueryKind::Fact,
-        InputKind::TargetCapability => TargetQueryKind::Capability,
-        InputKind::TargetFile => TargetQueryKind::ReadText,
-        _ => return Err("已审阅计划包含非目标端输入".into()),
-    };
-    provider
-        .query(&TargetQuery {
-            protocol_version: EVALUATOR_PROTOCOL_VERSION,
-            parent_id: "apply".into(),
-            id: "recheck".into(),
-            kind,
-            key: input.id.clone(),
-            origin: input.origin.clone(),
-        })
-        .map(|answer| answer.observation)
+pub(crate) fn new_request_id() -> std::io::Result<String> {
+    let mut nonce = [0; 16];
+    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    Ok(format!("{:032x}", u128::from_ne_bytes(nonce)))
+}
+
+pub(crate) fn write_finished(
+    mut out: impl Write,
+    actions: &[RunAction],
+) -> Result<(), Box<dyn Error>> {
+    let changes = actions
+        .iter()
+        .filter(|action| action.result == ActionResult::Verified { changed: true })
+        .count();
+    let deferred = actions
+        .iter()
+        .filter(|action| matches!(action.result, ActionResult::Deferred { .. }))
+        .count();
+    if deferred == 0 {
+        writeln!(out, "已核验完成，实际变更 {changes} 项")?;
+    } else {
+        writeln!(out, "实际变更 {changes} 项，待激活 {deferred} 项")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn require_explicit_upgrade(
+    mut out: impl Write,
+    name: &str,
+    plan: &Plan,
+) -> Result<(), Box<dyn Error>> {
+    if plan
+        .repository_transaction()
+        .is_some_and(|transaction| transaction.scope == RepositoryTransactionScope::Upgrade)
+    {
+        write_plan(&mut out, name, plan, false)?;
+        writeln!(
+            out,
+            "请审阅升级计划并运行 dek apply -H {name} --plan {}",
+            plan.id
+        )?;
+        out.flush()?;
+        return Err(format!("等待审阅计划 {}", plan.id).into());
+    }
+    Ok(())
 }

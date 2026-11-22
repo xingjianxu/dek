@@ -9,6 +9,8 @@ pub mod plan_output;
 pub mod planning;
 
 mod refresh;
+#[cfg(target_os = "linux")]
+mod remote_execution;
 mod repository;
 mod show;
 #[cfg(target_os = "linux")]

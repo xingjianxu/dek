@@ -6,6 +6,7 @@ mod plan;
 pub use inputs::{RemoteTarget, TargetInputSnapshot};
 
 use std::{
+    fs::OpenOptions,
     io::{self, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
 };
@@ -13,13 +14,14 @@ use std::{
 use dek_core::{
     TargetCapabilities,
     target_protocol::{
-        ClientFrame, ServerFrame, TARGET_PROTOCOL_VERSION, TargetRequest, TargetResult, read_frame,
-        write_frame,
+        ClientFrame, ServerFrame, TARGET_PROTOCOL_VERSION, TargetEvent, TargetRequest,
+        TargetResult, read_frame, write_frame,
     },
 };
 use thiserror::Error;
 
 const REMOTE_COMMAND: &str = "dek __target-stdio";
+const TERMINAL_COMMAND: &str = "dek __target-terminal";
 const HANDSHAKE: &str = "握手";
 const REQUEST: &str = "请求";
 
@@ -85,7 +87,7 @@ impl SshSession {
             ServerFrame::Incompatible { versions } => {
                 return Err(error(SshErrorKind::Version { remote: versions }));
             }
-            ServerFrame::Response { .. } => {
+            ServerFrame::Response { .. } | ServerFrame::Event { .. } => {
                 return Err(error(invalid("expected a target protocol hello")));
             }
         };
@@ -109,14 +111,28 @@ impl SshSession {
     }
 
     pub fn request(&mut self, operation: TargetRequest) -> Result<TargetResult, SshError> {
-        let result = self.exchange(operation);
+        self.request_with_events(operation, |_| {
+            Err(invalid("unexpected target protocol event"))
+        })
+    }
+
+    pub fn request_with_events(
+        &mut self,
+        operation: TargetRequest,
+        on_event: impl FnMut(TargetEvent) -> Result<(), SshErrorKind>,
+    ) -> Result<TargetResult, SshError> {
+        let result = self.exchange(operation, on_event);
         if result.is_err() {
             self.process.take();
         }
         result.map_err(|kind| ssh_error(&self.alias, REQUEST, kind))
     }
 
-    fn exchange(&mut self, operation: TargetRequest) -> Result<TargetResult, SshErrorKind> {
+    fn exchange(
+        &mut self,
+        operation: TargetRequest,
+        mut on_event: impl FnMut(TargetEvent) -> Result<(), SshErrorKind>,
+    ) -> Result<TargetResult, SshErrorKind> {
         let process = self
             .process
             .as_mut()
@@ -127,12 +143,15 @@ impl SshSession {
             .ok_or_else(|| invalid("target protocol request ID overflow"))?;
         self.last_id = id;
         process.write(&ClientFrame::Request { id, operation })?;
-        match process.read()? {
-            ServerFrame::Response { id: reply, result } if id == reply => Ok(result),
-            ServerFrame::Response { .. } => {
-                Err(invalid("target protocol response ID did not match"))
+        loop {
+            match process.read()? {
+                ServerFrame::Response { id: reply, result } if id == reply => return Ok(result),
+                ServerFrame::Event { id: reply, event } if id == reply => on_event(event)?,
+                ServerFrame::Response { .. } | ServerFrame::Event { .. } => {
+                    return Err(invalid("target protocol response ID did not match"));
+                }
+                _ => return Err(invalid("expected a target protocol response")),
             }
-            _ => Err(invalid("expected a target protocol response")),
         }
     }
 
@@ -146,6 +165,48 @@ impl SshSession {
     }
 }
 
+/// Attach the user's controlling terminal directly to a previously bound target helper.
+pub fn attach_terminal(alias: &str, token: &str) -> Result<(), SshErrorKind> {
+    if !dek_core::target_protocol::valid_terminal_token(token) {
+        return Err(invalid("invalid target terminal token"));
+    }
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|error| SshErrorKind::Target(format!("无法打开管理机终端：{error}")))?;
+    let output = tty.try_clone().map_err(SshErrorKind::Io)?;
+    let diagnostic = tty.try_clone().map_err(SshErrorKind::Io)?;
+    let status = ssh_command("-tt", alias)
+        .arg(format!("{TERMINAL_COMMAND} {token}"))
+        .stdin(Stdio::from(tty))
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::from(diagnostic))
+        .status()
+        .map_err(SshErrorKind::Spawn)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(exit_error(status))
+    }
+}
+
+fn ssh_command(tty: &str, alias: &str) -> Command {
+    let mut command = Command::new("ssh");
+    command.args([
+        tty,
+        "-S",
+        "none",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "--",
+        alias,
+    ]);
+    command
+}
+
 struct SshProcess {
     child: Child,
     input: Option<ChildStdin>,
@@ -154,19 +215,8 @@ struct SshProcess {
 
 impl SshProcess {
     fn connect(alias: &str) -> Result<Self, SshErrorKind> {
-        let mut child = Command::new("ssh")
-            .args([
-                "-T",
-                "-S",
-                "none",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "--",
-                alias,
-                REMOTE_COMMAND,
-            ])
+        let mut child = ssh_command("-T", alias)
+            .arg(REMOTE_COMMAND)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
