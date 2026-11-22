@@ -71,6 +71,33 @@ pub fn plan(
     resources: &ResourceSet,
     used_inputs: &[InputObservation],
 ) -> Result<Plan, PlanError> {
+    plan_with_host(registry, repository_id, None, resources, used_inputs)
+}
+
+/// Build a reviewed plan whose ID also binds the exact repository host name.
+pub fn plan_for_host(
+    registry: &BackendRegistry<'_>,
+    repository_id: &str,
+    logical_host: &str,
+    resources: &ResourceSet,
+    used_inputs: &[InputObservation],
+) -> Result<Plan, PlanError> {
+    plan_with_host(
+        registry,
+        repository_id,
+        Some(logical_host),
+        resources,
+        used_inputs,
+    )
+}
+
+fn plan_with_host(
+    registry: &BackendRegistry<'_>,
+    repository_id: &str,
+    logical_host: Option<&str>,
+    resources: &ResourceSet,
+    used_inputs: &[InputObservation],
+) -> Result<Plan, PlanError> {
     let (prepared, used_capabilities) = prepare(registry, resources)?;
     let order = topological_order(registry, &prepared)?;
     let mut actions = Actions::default();
@@ -124,20 +151,44 @@ pub fn plan(
     }
 
     let actions = actions.finish(registry)?;
-    let digest = Sha256::digest(serde_json::to_vec(resources)?);
     let mut reviewed = Plan {
         format_version: PlanVersion::V1,
         id: String::new(),
         repository_id: repository_id.into(),
         target: registry.target().clone(),
-        resource_digest: ContentDigest(format!("sha256:{digest:x}")),
+        resource_digest: resource_digest(resources)?,
         used_capabilities,
         used_inputs: used_inputs.to_vec(),
         actions,
     };
-    let digest = Sha256::digest(serde_json::to_vec(&reviewed)?);
-    reviewed.id = format!("{digest:x}");
+    reviewed.id = plan_id(&reviewed, logical_host)?;
     Ok(reviewed)
+}
+
+pub(crate) fn resource_digest(resources: &ResourceSet) -> Result<ContentDigest, serde_json::Error> {
+    let digest = Sha256::digest(serde_json::to_vec(resources)?);
+    Ok(ContentDigest(format!("sha256:{digest:x}")))
+}
+
+pub(crate) fn plan_id(
+    plan: &Plan,
+    logical_host: Option<&str>,
+) -> Result<String, serde_json::Error> {
+    let blank;
+    let plan = if plan.id.is_empty() {
+        plan
+    } else {
+        blank = Plan {
+            id: String::new(),
+            ..plan.clone()
+        };
+        &blank
+    };
+    let data = match logical_host {
+        Some(host) => serde_json::to_vec(&("dek-reviewed-plan-v1", host, plan))?,
+        None => serde_json::to_vec(plan)?,
+    };
+    Ok(format!("{:x}", Sha256::digest(data)))
 }
 
 /// Recheck the target binding and exactly the capabilities recorded by the plan.

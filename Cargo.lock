@@ -177,6 +177,7 @@ dependencies = [
  "dek-target",
  "hostname",
  "libc",
+ "rmp-serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -220,8 +221,12 @@ name = "dek-target"
 version = "0.1.0"
 dependencies = [
  "dek-core",
+ "rmp-serde",
+ "rustix",
+ "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 

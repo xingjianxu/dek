@@ -233,6 +233,8 @@ fn run_plan_with_memory_target() {
     }
 
     let mut out = Vec::new();
+    #[cfg(target_os = "linux")]
+    let state = root.join("target-state");
     dek_cli::command::run(
         [
             "dek",
@@ -242,6 +244,10 @@ fn run_plan_with_memory_target() {
             "--json",
             "--repo",
             repo.to_str().unwrap(),
+            #[cfg(target_os = "linux")]
+            "--state-dir",
+            #[cfg(target_os = "linux")]
+            state.to_str().unwrap(),
         ],
         &mut out,
         || Ok(memory.registry()),

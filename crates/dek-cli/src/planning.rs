@@ -9,7 +9,7 @@ use dek_controller::{
     repo::{HostSelector, Repository, Target},
 };
 use dek_core::{HostConfig, InputKind, Plan};
-use dek_target::{backend::BackendRegistry, planner::plan};
+use dek_target::{backend::BackendRegistry, planner::plan_for_host};
 
 use crate::evaluation::{evaluate_options, expand_host};
 
@@ -70,7 +70,13 @@ pub fn plan_host_with_cache(
     }
     let repository_id =
         CacheDigest::of_bytes(repo.root().as_os_str().as_encoded_bytes()).to_string();
-    let plan = plan(registry, &repository_id, &expanded.resources, &used_inputs)?;
+    let plan = plan_for_host(
+        registry,
+        &repository_id,
+        name,
+        &expanded.resources,
+        &used_inputs,
+    )?;
     Ok(PlannedHost {
         name: name.into(),
         config: evaluated.config,

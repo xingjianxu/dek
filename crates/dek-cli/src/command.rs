@@ -77,6 +77,10 @@ enum Command {
     TargetStdio,
     /// 观测本机目标并预览配置差异。
     Plan {
+        /// 使用指定的私有目标状态目录。默认 /var/lib/dek。
+        #[cfg(target_os = "linux")]
+        #[arg(long, value_name = "目录")]
+        state_dir: Option<PathBuf>,
         /// 输出 JSON。
         #[arg(long)]
         json: bool,
@@ -165,7 +169,11 @@ pub fn run<'target>(
             }
             dek_target::transport::serve(&local_target()?, &mut io::stdin().lock(), &mut out)?;
         }
-        Command::Plan { json } => {
+        Command::Plan {
+            json,
+            #[cfg(target_os = "linux")]
+            state_dir,
+        } => {
             let repo = discover_repo(cli.repo.as_deref())?;
             let selection = HostSelection::from_arg(cli.host)?;
             let registry = local_target()?;
@@ -178,6 +186,23 @@ pub fn run<'target>(
                 &mut provider,
                 cache.as_ref(),
             )?;
+            #[cfg(target_os = "linux")]
+            {
+                use dek_target::state::{DEFAULT_ROOT, StateStore};
+
+                let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
+                let store = StateStore::open(&state_dir).map_err(|err| {
+                    format!(
+                        "{err}。请使用持有目标状态目录的账户，或用 --state-dir 指定该账户的私有目录"
+                    )
+                })?;
+                store.lock()?.save_plan(
+                    &planned.name,
+                    &planned.plan,
+                    &planned.expanded.resources,
+                    &planned.expanded.contents,
+                )?;
+            }
             write_plan(&mut out, &planned.name, &planned.plan, json)?;
         }
     }

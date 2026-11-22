@@ -12,15 +12,19 @@ mod http_server;
 use http_server::Server;
 
 fn run(root: &Path, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_dek"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dek"));
+    command
         .arg("--repo")
         .arg(root)
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("NO_PROXY", "127.0.0.1")
         .env("no_proxy", "127.0.0.1")
-        .args(arguments)
-        .output()
-        .unwrap()
+        .args(arguments);
+    #[cfg(target_os = "linux")]
+    if arguments.first() == Some(&"plan") {
+        command.arg("--state-dir").arg(root.join("target-state"));
+    }
+    command.output().unwrap()
 }
 
 fn success(output: Output) -> String {
