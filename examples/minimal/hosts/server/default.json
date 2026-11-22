@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "imports": ["base"],
+  "options": [
+    { "path": "services.caddy.enable", "value": true },
+    { "path": "services.caddy.configFile", "value": "./Caddyfile" }
+  ]
+}

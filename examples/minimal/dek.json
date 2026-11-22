@@ -4,6 +4,10 @@
     "demo": {
       "entry": "hosts/demo/default.json",
       "target": { "local": true }
+    },
+    "server": {
+      "entry": "hosts/server/default.json",
+      "target": { "local": true }
     }
   },
   "profiles": { "base": "profiles/base.json" },
