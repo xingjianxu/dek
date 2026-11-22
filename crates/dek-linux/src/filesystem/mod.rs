@@ -1,8 +1,10 @@
-//! Observe and atomically publish Linux regular-file resources.
+//! Manage Linux regular-file and directory resources.
 
 pub(crate) mod atomic_file;
+mod directory;
 mod validation;
 
+pub use directory::DirectoryBackend;
 pub use validation::{FileValidationGroup, ValidationInput};
 
 use std::{
@@ -54,15 +56,7 @@ impl Backend for FileBackend {
         normalize(&file.path)?;
         if let FileState::Present(content) = &file.state {
             let attributes = &content.attributes;
-            mode(attributes.mode.as_deref())?;
-            for name in [attributes.owner.as_deref(), attributes.group.as_deref()]
-                .into_iter()
-                .flatten()
-            {
-                if name.is_empty() || name.contains('\0') {
-                    return Err(BackendError(format!("无效的账户或组名 {name:?}")));
-                }
-            }
+            validate_attributes(attributes)?;
         }
         Ok(())
     }
@@ -242,6 +236,19 @@ fn normalize(raw: &str) -> Result<PathBuf, BackendError> {
 
 fn path_error(path: &str, err: io::Error) -> BackendError {
     BackendError(format!("无法访问目标文件 {path:?}：{err}"))
+}
+
+fn validate_attributes(attributes: &FileAttributes) -> Result<(), BackendError> {
+    mode(attributes.mode.as_deref())?;
+    for name in [attributes.owner.as_deref(), attributes.group.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if name.is_empty() || name.contains('\0') {
+            return Err(BackendError(format!("无效的账户或组名 {name:?}")));
+        }
+    }
+    Ok(())
 }
 
 fn mode(mode: Option<&str>) -> Result<Option<u32>, BackendError> {
