@@ -322,6 +322,8 @@ fn package_created_configuration_is_returned_for_review_after_the_transaction_is
     );
     let run = store.lock().unwrap().latest_run(binding).unwrap().unwrap();
     assert_eq!(run.plan_id, old.id);
+    assert!(run.finished);
+    assert_eq!(run.replacement_plan_id.as_deref(), Some(new.id.as_str()));
     assert_eq!(
         run.actions[0].result,
         ActionResult::Verified { changed: true }
@@ -330,7 +332,9 @@ fn package_created_configuration_is_returned_for_review_after_the_transaction_is
     assert_eq!(target.config_writes.get(), 0);
     assert_eq!(target.content.get(), GENERATED);
 
-    let retry = apply(&Executor::new(&store, &registry), binding, &old, |_| {});
+    let retry = apply(&Executor::new(&store, &registry), binding, &old, |id| {
+        assert_eq!(id, run.id)
+    });
     assert!(
         matches!(retry, ExecutionOutcome::ReviewRequired { replacement: Some(plan), .. } if plan.id == new.id)
     );

@@ -139,6 +139,7 @@ fn execute(
         } => TargetResult::ReviewRequired {
             reason: reason.to_string(),
             replacement,
+            mode: reason.replan_mode(),
         },
     })
 }

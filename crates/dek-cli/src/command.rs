@@ -453,7 +453,20 @@ fn run_command<'target>(
                         PlanMode::Upgrade,
                     )?;
                     session.finish()?;
-                    crate::upgrading::confirm(&mut out, name, &review.plan, false)?;
+                    if crate::upgrading::confirm(&mut out, name, &review.plan, interactive)? {
+                        crate::remote_execution::apply_remote(
+                            &mut out,
+                            &repo,
+                            name,
+                            alias,
+                            expected,
+                            crate::applying::ApplySelection {
+                                plan: Some(&review.plan.id),
+                                ..crate::applying::ApplySelection::default()
+                            },
+                            true,
+                        )?;
+                    }
                 }
             }
         }

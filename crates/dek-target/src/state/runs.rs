@@ -29,6 +29,8 @@ pub struct RunRecord {
     pub actions: Vec<RunAction>,
     pub pending_notifications: Vec<RunNotification>,
     pub finished: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_plan_id: Option<String>,
 }
 
 impl RunRecord {
@@ -43,6 +45,7 @@ impl RunRecord {
             actions: self.actions,
             pending_notifications: self.pending_notifications,
             finished: self.finished,
+            replacement_plan_id: self.replacement_plan_id,
         }
     }
 
@@ -137,6 +140,7 @@ impl StateGuard<'_> {
                 .collect(),
             pending_notifications: Vec::new(),
             finished: false,
+            replacement_plan_id: None,
         };
         let bytes = encode(&run, &runs)?;
         runs.publish(&name, &bytes)?;
@@ -438,6 +442,33 @@ impl StateGuard<'_> {
         replace_run(&runs, &run)
     }
 
+    /// Retain the verified package receipt and stop the superseded run from
+    /// applying configuration that now requires another review.
+    pub(crate) fn finish_upgrade_for_review(
+        &self,
+        id: &str,
+        binding: PlanBinding<'_>,
+        plan_id: &str,
+    ) -> Result<(), StateError> {
+        let runs = self.runs_directory()?;
+        let mut run = bound_run(&runs, id, binding)?;
+        if !run.pending_notifications.is_empty() {
+            // Notifications from an earlier configuration attempt stay recoverable.
+            return Ok(());
+        }
+        let upgraded = run.actions.first().is_some_and(|item| {
+            matches!(&item.action.kind, ActionKind::RepositoryTransaction(transaction)
+                if transaction.scope == dek_core::RepositoryTransactionScope::Upgrade)
+                && matches!(item.result, ActionResult::Verified { .. })
+        });
+        if run.finished || !upgraded || run.plan_id == plan_id || !valid_hash(plan_id) {
+            return Err(StateError::invalid(&runs.path, "无效的升级后续审阅记录"));
+        }
+        run.replacement_plan_id = Some(plan_id.into());
+        run.finished = true;
+        replace_run(&runs, &run)
+    }
+
     pub(super) fn active_runs(&self) -> Result<Vec<RunRecord>, StateError> {
         let mut active = Vec::new();
         let Some(runs) = self.store.root.existing_private_child("runs")? else {
@@ -492,6 +523,10 @@ fn read_run(runs: &Directory, name: &str) -> Result<Option<RunRecord>, StateErro
     if cursor.position() != bytes.len() as u64
         || record.format_version != RUN_FORMAT_VERSION
         || !valid_hash(&record.plan_id)
+        || record
+            .replacement_plan_id
+            .as_ref()
+            .is_some_and(|id| !record.finished || !valid_hash(id) || id == &record.plan_id)
         || record.id != run_id(record.binding(), &record.request_id)
         || run_filename(runs, &record.id)? != name
     {

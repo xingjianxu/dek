@@ -59,7 +59,7 @@ pub(crate) fn write_status(
         return Ok(());
     };
     if json_output {
-        let document = json!({
+        let mut document = json!({
             "run_id": run.id,
             "plan_id": run.plan_id,
             "host": run.logical_host,
@@ -70,6 +70,9 @@ pub(crate) fn write_status(
             "actions": run.actions,
             "pending_notifications": run.pending_notifications,
         });
+        if let Some(id) = run.replacement_plan_id {
+            document["replacement_plan_id"] = json!(id);
+        }
         serde_json::to_writer_pretty(&mut out, &document)?;
         writeln!(out)?;
         return Ok(());
@@ -86,12 +89,16 @@ pub(crate) fn write_status(
     }
     writeln!(out, "执行 {}", run.id)?;
     writeln!(out, "计划 {}", run.plan_id)?;
+    if let Some(id) = &run.replacement_plan_id {
+        writeln!(out, "待审阅后续计划 {id}")?;
+    }
     for item in &run.actions {
         let label = match item.result {
             ActionResult::Verified { .. } => "已核验",
             ActionResult::Failed { .. } => "失败",
             ActionResult::Unverified => "结果待核验",
             ActionResult::Deferred { .. } => "待激活",
+            ActionResult::Pending if run.replacement_plan_id.is_some() => "等待重新审阅",
             ActionResult::Pending => "待执行",
         };
         let operation = match (&item.action.kind, item.selected_notification_effect) {

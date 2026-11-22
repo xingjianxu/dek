@@ -140,13 +140,14 @@ cmp "$base/b/fixture.db" /var/lib/pacman/sync/fixture.db
 [[ "$(cat "$base/drifted.conf")" == package-generated && ! -e "$base/pending.conf" ]]
 [[ "$(cat "$base/hook-commits")" == '3-1' ]]
 run_dek status --run "$run_id" --json > "$base/partial.json"
-python3 - "$base/partial.json" "$new" <<'PY'
+python3 - "$base/partial.json" "$new" "$followup" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 run = json.loads(Path(sys.argv[1]).read_bytes())
 assert run["plan_id"] == sys.argv[2]
+assert run["finished"] and run["replacement_plan_id"] == sys.argv[3]
 transaction, pending = run["actions"]
 assert transaction["action"]["kind"]["repositoryTransaction"]["scope"] == "upgrade"
 assert transaction["result"] == {"verified": {"changed": True}}

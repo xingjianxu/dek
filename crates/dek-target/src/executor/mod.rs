@@ -222,6 +222,19 @@ impl<'a, 'backend> Executor<'a, 'backend> {
     ) -> Result<ExecutionOutcome, ExecutionError> {
         if run.finished {
             started(&run.id).map_err(ExecutionError::Output)?;
+            if let Some(id) = &run.replacement_plan_id {
+                let replacement = self.store.lock()?.load_plan(id, binding);
+                return match replacement {
+                    Ok(review) => Ok(ExecutionOutcome::ReviewRequired {
+                        reason: ReviewReason::ScopeExpanded,
+                        replacement: Some(Box::new(review.plan)),
+                    }),
+                    Err(StateError::ExpiredPlan { mode, .. }) => {
+                        Ok(ExecutionOutcome::review(ReviewReason::Expired(mode)))
+                    }
+                    Err(error) => Err(error.into()),
+                };
+            }
             return Ok(ExecutionOutcome::Finished(Box::new(run)));
         }
         let reviewed = self.store.lock()?.load_run_plan(&run.id, binding)?;
@@ -296,13 +309,18 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             Application::Resume(run) => Some(run.as_ref()),
             Application::New { .. } => None,
         };
-        let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh, resumed)
-        else {
-            return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
+        let (live, conflict) = match match_scope(&reviewed.plan, &fresh, resumed) {
+            Scope::Reviewed { live, conflict } if upgrade.is_none() || conflict.is_none() => {
+                (live, conflict)
+            }
+            _ => {
+                if already_upgraded && let Some(run) = resumed {
+                    started(&run.id).map_err(ExecutionError::Output)?;
+                    return self.replacement_after_upgrade(binding, reviewed, &fresh, run);
+                }
+                return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
+            }
         };
-        if upgrade.is_some() && conflict.is_some() {
-            return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
-        }
         if let Application::Resume(run) = &application
             && run.actions.iter().any(|item| {
                 matches!(item.result, ActionResult::Verified { .. })
@@ -414,7 +432,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                 conflict: None,
             } = match_scope(&reviewed.plan, &fresh, Some(&run))
             else {
-                return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
+                return self.replacement_after_upgrade(binding, reviewed, &fresh, &run);
             };
             self.validate_batches(reviewed, &live)?;
             self.run_actions(&run, binding, reviewed, &live, None, None)?;
@@ -460,6 +478,27 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         )?;
         Ok(ExecutionOutcome::ReviewRequired {
             reason,
+            replacement: Some(Box::new(stored)),
+        })
+    }
+
+    fn replacement_after_upgrade(
+        &self,
+        binding: PlanBinding<'_>,
+        reviewed: &ReviewedPlan,
+        fresh: &Plan,
+        run: &RunRecord,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        let guard = self.store.lock()?;
+        let stored = guard.save_plan(
+            binding.logical_host,
+            fresh,
+            &reviewed.resources,
+            &reviewed.contents,
+        )?;
+        guard.finish_upgrade_for_review(&run.id, binding, &stored.id)?;
+        Ok(ExecutionOutcome::ReviewRequired {
+            reason: ReviewReason::ScopeExpanded,
             replacement: Some(Box::new(stored)),
         })
     }

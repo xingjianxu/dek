@@ -146,7 +146,11 @@ pub fn apply_local_with_loader(
                     reason.replan_mode(),
                 )?,
             };
-            writeln!(out, "{reason}。请审阅新计划后使用 dek apply --plan")?;
+            writeln!(
+                out,
+                "{reason}。请审阅新计划并运行 dek apply -H {name} --plan {}",
+                plan.id
+            )?;
             write_plan(&mut *out, name, &plan, false)?;
             out.flush()?;
             Err(format!("等待审阅计划 {}", plan.id).into())
