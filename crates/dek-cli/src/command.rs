@@ -169,6 +169,8 @@ fn run_command<'target>(
         dek_linux::secrets::SecretBackend::new(root)
     };
     #[cfg(target_os = "linux")]
+    let pacman = dek_linux::arch::PacmanBackend::default();
+    #[cfg(target_os = "linux")]
     let systemd = dek_linux::systemd::SystemdBackend;
     #[cfg(target_os = "linux")]
     let accounts = dek_linux::accounts::AccountBackend::default();
@@ -179,6 +181,9 @@ fn run_command<'target>(
         let mut registry = local_target()?;
         if _production {
             registry.register(&secrets)?;
+            if registry.target().distribution.as_deref() == Some("arch") && pacman.available() {
+                registry.register(&pacman)?;
+            }
             registry.register(&systemd)?;
             registry.register(&accounts)?;
             registry.register(&directories)?;

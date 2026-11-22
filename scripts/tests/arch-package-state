@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# != 5 ]]; then
+    printf 'Usage: %s IMAGE_ID DEK_BINARY RIPGREP_ARCHIVE TREE_ARCHIVE OLDER_TREE_ARCHIVE\n' "$0" >&2
+    exit 2
+fi
+
+scripts=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+binary=$(realpath -e -- "$2")
+run_root="${DEK_DEV_ROOT:-/data/dek-dev}/runs/38"
+mkdir -p -- "$run_root"
+evidence=$(mktemp -d "$run_root/package-acceptance.XXXXXXXX")
+printf 'Evidence %s\n' "$evidence"
+mkdir -- "$evidence/packages"
+
+stage_archive() {
+    local source=$1 name=$2
+    cp -- "$source" "$evidence/packages/$name.pkg.tar.zst"
+    cp -- "$source.sig" "$evidence/packages/$name.pkg.tar.zst.sig"
+}
+stage_archive "$3" ripgrep
+stage_archive "$4" tree
+stage_archive "$5" older-tree
+sha256sum -- "$evidence/packages/"* "$binary" | tee "$evidence/inputs.sha256"
+
+ruby=$(realpath -e -- "$(command -v ruby)")
+[[ "$ruby" == /nix/store/*/bin/ruby ]]
+ruby_root="${ruby%/bin/ruby}"
+nix-store -qR "$ruby_root" | sed 's#^/##' > "$evidence/ruby-paths"
+
+run=''
+cleanup() {
+    if [[ -n "$run" ]]; then
+        "$scripts/run-arch-vm" finish "$run" failed || true
+    fi
+}
+trap cleanup EXIT
+run=$("$scripts/run-arch-vm" start 38 "$1" "$binary")
+printf '%s\n' "$run" | tee "$evidence/run"
+grep -F 'restrict=on' "$run/qemu.command" > "$evidence/offline-network"
+remote=$("$scripts/run-arch-vm" ssh "$run" sha256sum /usr/local/bin/dek)
+local_digest=$(sha256sum -- "$binary")
+[[ "${remote%% *}" == "${local_digest%% *}" ]]
+
+tar -C / -cf - -T "$evidence/ruby-paths" | gzip -1 |
+    "$scripts/run-arch-vm" ssh "$run" sudo tar -xzpf - -C /
+tar -C "$evidence/packages" -cf - . |
+    "$scripts/run-arch-vm" ssh "$run" 'sudo mkdir -m 0755 /run/dek-package-fixture && sudo tar --no-same-owner -xf - -C /run/dek-package-fixture'
+"$scripts/run-arch-vm" ssh "$run" bash -s -- "$ruby_root/bin" \
+    < "$scripts/tests/arch-package-state-guest" 2>&1 | tee "$evidence/guest.log"
+"$scripts/run-arch-vm" finish "$run" passed
+run=''
