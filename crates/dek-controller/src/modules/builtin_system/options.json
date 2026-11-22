@@ -1,0 +1,22 @@
+{
+  "options": [
+    {"path":"users.users.<name>", "type":{"map":"any"}, "description":"Manage an account without specifying attributes"},
+    {"path":"users.users.<name>.isNormalUser", "type":"boolean", "description":"Select an ordinary account"},
+    {"path":"users.users.<name>.isSystemUser", "type":"boolean", "description":"Select a system account"},
+    {"path":"users.users.<name>.uid", "type":"integer", "description":"Explicit user ID"},
+    {"path":"users.users.<name>.group", "type":"string", "description":"Primary group"},
+    {"path":"users.users.<name>.extraGroups", "type":{"list":"string"}, "merge":"set", "description":"Additional group memberships"},
+    {"path":"users.users.<name>.home", "type":"string", "description":"Home directory on the target"},
+    {"path":"users.users.<name>.shell", "type":"string", "description":"Login shell on the target"},
+    {"path":"users.users.<name>.description", "type":"string", "description":"Account description"},
+    {"path":"users.groups.<name>", "type":{"map":"any"}, "description":"Manage a group without specifying a GID"},
+    {"path":"users.groups.<name>.gid", "type":"integer", "description":"Explicit group ID"},
+    {"path":"systemd.tmpfiles.settings.<config>", "type":{"map":{"map":{"map":"string"}}}, "merge":"map", "description":"Directory rules keyed by literal target path"},
+    {"path":"systemd.services", "type":{"map":{"map":"any"}}, "merge":"map", "description":"System service units by name"},
+    {"path":"systemd.timers", "type":{"map":{"map":"any"}}, "merge":"map", "description":"System timer units by name"},
+    {"path":"systemd.user.services", "type":{"map":{"map":"any"}}, "merge":"map", "description":"Global user service units by name"},
+    {"path":"systemd.user.timers", "type":{"map":{"map":"any"}}, "merge":"map", "description":"Global user timer units by name"},
+    {"path":"dek.users.<name>.systemd.services", "type":{"map":{"map":"any"}}, "merge":"map", "description":"Service units for one target account"},
+    {"path":"dek.users.<name>.systemd.timers", "type":{"map":{"map":"any"}}, "merge":"map", "description":"Timer units for one target account"}
+  ]
+}
