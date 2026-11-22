@@ -11,7 +11,7 @@ use dek_core::{
     target_protocol::{PlanRequest, RemotePlan, TargetRequest, TargetResult},
 };
 
-use crate::{backend::BackendRegistry, planner::plan_for_host_with_contents};
+use crate::{backend::BackendRegistry, planner::plan_for_host_with_contents_mode};
 
 use super::{PlanBinding, StateStore};
 
@@ -135,13 +135,14 @@ impl<'a> PlanSession<'a> {
                 digests: transfer.missing.iter().cloned().collect(),
             });
         }
-        let plan = plan_for_host_with_contents(
+        let plan = plan_for_host_with_contents_mode(
             registry,
             &request.repository_id,
             &request.logical_host,
             &request.resources,
             &request.used_inputs,
             &contents,
+            request.mode,
         )?;
         let pending_notifications = guard.pending_notifications(PlanBinding {
             repository_id: &request.repository_id,

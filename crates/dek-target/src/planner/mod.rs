@@ -13,7 +13,8 @@ use dek_core::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::backend::{BackendRegistry, PlanningContext};
+use crate::backend::{BackendRegistry, PlannedPackages, PlanningContext};
+pub use dek_core::PlanMode;
 use graph::{prepare, topological_order};
 
 #[derive(Debug, Error)]
@@ -33,6 +34,12 @@ pub enum PlanError {
     Capability {
         target: String,
         kind: ResourceKind,
+        message: String,
+    },
+    #[error("目标 {target} 无法预览软件包事务（{locations}）：{message}")]
+    Packages {
+        target: String,
+        locations: String,
         message: String,
     },
     #[error("cannot encode the reviewed plan or resource digest: {0}")]
@@ -79,6 +86,7 @@ pub fn plan(
         resources,
         used_inputs,
         &BTreeMap::new(),
+        PlanMode::Normal,
     )
 }
 
@@ -109,6 +117,27 @@ pub fn plan_for_host_with_contents(
     used_inputs: &[InputObservation],
     contents: &BTreeMap<ContentDigest, Vec<u8>>,
 ) -> Result<Plan, PlanError> {
+    plan_for_host_with_contents_mode(
+        registry,
+        repository_id,
+        logical_host,
+        resources,
+        used_inputs,
+        contents,
+        PlanMode::Normal,
+    )
+}
+
+/// Build an ordinary or full-upgrade plan using the selected target backend.
+pub fn plan_for_host_with_contents_mode(
+    registry: &BackendRegistry<'_>,
+    repository_id: &str,
+    logical_host: &str,
+    resources: &ResourceSet,
+    used_inputs: &[InputObservation],
+    contents: &BTreeMap<ContentDigest, Vec<u8>>,
+    mode: PlanMode,
+) -> Result<Plan, PlanError> {
     plan_with_host(
         registry,
         repository_id,
@@ -116,6 +145,7 @@ pub fn plan_for_host_with_contents(
         resources,
         used_inputs,
         contents,
+        mode,
     )
 }
 
@@ -126,10 +156,37 @@ fn plan_with_host(
     resources: &ResourceSet,
     used_inputs: &[InputObservation],
     contents: &BTreeMap<ContentDigest, Vec<u8>>,
+    mode: PlanMode,
 ) -> Result<Plan, PlanError> {
-    let (prepared, used_capabilities) = prepare(registry, resources)?;
+    let (prepared, mut used_capabilities) = prepare(registry, resources)?;
     let order = topological_order(registry, &prepared)?;
     let mut actions = Actions::default();
+    let mut packages = plan_packages(registry, resources, mode)?;
+    let transaction = packages.transaction.take().map(|draft| {
+        let origins = packages
+            .covered
+            .iter()
+            .flat_map(|id| prepared[id].resource.origins.clone())
+            .collect();
+        if !used_capabilities
+            .iter()
+            .any(|capability| capability.kind == ResourceKind::Package)
+        {
+            let (capability, _) = registry
+                .backend(ResourceKind::Package)
+                .expect("package transaction backend");
+            used_capabilities.push(capability.clone());
+            used_capabilities.sort_by_key(|capability| capability.kind);
+        }
+        actions.push(
+            draft.kind,
+            draft.reason,
+            origins,
+            &BTreeSet::new(),
+            draft.preconditions,
+        );
+        0
+    });
     let context = PlanningContext {
         resources,
         contents,
@@ -141,14 +198,27 @@ fn plan_with_host(
         let (_, backend) = registry
             .backend(resource.desired.kind())
             .expect("validated backend");
-        let drafts = backend
-            .plan_with_contents(&resource.desired, &context)
-            .map_err(|err| resource_error(registry, resource, err.0))?;
         let mut predecessors = prepared_resource
             .dependencies
             .iter()
             .flat_map(|dependency| actions.ends[dependency].iter().copied())
             .collect::<BTreeSet<_>>();
+        let covered = packages.covered.contains(&id);
+        if covered && predecessors.iter().any(|index| Some(*index) != transaction) {
+            return Err(resource_error(
+                registry,
+                resource,
+                "软件包事务依赖尚未应用的配置，请先应用前置配置",
+            ));
+        }
+        predecessors.extend(transaction);
+        let drafts = match packages.actions.remove(&id) {
+            Some(drafts) => drafts,
+            None if covered => Vec::new(),
+            None => backend
+                .plan_with_contents(&resource.desired, &context)
+                .map_err(|err| resource_error(registry, resource, err.0))?,
+        };
 
         let changed = !drafts.is_empty();
         let content_changed = drafts.iter().any(|action| action.content_changed);
@@ -193,6 +263,35 @@ fn plan_with_host(
     };
     reviewed.id = plan_id(&reviewed, logical_host)?;
     Ok(reviewed)
+}
+
+fn plan_packages(
+    registry: &BackendRegistry<'_>,
+    resources: &ResourceSet,
+    mode: PlanMode,
+) -> Result<PlannedPackages, PlanError> {
+    let error = |message| PlanError::Packages {
+        target: registry.target().id.clone(),
+        locations: locations(
+            &resources
+                .resources
+                .iter()
+                .filter(|resource| resource.desired.kind() == ResourceKind::Package)
+                .flat_map(|resource| resource.origins.clone())
+                .collect::<Vec<_>>(),
+        ),
+        message,
+    };
+    let planned = match registry.backend(ResourceKind::Package) {
+        Some((_, backend)) => backend
+            .plan_packages(resources, mode)
+            .map_err(|err| error(err.0))?,
+        None => None,
+    };
+    if planned.is_none() && mode == PlanMode::Upgrade {
+        return Err(error("目标未提供完整仓库升级预览能力".into()));
+    }
+    Ok(planned.unwrap_or_default())
 }
 
 pub(crate) fn resource_digest(resources: &ResourceSet) -> Result<ContentDigest, serde_json::Error> {

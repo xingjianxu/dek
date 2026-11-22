@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# != 2 ]]; then
+    printf 'Usage: %s IMAGE_ID DEK_BINARY\n' "$0" >&2
+    exit 2
+fi
+
+scripts=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+binary=$(realpath -e -- "$2")
+run_root="${DEK_DEV_ROOT:-/data/dek-dev}/runs/45"
+mkdir -p -- "$run_root"
+evidence=$(mktemp -d "$run_root/upgrade-plan.XXXXXXXX")
+printf 'Evidence %s\n' "$evidence"
+sha256sum -- "$binary" | tee "$evidence/binary.sha256"
+ruby=$(realpath -e -- "$(command -v ruby)")
+[[ "$ruby" == /nix/store/*/bin/ruby ]]
+ruby_root="${ruby%/bin/ruby}"
+nix-store -qR "$ruby_root" | sed 's#^/##' > "$evidence/ruby-paths"
+
+run=''
+cleanup() {
+    if [[ -n "$run" ]]; then
+        "$scripts/run-arch-vm" finish "$run" failed || true
+    fi
+}
+trap cleanup EXIT
+run=$("$scripts/run-arch-vm" start 45 "$1" "$binary")
+printf '%s\n' "$run" | tee "$evidence/run"
+grep -F 'restrict=on' "$run/qemu.command" > "$evidence/offline-network"
+remote=$("$scripts/run-arch-vm" ssh "$run" sha256sum /usr/local/bin/dek)
+local_digest=$(sha256sum -- "$binary")
+[[ "${remote%% *}" == "${local_digest%% *}" ]]
+tar -C / -cf - -T "$evidence/ruby-paths" | gzip -1 |
+    "$scripts/run-arch-vm" ssh "$run" sudo tar -xzpf - -C /
+"$scripts/run-arch-vm" ssh "$run" sudo env "PATH=$ruby_root/bin:/usr/bin" bash -s \
+    < "$scripts/tests/arch-upgrade-plan-guest" 2>&1 | tee "$evidence/guest.log"
+
+export DEK_UPGRADE_TEST_SSH_CONFIG DEK_UPGRADE_TEST_REAL_SSH
+DEK_UPGRADE_TEST_SSH_CONFIG=$("$scripts/run-arch-vm" config "$run")
+DEK_UPGRADE_TEST_REAL_SSH=$(command -v ssh)
+install -d -m 0700 "$evidence/bin" "$evidence/remote-repo"
+cat > "$evidence/bin/ssh" <<'SH'
+#!/bin/sh
+exec "$DEK_UPGRADE_TEST_REAL_SSH" -F "$DEK_UPGRADE_TEST_SSH_CONFIG" "$@"
+SH
+chmod 0700 -- "$evidence/bin/ssh"
+target_id=$(<"$run/instance")
+printf '{"schemaVersion":1,"hosts":{"fixture":{"entry":"entry.json","target":{"ssh":"dek-vm"},"targetId":"%s"}}}\n' \
+    "$target_id" > "$evidence/remote-repo/dek.json"
+printf '{"schemaVersion":1,"imports":[],"options":[]}\n' > "$evidence/remote-repo/entry.json"
+remote_plan() {
+    PATH="$evidence/bin:$PATH" XDG_CACHE_HOME="$evidence/cache" \
+        "$binary" --repo "$evidence/remote-repo" -H fixture plan --json "$@"
+}
+remote_plan > "$evidence/remote-normal.json"
+remote_plan --upgrade > "$evidence/remote-upgrade.json"
+python3 - "$evidence" <<'PY_TEST'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+normal = json.loads((root / 'remote-normal.json').read_text())
+assert normal['actions'] == [], normal
+upgrade = json.loads((root / 'remote-upgrade.json').read_text())
+(action,) = upgrade['actions']
+transaction = action['kind']['repositoryTransaction']
+assert transaction['scope'] == 'upgrade' and transaction['targets'] == [], transaction
+assert {next(iter(change)) for change in transaction['changes']} == {'upgrade', 'replace'}, transaction
+print(f"SSH target returned full upgrade plan {upgrade['plan_id']}")
+PY_TEST
+"$scripts/run-arch-vm" finish "$run" passed
+run=''

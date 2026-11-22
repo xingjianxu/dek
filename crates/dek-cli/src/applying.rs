@@ -12,7 +12,7 @@ use dek_controller::{
     repo::{HostSelector, Repository, Target},
 };
 use dek_core::{
-    InputKind, InputObservation, Observation, Plan,
+    InputKind, InputObservation, Observation, Plan, RepositoryTransactionScope,
     protocol::{EVALUATOR_PROTOCOL_VERSION, TargetQuery, TargetQueryKind},
 };
 use dek_target::{
@@ -106,6 +106,18 @@ pub fn apply_local_with_loader(
             Some(id) => id,
             None => {
                 current = create_plan()?;
+                if current.repository_transaction().is_some_and(|transaction| {
+                    transaction.scope == RepositoryTransactionScope::Upgrade
+                }) {
+                    write_plan(&mut *out, name, &current, false)?;
+                    writeln!(
+                        out,
+                        "请审阅升级计划并运行 dek apply -H {name} --plan {}",
+                        current.id
+                    )?;
+                    out.flush()?;
+                    return Err(format!("等待审阅计划 {}", current.id).into());
+                }
                 &current.id
             }
         };

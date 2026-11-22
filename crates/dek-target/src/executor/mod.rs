@@ -825,9 +825,10 @@ fn action_kind(action: &ActionKind) -> ResourceKind {
         ActionKind::EnsureDirectory(_) => ResourceKind::Directory,
         ActionKind::EnsureUser(_) | ActionKind::SetUserPrimaryGroup { .. } => ResourceKind::User,
         ActionKind::EnsureGroup(_) => ResourceKind::Group,
-        ActionKind::InstallPackage { .. } | ActionKind::RemovePackage { .. } => {
-            ResourceKind::Package
-        }
+        ActionKind::InstallPackage { .. }
+        | ActionKind::RemovePackage { .. }
+        | ActionKind::RepositoryTransaction(_)
+        | ActionKind::BuildAurPackage { .. } => ResourceKind::Package,
         ActionKind::DeployUnit { .. }
         | ActionKind::ReloadManager(_)
         | ActionKind::SetUnitEnabled { .. }

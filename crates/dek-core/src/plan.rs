@@ -34,6 +34,15 @@ pub struct ResourceCapability {
     pub attributes: BTreeSet<String>,
 }
 
+/// Whether a plan reconciles declarations or explicitly previews a system upgrade.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanMode {
+    #[default]
+    Normal,
+    Upgrade,
+}
+
 /// The exact actions and inputs that were reviewed for one repository and target.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -49,6 +58,13 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn repository_transaction(&self) -> Option<&RepositoryTransaction> {
+        self.actions.iter().find_map(|action| match &action.kind {
+            ActionKind::RepositoryTransaction(transaction) => Some(transaction),
+            _ => None,
+        })
+    }
+
     /// Digests of the content objects required to perform the reviewed actions.
     pub fn content_digests(&self) -> BTreeSet<&ContentDigest> {
         let mut digests = BTreeSet::new();
@@ -150,6 +166,11 @@ pub enum ActionKind {
     RemovePackage {
         package: PackageId,
     },
+    RepositoryTransaction(RepositoryTransaction),
+    BuildAurPackage {
+        package: PackageId,
+        candidate_version: Option<String>,
+    },
     DeployUnit {
         unit: UnitId,
         definition: UnitDefinition,
@@ -176,6 +197,56 @@ pub enum ActionKind {
     },
     DeployAgeSecret(AgeSecretResource),
     SetAgeSecretAttributes(AgeSecretResource),
+}
+
+/// One native pacman transaction, including effects on unmanaged packages.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositoryTransaction {
+    pub scope: RepositoryTransactionScope,
+    pub targets: Vec<String>,
+    pub changes: Vec<RepositoryPackageChange>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RepositoryTransactionScope {
+    Install,
+    Upgrade,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositoryPackageCandidate {
+    pub name: String,
+    pub version: String,
+    pub repository: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RepositoryPackageChange {
+    Install {
+        candidate: RepositoryPackageCandidate,
+    },
+    Upgrade {
+        installed_version: String,
+        candidate: RepositoryPackageCandidate,
+    },
+    Replace {
+        package: String,
+        installed_version: String,
+        candidate: RepositoryPackageCandidate,
+    },
+    Remove {
+        package: String,
+        installed_version: String,
+    },
 }
 
 /// A source that can request a specific effect once its actual change is known.

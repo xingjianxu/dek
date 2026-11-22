@@ -104,11 +104,21 @@ user_dek apply
 
 entry '[{"path":"environment.systemPackages","value":["jq"]}]'
 if user_dek plan --json > "$work/missing.json" 2> "$work/missing.log"; then
-    printf 'A missing package unexpectedly received an offline candidate\n' >&2
-    exit 1
+    ruby -rjson -e '
+      doc = JSON.parse(File.read(ARGV.fetch(0), encoding: "UTF-8"))
+      action, extra = doc.fetch("actions")
+      tx = action.fetch("kind").fetch("repositoryTransaction")
+      abort "expected the installed-packages snapshot to permit only an install" if extra || tx.fetch("scope") != "install" || tx.fetch("targets") != ["jq"]
+      condition = {"packageVersion" => {"package" => {"source" => "official", "name" => "jq"}, "expected" => nil}}
+      abort "missing jq version precondition" unless action.fetch("preconditions").include?(condition)
+      abort "missing jq installation" unless tx.fetch("changes").any? { |delta| delta.dig("install", "candidate", "name") == "jq" }
+    ' "$work/missing.json"
+    printf 'Cached repository data planned a reviewed jq installation\n'
+else
+    [[ ! -s "$work/missing.json" ]]
+    grep -F '本地未安装软件包 jq' "$work/missing.log"
 fi
-[[ ! -s "$work/missing.json" ]]
-grep -F '本地未安装软件包 jq' "$work/missing.log"
+! "$native" -Q jq
 
 put dek.json <<'JSON'
 {"schemaVersion":1,"hosts":{"fixture":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.remove":{"schema":"options.json","expand":"expand.rb"}}}

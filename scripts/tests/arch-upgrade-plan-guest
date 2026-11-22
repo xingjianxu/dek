@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# Run only in a fresh disposable Arch guest through scripts/tests/arch-upgrade-plan.
+set -euo pipefail
+[[ $(id -u) == 0 && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+pacman --version
+export LC_ALL=C SOURCE_DATE_EPOCH=1700000000
+
+base=/run/dek-upgrade-fixture
+install -d -m 0755 "$base"/{installed,a,b,repo}
+work=$(mktemp -d)
+chmod 0755 "$work"
+mkpkg() {
+    local directory=$1 name=$2 version=$3
+    shift 3
+    local source="$work/$name"
+    install -d -m 0755 "$source/usr/share/$name"
+    {
+        printf 'pkgname = %s\npkgver = %s\npkgdesc = dek upgrade fixture\n' "$name" "$version"
+        printf 'url = https://example.invalid/dek-fixture\nbuilddate = %s\nsize = 1\narch = any\n' "$SOURCE_DATE_EPOCH"
+        if [[ $# != 0 ]]; then printf '%s\n' "$@"; fi
+    } > "$source/.PKGINFO"
+    printf '%s\n' "$version" > "$source/usr/share/$name/version"
+    tar --mtime="@$SOURCE_DATE_EPOCH" --sort=name --owner=0 --group=0 --numeric-owner \
+        -cf - -C "$source" .PKGINFO usr | zstd -q -o "$base/$directory/$name-$version-any.pkg.tar.zst"
+    rm -r -- "$source"
+}
+
+mkpkg installed dek-fixture-update 1-1
+mkpkg installed dek-fixture-obsolete 1-1
+mkpkg installed dek-fixture-conflict 1-1
+mkpkg installed dek-fixture-ahead 2-1
+mkpkg installed dek-fixture-aur 1-1
+cp -- "$base/installed/"{dek-fixture-update,dek-fixture-obsolete,dek-fixture-conflict}-1-1-any.pkg.tar.zst "$base/a/"
+mkpkg a dek-fixture-ahead 1-1
+mkpkg a dek-fixture-required 1-1
+mkpkg b dek-fixture-update 2-1
+mkpkg b dek-fixture-successor 2-1 'replaces = dek-fixture-obsolete'
+mkpkg b dek-fixture-dependency 2-1 'conflict = dek-fixture-conflict'
+mkpkg b dek-fixture-required 2-1 'depend = dek-fixture-dependency>=2'
+cp -- "$base/installed/dek-fixture-ahead-2-1-any.pkg.tar.zst" "$base/b/"
+for state in a b; do
+    (cd "$base/$state" && repo-add fixture.db.tar.gz ./*.pkg.tar.zst && sha256sum -- fixture.db ./*.pkg.tar.zst)
+done
+ln -s "$base/a" "$base/current"
+cat > /etc/pacman.conf <<CONF
+[options]
+Architecture = auto
+SigLevel = Never
+LocalFileSigLevel = Never
+DownloadUser = alpm
+[fixture]
+Server = file://$base/current
+CONF
+pacman -U --noconfirm -- "$base/installed/"*.pkg.tar.zst
+printf 'original\n' > "$base/managed.conf"
+cat > /etc/systemd/system/dek-fixture-upgrade.service <<'UNIT'
+[Unit]
+Description=Fixture for Arch upgrade preview
+[Service]
+ExecStart=/usr/bin/sleep infinity
+UNIT
+systemctl daemon-reload
+systemctl start dek-fixture-upgrade.service
+
+cat > "$base/repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.upgrade":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$base/repo/options.json" <<'JSON'
+{"options":[{"path":"lab.upgrade.enable","type":"boolean","description":"Enable the upgrade preview fixture"}]}
+JSON
+cat > "$base/repo/expand.rb" <<'RUBY'
+file_resource "/run/dek-upgrade-fixture/managed.conf", content: "planned\n"
+resource "systemdUnit", unit: {scope: "system", name: "dek-fixture-upgrade.service"}, running: false
+RUBY
+cat > "$base/repo/entry.json" <<'JSON'
+{"schemaVersion":1,"imports":[],"options":[
+  {"path":"environment.systemPackages","value":["dek-fixture-required"]},
+  {"path":"dek.arch.aurPackages","value":["dek-fixture-aur","dek-fixture-aur-missing"]},
+  {"path":"lab.upgrade.enable","value":true}
+]}
+JSON
+
+install -d -m 0755 "$work/output"
+install -d -m 0700 "$work/output"/{root-cache,root-state}
+install -d -o dek -g dek -m 0700 "$work/output"/{dek-cache,dek-state}
+run_dek() {
+    local user=$1
+    shift
+    runuser -u "$user" -- env "PATH=$PATH" "XDG_CACHE_HOME=$work/output/$user-cache" \
+        /usr/local/bin/dek --repo "$base/repo" -H fixture "$@" --state-dir "$work/output/$user-state"
+}
+snapshot() {
+    find /var/lib/pacman/local /var/lib/pacman/sync -type f -print0 | sort -z | xargs -0 sha256sum
+    sha256sum "$base/managed.conf" /etc/systemd/system/dek-fixture-upgrade.service
+    systemctl show --property=ActiveState,UnitFileState,MainPID -- dek-fixture-upgrade.service
+}
+check_unchanged() {
+    snapshot > "$work/after"
+    cmp "$work/before" "$work/after"
+    printf 'Unchanged package databases, file and service: '
+    sha256sum "$work/after"
+}
+check_plan() {
+    local source=$1 text="$work/$1.txt" json="$work/$1.json"
+    snapshot > "$work/before"
+    run_dek dek plan --upgrade > "$text"
+    run_dek dek plan --upgrade --json > "$json"
+    cat "$text"
+    python3 - "$source" "$text" "$json" <<'PY'
+import json
+import pathlib
+import sys
+
+source, text_file, json_file = sys.argv[1:]
+text = pathlib.Path(text_file).read_text()
+plan = json.loads(pathlib.Path(json_file).read_text())
+action, *configuration = plan['actions']
+transaction = action['kind']['repositoryTransaction']
+assert transaction['scope'] == 'upgrade', transaction
+assert transaction['targets'] == ['dek-fixture-required'], transaction
+expected = {'新增 fixture/dek-fixture-required 1-1'} if source == 'a' else {
+    '新增 fixture/dek-fixture-dependency 2-1',
+    '新增 fixture/dek-fixture-required 2-1',
+    '升级 fixture/dek-fixture-update 1-1 → 2-1',
+    '替换 dek-fixture-obsolete 1-1 → fixture/dek-fixture-successor 2-1',
+    '移除 dek-fixture-conflict 1-1',
+}
+actual = set()
+for change in transaction['changes']:
+    (kind, info), = change.items()
+    candidate = info.get('candidate')
+    if candidate:
+        address = f"{candidate['repository']}/{candidate['name']}"
+        version = candidate['version']
+        assert len(candidate['sha256']) == 64
+    if kind == 'install':
+        actual.add(f'新增 {address} {version}')
+    elif kind == 'upgrade':
+        actual.add(f"升级 {address} {info['installedVersion']} → {version}")
+    elif kind == 'replace':
+        actual.add(f"替换 {info['package']} {info['installedVersion']} → {address} {version}")
+    else:
+        assert kind == 'remove'
+        actual.add(f"移除 {info['package']} {info['installedVersion']}")
+assert actual == expected, (actual, expected)
+assert all(any(row in line for line in text.splitlines()) for row in expected), text
+assert plan['plan_id'] in text
+assert all(action['id'] in step['dependsOn'] for step in configuration), configuration
+assert any('writeFile' in step['kind'] for step in configuration), configuration
+assert any('setUnitRunning' in step['kind'] for step in configuration), configuration
+builds = {step['kind']['buildAurPackage']['package']['name']: step for step in configuration if 'buildAurPackage' in step['kind']}
+assert builds.keys() == {'dek-fixture-aur', 'dek-fixture-aur-missing'}, builds
+assert builds['dek-fixture-aur']['preconditions'][0]['packageVersion']['expected'] == '1-1'
+assert builds['dek-fixture-aur-missing']['preconditions'][0]['packageVersion']['expected'] is None
+print(f"Verified terminal and JSON {source} plan {plan['plan_id']}")
+PY
+    check_unchanged
+}
+
+check_plan a
+ln -sfn "$base/b" "$base/current"
+check_plan b
+
+check_apply() {
+    local label=$1 reason=$2
+    snapshot > "$work/before"
+    if run_dek root apply > "$work/$label.log" 2>&1; then
+        printf 'Apply unexpectedly finished without upgrade confirmation\n' >&2
+        return 1
+    fi
+    cat "$work/$label.log"
+    grep -Fq "$reason" "$work/$label.log"
+    grep -Fq '完整仓库升级事务' "$work/$label.log"
+    grep -Fq '升级 fixture/dek-fixture-update 1-1 → 2-1' "$work/$label.log"
+    grep -Fq '替换 dek-fixture-obsolete 1-1 → fixture/dek-fixture-successor 2-1' "$work/$label.log"
+    grep -Fq '移除 dek-fixture-conflict 1-1' "$work/$label.log"
+    ! grep -q '^run_id ' "$work/$label.log"
+    local id
+    id=$(awk '/^计划 / { print $2 }' "$work/$label.log")
+    [[ "$id" =~ ^[0-9a-f]{64}$ && -f "$work/output/root-state/plans/$id.mpk" ]]
+    check_unchanged
+}
+
+check_apply refresh '需要刷新仓库元数据'
+pacman -Syy --noconfirm
+check_apply refreshed '本机同步数据库已有待升级的软件包'
+ln -sfn "$base/a" "$base/current"
+pacman -Syy --noconfirm
+ln -sfn "$base/b" "$base/current"
+check_apply unknown '无法确认补装与本机一致'
+
+snapshot > "$work/before"
+mv -- "$base/current" "$base/unavailable"
+if run_dek dek plan --upgrade --json > "$work/unavailable.json" 2> "$work/unavailable.log"; then
+    printf 'Unavailable source unexpectedly produced a plan\n' >&2
+    exit 1
+fi
+[[ ! -s "$work/unavailable.json" ]]
+cat "$work/unavailable.log"
+grep -F '仓库 fixture 的同步数据库' "$work/unavailable.log"
+check_unchanged
+
+# Leave the new fixture source ready for an explicit remote preview with no
+# managed packages, so a remote ordinary plan would return no actions.
+mv -- "$base/unavailable" "$base/current"
+install -d -m 0700 -o dek -g dek /var/lib/dek
