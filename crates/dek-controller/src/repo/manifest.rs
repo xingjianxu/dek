@@ -1,16 +1,16 @@
 use std::{
     collections::{BTreeMap, btree_map},
     fmt,
-    marker::PhantomData,
     path::{Component, Path, PathBuf},
 };
 
 use serde::{
     Deserialize, Deserializer, Serialize,
-    de::{self, MapAccess, Visitor, value::MapAccessDeserializer},
+    de::{self, MapAccess, Visitor},
 };
 
 use super::RepoError;
+use crate::json_object::Object;
 
 pub(super) const SCHEMA_VERSION: u32 = 1;
 
@@ -255,27 +255,4 @@ where
     }
 
     deserializer.deserialize_map(UniqueMap(into_entry))
-}
-
-// Serde 的结构体派生也接受按字段顺序排列的数组，清单只采用对象写法。
-struct Object<T>(T);
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ObjectVisitor<T>(PhantomData<T>);
-
-        impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
-            type Value = Object<T>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a JSON object")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                T::deserialize(MapAccessDeserializer::new(map)).map(Object)
-            }
-        }
-
-        deserializer.deserialize_map(ObjectVisitor(PhantomData))
-    }
 }
