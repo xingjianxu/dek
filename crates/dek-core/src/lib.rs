@@ -2,6 +2,9 @@
 
 mod config;
 mod origin;
+mod plan;
+pub mod protocol;
+mod resource;
 
 pub use config::{
     EffectiveOption, HostConfig, InputKind, InputObservation, InvalidOptionPath, Observation,
@@ -9,4 +12,14 @@ pub use config::{
 };
 pub use origin::{InvalidJsonPointer, JsonPointer, Origin};
 
-pub mod protocol;
+pub use plan::{
+    Action, ActionKind, FileObservation, Plan, PlanVersion, Precondition, ResourceCapability,
+    TargetCapabilities, TargetIdentity, UnsupportedPlanVersion,
+};
+pub use resource::{
+    AgeSecretResource, AuthorizedKeysResource, ContentDigest, DesiredResource, DirectoryResource,
+    FileAttributes, FileContent, FileResource, FileState, GroupResource, NotifyWhen, PackageId,
+    PackageResource, PackageSource, Presence, Resource, ResourceId, ResourceKind, ResourceOrigin,
+    ResourceSet, ServiceEffect, ServiceNotification, SystemdUnitResource, UnitDefinition, UnitId,
+    UnitScope, UserKind, UserResource,
+};
