@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+if [[ $# != 3 ]]; then
+    printf 'Usage: %s IMAGE_ID MANAGER_DEK GUEST_DEK\n' "$0" >&2
+    exit 2
+fi
+image=$1
+manager=$(realpath -e -- "$2")
+guest=$(realpath -e -- "$3")
+scripts=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+vm=$scripts/run-arch-vm
+run_root="${DEK_DEV_ROOT:-/data/dek-dev}/runs/44"
+mkdir -p -- "$run_root"
+evidence=$(mktemp -d "$run_root/ssh-convergence.XXXXXXXX")
+printf 'Evidence %s\n' "$evidence"
+
+a=''
+b=''
+cleanup() {
+    for run in "$a" "$b"; do
+        if [[ -n "$run" && ! -e "$run/result" ]]; then
+            "$vm" finish "$run" failed || true
+        fi
+    done
+}
+trap cleanup EXIT
+a=$("$vm" start 44 "$image" "$guest")
+printf '%s\n' "$a" > "$evidence/guest-a"
+b=$("$vm" start 44 "$image" "$guest")
+printf '%s\n' "$b" > "$evidence/guest-b"
+id_a=$(<"$a/instance")
+id_b=$(<"$b/instance")
+[[ "$id_a" != "$id_b" ]]
+sha256sum -- "$manager" "$guest" > "$evidence/binaries.sha256"
+for label in a b; do
+    run=${!label}
+    grep -F 'restrict=on' "$run/qemu.command" > "$evidence/$label-network"
+    actual=$("$vm" ssh "$run" sha256sum /usr/local/bin/dek)
+    expected=$(sha256sum -- "$guest")
+    [[ "${actual%% *}" == "${expected%% *}" ]]
+    "$vm" ssh "$run" sudo -n bash -s -- "$label" \
+        < "$scripts/tests/ssh-convergence-guest" > "$evidence/$label-setup.log"
+done
+
+config=$evidence/ssh.conf
+misbound=$evidence/wrong-ssh.conf
+sed 's/^Host dek-vm$/Host guest-a/' "$a/ssh.conf" > "$config"
+sed 's/^Host dek-vm$/Host guest-b/' "$b/ssh.conf" >> "$config"
+sed 's/^Host dek-vm$/Host guest-a/' "$b/ssh.conf" > "$misbound"
+
+# Leave real OpenSSH in charge of transport. Drop its process after the target's
+# completed frame and before any byte of that frame reaches dek on the manager.
+export DEK_TEST_REAL_SSH DEK_TEST_PYTHON
+DEK_TEST_REAL_SSH=$(command -v ssh)
+DEK_TEST_PYTHON=$(command -v python3)
+export DEK_TEST_SSH_SHIM="$evidence/shim.py"
+export DEK_TEST_DROPPED="$evidence/dropped-frame.json"
+mkdir -- "$evidence/bin" "$evidence/repo"
+cat > "$evidence/bin/ssh" <<'SH'
+#!/bin/sh
+exec "$DEK_TEST_PYTHON" "$DEK_TEST_SSH_SHIM" "$@"
+SH
+chmod 0700 "$evidence/bin/ssh"
+cat > "$DEK_TEST_SSH_SHIM" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+command = [os.environ["DEK_TEST_REAL_SSH"], "-F", os.environ["DEK_TEST_SSH_CONFIG"], *sys.argv[1:]]
+receipt = Path(os.environ["DEK_TEST_DROPPED"])
+if not os.environ.get("DEK_TEST_DROP_FINAL") or receipt.exists():
+    os.execv(command[0], command)
+
+with subprocess.Popen(command, stdout=subprocess.PIPE) as ssh:
+    for line in ssh.stdout:
+        frame = json.loads(line)
+        result = frame.get("response", {}).get("result", {})
+        if isinstance(result, dict) and "executionFinished" in result:
+            receipt.write_bytes(line)
+            ssh.kill()
+            ssh.wait(timeout=10)
+            raise SystemExit(255)
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
+    raise SystemExit(ssh.wait(timeout=10))
+PY
+
+repo=$evidence/repo
+jq -n --arg a "$id_a" --arg b "$id_b" '{
+  schemaVersion: 1,
+  hosts: {
+    a: {entry: "host.rb", target: {ssh: "guest-a"}, targetId: $a, inputs: "sdk"},
+    b: {entry: "host.rb", target: {ssh: "guest-b"}, targetId: $b, inputs: "sdk"}
+  },
+  modules: {"lab.ssh": {schema: "options.json", expand: "expand.rb", inputs: "sdk"}}
+}' > "$repo/dek.json"
+cat > "$repo/options.json" <<'JSON'
+{"options":[
+  {"path":"lab.ssh.enable","type":"boolean","description":"Enable the SSH fixture"},
+  {"path":"lab.ssh.content","type":"string","description":"Controller text plus target fact"}
+]}
+JSON
+cat > "$repo/host.rb" <<'RUBY'
+local = read_text("controller.txt").strip
+fact = target.read_text("/run/dek-ssh-convergence/fact").strip
+configure "lab.ssh", enable: true, content: "#{local}:#{fact}\n"
+RUBY
+cat > "$repo/expand.rb" <<'RUBY'
+unit = {scope: "system", name: "dek-ssh-convergence.service"}
+file_resource "/run/dek-ssh-convergence/managed.conf", content: option("lab.ssh.content"),
+  notifications: [{unit: unit, effect: "reload", when: "contentChanged"}]
+RUBY
+printf 'reviewed\n' > "$repo/controller.txt"
+
+invoke() {
+    PATH="$evidence/bin:$PATH" XDG_CACHE_HOME="$evidence/cache" \
+        DEK_TEST_SSH_CONFIG="${DEK_TEST_SSH_CONFIG:-$config}" \
+        "$manager" --repo "$repo" -H "$@"
+}
+
+observe() {
+    local run=$1
+    "$vm" ssh "$run" 'cd /run/dek-ssh-convergence &&
+        sha256sum managed.conf &&
+        stat -c "%i %s %Y" managed.conf &&
+        printf "reloads " && wc -l < reloads &&
+        systemctl is-active dek-ssh-convergence.service'
+}
+
+reject() {
+    local label=$1
+    shift
+    if invoke "$@" > "$evidence/$label.stdout" 2> "$evidence/$label.stderr"; then
+        printf 'Unexpected success for %s\n' "$label" >&2
+        return 1
+    fi
+}
+
+observe "$a" > "$evidence/a-before"
+observe "$b" > "$evidence/b-before"
+invoke a plan --json > "$evidence/a-plan.json"
+invoke b plan --json > "$evidence/b-plan.json"
+a_plan=$(jq -er .plan_id "$evidence/a-plan.json")
+b_plan=$(jq -er .plan_id "$evidence/b-plan.json")
+[[ "$a_plan" != "$b_plan" ]]
+for label in a b; do
+    expected="sha256:$(printf 'reviewed:fact-%s\n' "$label" | sha256sum | cut -d' ' -f1)"
+    fact="sha256:$(printf 'fact-%s\n' "$label" | sha256sum | cut -d' ' -f1)"
+    id_var=id_$label
+    jq -e --arg id "${!id_var}" --arg digest "$expected" --arg fact "$fact" '
+        .target.id == $id
+        and ([.actions[].kind | keys[0]] == ["writeFile","notifyService"])
+        and .actions[0].kind.writeFile.content.digest == $digest
+        and (.usedInputs == [{
+            id: "/run/dek-ssh-convergence/fact",
+            kind: "targetFile",
+            observation: {digest: $fact},
+            origin: {file: "host.rb", line: 2}
+        }])
+    ' "$evidence/$label-plan.json" >/dev/null
+done
+
+DEK_TEST_SSH_CONFIG=$misbound reject wrong-host a plan --json
+grep -Fq '目标标识不匹配' "$evidence/wrong-host.stderr"
+reject wrong-plan b apply --plan "$a_plan" --request-id cross-target
+grep -Fq "$a_plan" "$evidence/wrong-plan.stderr"
+observe "$a" > "$evidence/a-after-rejections"
+observe "$b" > "$evidence/b-after-rejections"
+cmp "$evidence/a-before" "$evidence/a-after-rejections"
+cmp "$evidence/b-before" "$evidence/b-after-rejections"
+
+DEK_TEST_DROP_FINAL=1 reject lost-receipt a apply --plan "$a_plan" --request-id first
+run_id=$(awk '$1 == "run_id" {print $2}' "$evidence/lost-receipt.stdout")
+[[ "$run_id" =~ ^[0-9a-f]{64}$ ]]
+grep -Fq "$run_id" "$evidence/lost-receipt.stderr"
+jq -e --arg id "$run_id" '.response.result.executionFinished | .id == $id and .finished' \
+    "$DEK_TEST_DROPPED" >/dev/null
+invoke a status --run "$run_id" --json > "$evidence/a-status.json"
+jq -e --arg run "$run_id" --arg plan "$a_plan" '
+    .finished and .run_id == $run and .plan_id == $plan and .request_id == "first"
+    and (.actions | length == 2)
+    and (.actions | all(.attempt == 1 and .result.verified.changed))
+' "$evidence/a-status.json" >/dev/null
+observe "$a" > "$evidence/a-after-apply"
+expected_a=$(printf 'reviewed:fact-a\n' | sha256sum | cut -d' ' -f1)
+grep -Fxq "$expected_a  managed.conf" "$evidence/a-after-apply"
+grep -qx 'reloads 1' "$evidence/a-after-apply"
+
+invoke a apply --plan "$a_plan" --request-id first > "$evidence/replay.stdout"
+grep -Fxq "run_id $run_id" "$evidence/replay.stdout"
+invoke a plan --json > "$evidence/a-converged.json"
+jq -e '.actions == []' "$evidence/a-converged.json" >/dev/null
+observe "$a" > "$evidence/a-after-replay"
+cmp "$evidence/a-after-apply" "$evidence/a-after-replay"
+
+"$vm" ssh "$a" sudo -n tee /var/lib/dek/retention.json >/dev/null <<'JSON'
+{"planTtlSeconds":1}
+JSON
+"$vm" ssh "$a" sudo -n chmod 0600 /var/lib/dek/retention.json
+printf 'second review\n' > "$repo/controller.txt"
+invoke a plan --json > "$evidence/a-short-lived.json"
+short_plan=$(jq -er .plan_id "$evidence/a-short-lived.json")
+sleep 2
+reject expired a apply --plan "$short_plan" --request-id expired
+grep -Fq '过期' "$evidence/expired.stdout"
+new_plan=$(awk '$1 == "计划" {print $2}' "$evidence/expired.stdout")
+[[ "$new_plan" =~ ^[0-9a-f]{64}$ && "$new_plan" != "$short_plan" ]]
+"$vm" ssh "$a" sudo -n test -s "/var/lib/dek/plans/$new_plan.mpk"
+if grep -q '^run_id ' "$evidence/expired.stdout"; then
+    printf 'Expired plan started an execution.\n' >&2
+    exit 1
+fi
+observe "$a" > "$evidence/a-after-expired"
+observe "$b" > "$evidence/b-after"
+cmp "$evidence/a-after-apply" "$evidence/a-after-expired"
+cmp "$evidence/b-before" "$evidence/b-after"
+
+"$vm" finish "$a" passed
+a=''
+"$vm" finish "$b" passed
+b=''
+printf 'Two Arch guests verified target isolation, expired plan review and one durable service reload.\n'
