@@ -1,11 +1,16 @@
 //! Target-owned reviewed plans and content-addressed objects.
 
 mod fs;
+mod runs;
+
+pub use runs::{ActionAttempt, ActionReceipt, ActionResult, RunAction, RunNotification, RunRecord};
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{self, Cursor},
+    marker::PhantomData,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -60,9 +65,11 @@ pub struct StateStore {
 
 /// A target-wide transaction. A later state consumer can pin a plan reference
 /// and read its complete content under the same lock.
+/// Threads doing independent updates must each acquire their own guard.
 pub struct StateGuard<'a> {
     store: &'a StateStore,
     _lock: File,
+    _single_thread: PhantomData<Cell<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +118,7 @@ impl StateStore {
         Ok(StateGuard {
             store: self,
             _lock: lock,
+            _single_thread: PhantomData,
         })
     }
 }
