@@ -6,6 +6,9 @@ mod schema;
 pub use merge::MergeError;
 pub use schema::{SchemaError, SchemaLocation, SchemaRegistry, ValueMismatch};
 
+mod builtin_apps;
+pub use builtin_apps::{register_app_modules, register_app_schemas};
+
 mod expansion;
 mod resources;
 
