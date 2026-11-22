@@ -3,3 +3,5 @@
 pub mod eval;
 pub mod modules;
 pub mod repo;
+
+mod json_object;
