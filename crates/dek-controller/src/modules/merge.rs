@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use dek_core::{
     EffectiveOption, HostConfig, OptionDefinition, OptionPath, Origin, Priority, UnitSpec,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 use super::SchemaRegistry;
@@ -24,6 +24,16 @@ pub enum MergeError {
     )]
     Conflict {
         path: OptionPath,
+        priority: Priority,
+        first: Box<Origin>,
+        second: Box<Origin>,
+    },
+    #[error(
+        "conflicting definitions of option {path} member {key:?} at priority {priority:?}: {first} and {second}"
+    )]
+    MapConflict {
+        path: OptionPath,
+        key: String,
         priority: Priority,
         first: Box<Origin>,
         second: Box<Origin>,
@@ -93,6 +103,12 @@ fn merge_option(
 ) -> Result<EffectiveOption, MergeError> {
     match option.schema.merge {
         MergeStrategy::Replace => merge_replacement(path, &option.schema.value_type, definitions),
+        MergeStrategy::Map => {
+            let ValueType::Map { map } = &option.schema.value_type else {
+                unreachable!("map merge schema validated during registration");
+            };
+            merge_map(path, map, definitions)
+        }
         MergeStrategy::Set | MergeStrategy::Ordered => {
             let ValueType::List { list } = &option.schema.value_type else {
                 unreachable!("list merge schema validated during registration");
@@ -146,6 +162,77 @@ fn merge_replacement(
         priority,
         effective_definitions,
         overridden_definitions: definitions,
+    })
+}
+
+struct MapMember<'a> {
+    index: usize,
+    value: &'a Value,
+    definition: &'a OptionDefinition,
+}
+
+fn merge_map(
+    path: &OptionPath,
+    value_type: &ValueType,
+    definitions: Vec<OptionDefinition>,
+) -> Result<EffectiveOption, MergeError> {
+    let mut by_key: BTreeMap<&str, Vec<MapMember<'_>>> = BTreeMap::new();
+    let mut used = vec![false; definitions.len()];
+    for (index, definition) in definitions.iter().enumerate() {
+        let entries = definition.value.as_object().expect("validated map");
+        used[index] = entries.is_empty();
+        for (key, value) in entries {
+            by_key.entry(key).or_default().push(MapMember {
+                index,
+                value,
+                definition,
+            });
+        }
+    }
+
+    let mut merged = Map::new();
+    for (key, members) in by_key {
+        let mut layers = members.chunk_by(|a, b| a.definition.priority == b.definition.priority);
+        let winning = layers.next_back().expect("nonempty map member");
+        for layer in layers.chain(std::iter::once(winning)) {
+            let first = &layer[0];
+            let origin = &first.definition.origin;
+            let selected = value_type.comparison_value(first.value, origin);
+            if let Some(second) = layer[1..].iter().find(|other| {
+                value_type.comparison_value(other.value, &other.definition.origin) != selected
+            }) {
+                return Err(MergeError::MapConflict {
+                    path: path.clone(),
+                    key: key.into(),
+                    priority: first.definition.priority,
+                    first: Box::new(origin.clone()),
+                    second: Box::new(second.definition.origin.clone()),
+                });
+            }
+        }
+        for member in winning {
+            used[member.index] = true;
+        }
+        merged.insert(key.into(), winning[0].value.clone());
+    }
+
+    let priority = highest_priority(&definitions);
+    let (effective_definitions, overridden_definitions) = definitions.into_iter().zip(used).fold(
+        (Vec::new(), Vec::new()),
+        |(mut effective, mut overridden), (definition, used)| {
+            if used {
+                effective.push(definition);
+            } else {
+                overridden.push(definition);
+            }
+            (effective, overridden)
+        },
+    );
+    Ok(EffectiveOption {
+        value: Value::Object(merged),
+        priority,
+        effective_definitions,
+        overridden_definitions,
     })
 }
 
