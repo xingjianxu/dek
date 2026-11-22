@@ -3,7 +3,7 @@
 use std::{error::Error, io::Write, path::Path};
 
 use dek_controller::repo::{HostSelector, Repository, Target};
-use dek_core::{Plan, TargetIdentity};
+use dek_core::{ActionKind, Plan, TargetIdentity};
 use dek_target::state::{ActionResult, PendingRunNotification, PlanBinding, StateStore};
 use serde_json::json;
 
@@ -85,7 +85,7 @@ pub(crate) fn show_status(
             item.action.id,
             description(&item.action.kind)
         )?;
-        if let ActionResult::Failed { message } = &item.result {
+        if let ActionResult::Failed { message, .. } = &item.result {
             writeln!(out, "  {message}")?;
         }
         if let Some(diagnostic) = &item.recovery_diagnostic {
@@ -126,8 +126,13 @@ pub(crate) fn write_plan_with_pending(
     for item in pending {
         writeln!(
             out,
-            "待续办服务通知 [{}] {}，执行 {}",
-            item.notification.action_id, item.notification.unit.name, item.run_id,
+            "待续办 [{}] {}，执行 {}",
+            item.notification.action_id,
+            description(&ActionKind::NotifyService {
+                unit: item.notification.unit.clone(),
+                effect: item.notification.effect,
+            }),
+            item.run_id,
         )?;
     }
     Ok(())

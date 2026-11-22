@@ -59,8 +59,18 @@ pub struct RunAction {
 pub enum ActionResult {
     Pending,
     Unverified,
-    Verified { changed: bool },
-    Failed { message: String },
+    Verified {
+        changed: bool,
+    },
+    Failed {
+        message: String,
+        #[serde(
+            default,
+            rename = "notificationJobFailed",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        notification_job_failed: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +84,7 @@ pub enum ActionAttempt {
 pub enum ActionReceipt {
     Verified { changed: bool },
     Failed { message: String },
+    NotificationJobFailed { message: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -306,7 +317,22 @@ impl StateGuard<'_> {
         let action = action_mut(&runs, &mut run, action_id)?;
         let next = match receipt {
             ActionReceipt::Verified { changed } => ActionResult::Verified { changed },
-            ActionReceipt::Failed { message } => ActionResult::Failed { message },
+            ActionReceipt::Failed { message } => ActionResult::Failed {
+                message,
+                notification_job_failed: false,
+            },
+            ActionReceipt::NotificationJobFailed { message } => {
+                if !matches!(action.action.kind, ActionKind::NotifyService { .. }) {
+                    return Err(StateError::invalid(
+                        &runs.path,
+                        "服务通知回执与动作类型不符",
+                    ));
+                }
+                ActionResult::Failed {
+                    message,
+                    notification_job_failed: true,
+                }
+            }
         };
         if attempt != action.attempt || attempt == 0 {
             return Err(StateError::invalid(

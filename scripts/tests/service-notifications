@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Run inside the dedicated disposable Arch guest as root.
+set -euo pipefail
+
+[[ -e /run/cloud-init/instance-data.json && "$(id -u)" == 0 ]]
+grep -Fx 'ID=arch' /etc/os-release
+repo=$(mktemp -d)
+export XDG_CACHE_HOME="$repo/cache"
+state="$repo/state"
+unit=dek-test-notice.service
+printf 'Service notification fixture %s\n' "$repo"
+
+cat > "$repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"system":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.notice":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$repo/options.json" <<'JSON'
+{"options":[
+  {"path":"lab.notice.enable","type":"boolean","default":true,"description":"Enable test module"},
+  {"path":"lab.notice.phase","type":"string","description":"Notification fixture phase"}
+]}
+JSON
+cat > "$repo/expand.rb" <<'RUBY'
+phase = option("lab.notice.phase")
+root = File.expand_path(File.dirname(__FILE__))
+unit = {scope: "system", name: "dek-test-notice.service"}
+description = phase == "initial" ? "Initial notice fixture" : "Updated notice fixture"
+definition = content_object(<<~UNIT)
+  [Unit]
+  Description=#{description}
+  [Service]
+  ExecStart=/usr/bin/sleep infinity
+  ExecReload=/usr/bin/bash #{root}/reload.sh #{root}
+UNIT
+resource("systemdUnit", unit: unit, definition: {content: definition}, running: true)
+
+%w[a b].each do |name|
+  effect = phase == "restart" && name == "b" ? "restart" : "reload"
+  file_resource "#{root}/#{name}.conf", content: "#{name}-#{phase}\n",
+    notifications: [{unit: unit, effect: effect, when: "contentChanged"}]
+end
+RUBY
+cat > "$repo/reload.sh" <<'SH'
+set -euo pipefail
+root=$1
+printf 'attempt\n' >> "$root/attempts"
+if [[ -e "$root/fail-once" ]]; then
+    rm -- "$root/fail-once"
+    exit 23
+fi
+cat "$root/a.conf" "$root/b.conf" > "$root/received"
+systemctl --system show --property=Description --value -- dek-test-notice.service >> "$root/received"
+printf 'success\n' >> "$root/successes"
+SH
+touch "$repo/attempts" "$repo/successes"
+
+entry() {
+    printf '{"schemaVersion":1,"imports":[],"options":[{"path":"lab.notice.phase","value":"%s"}]}\n' "$1" > "$repo/entry.json"
+}
+
+plan() {
+    dek --repo "$repo" -H system plan --state-dir "$state" --json > "$repo/plan.json"
+}
+
+apply() {
+    dek --repo "$repo" -H system apply --state-dir "$state" "$@"
+}
+
+status() {
+    dek --repo "$repo" -H system status --state-dir "$state" --json > "$repo/status.json"
+}
+
+review() {
+    python3 - "$repo/plan.json" "$1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="UTF-8") as source:
+    plan = json.load(source)
+actions = plan["actions"]
+notifications = [action for action in actions if "notifyService" in action["kind"]]
+phase = sys.argv[2]
+if phase == "initial":
+    assert not notifications, notifications
+    start = next(action for action in actions if "setUnitRunning" in action["kind"])
+    assert {action["id"] for action in actions if "writeFile" in action["kind"]} <= set(start["dependsOn"]), start
+else:
+    assert len(notifications) == 1, notifications
+    notice, = notifications
+    expected = "restart" if phase == "restart" else "reload"
+    assert notice["kind"]["notifyService"]["effect"] == expected, notice
+    dependencies = {action["id"] for action in actions if {"reloadManager", "writeFile"} & action["kind"].keys()}
+    assert len(dependencies) == (3 if phase == "update" else 2), dependencies
+    assert dependencies <= set(notice["dependsOn"]), notice
+print(plan["plan_id"])
+PY
+}
+
+entry initial
+plan
+apply --plan "$(review initial)"
+systemctl is-active --quiet "$unit"
+[[ ! -s "$repo/attempts" ]]
+printf 'First start read the current files with zero reloads.\n'
+
+entry update
+plan
+apply --plan "$(review update)"
+[[ $(wc -l < "$repo/attempts") == 1 && $(wc -l < "$repo/successes") == 1 ]]
+diff -u <(printf 'a-update\nb-update\nUpdated notice fixture\n') "$repo/received"
+printf 'Two file changes produced one reload after both writes and daemon-reload.\n'
+
+entry retry
+touch "$repo/fail-once"
+if apply > "$repo/first-attempt.log" 2>&1; then
+    printf 'Expected ExecReload to fail on the first attempt.\n' >&2
+    exit 1
+fi
+cat "$repo/first-attempt.log"
+[[ $(wc -l < "$repo/attempts") == 2 && $(wc -l < "$repo/successes") == 1 ]]
+status
+plan
+run_id=$(python3 - "$repo/status.json" "$repo/plan.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="UTF-8") as source:
+    status = json.load(source)
+with open(sys.argv[2], encoding="UTF-8") as source:
+    plan = json.load(source)
+assert not status["finished"], status
+assert len(status["actions"]) == 3, status
+assert all(item["result"] == {"verified": {"changed": True}} for item in status["actions"][:2]), status
+assert "failed" in status["actions"][2]["result"], status
+assert len(status["pending_notifications"]) == 1, status
+assert not plan["actions"], plan
+pending, = plan["pending_notifications"]
+assert pending["runId"] == status["run_id"] and pending["prerequisitesVerified"], pending
+assert pending["notification"]["effect"] == "reload", pending
+print(status["run_id"])
+PY
+)
+before=$(stat -c '%i' "$repo/a.conf" "$repo/b.conf")
+apply | tee "$repo/retried.log"
+grep -F "run_id $run_id" "$repo/retried.log"
+[[ $(stat -c '%i' "$repo/a.conf" "$repo/b.conf") == "$before" ]]
+[[ $(wc -l < "$repo/attempts") == 3 && $(wc -l < "$repo/successes") == 2 ]]
+diff -u <(printf 'a-retry\nb-retry\nUpdated notice fixture\n') "$repo/received"
+status
+python3 - "$repo/status.json" "$run_id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="UTF-8") as source:
+    status = json.load(source)
+assert status["run_id"] == sys.argv[2] and status["finished"], status
+assert [item["attempt"] for item in status["actions"]] == [1, 1, 2], status
+assert not status["pending_notifications"], status
+PY
+printf 'The same run retried only the failed notification and kept both file inodes.\n'
+
+entry restart
+plan
+invocation=$(systemctl show --property=InvocationID --value -- "$unit")
+apply --plan "$(review restart)"
+[[ $(systemctl show --property=InvocationID --value -- "$unit") != "$invocation" ]]
+[[ $(wc -l < "$repo/attempts") == 3 ]]
+printf 'Mixed reload and restart triggers produced one restart and no reload.\n'
