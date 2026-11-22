@@ -44,6 +44,14 @@ pub(super) struct DependencyConflict {
     pub reason: *const Dependency,
 }
 
+#[repr(C)]
+pub(super) struct FileConflict {
+    pub target: *const c_char,
+    pub kind: c_int,
+    pub file: *const c_char,
+    pub other: *const c_char,
+}
+
 struct Library(*mut c_void);
 
 impl Drop for Library {
@@ -95,6 +103,13 @@ bindings! {
     fn alpm_strerror(c_int) -> *const c_char;
     fn alpm_option_set_gpgdir(*mut Handle, *const c_char) -> c_int;
     fn alpm_option_set_logfile(*mut Handle, *const c_char) -> c_int;
+    fn alpm_option_add_cachedir(*mut Handle, *const c_char) -> c_int;
+    fn alpm_option_add_hookdir(*mut Handle, *const c_char) -> c_int;
+    fn alpm_option_add_noupgrade(*mut Handle, *const c_char) -> c_int;
+    fn alpm_option_add_noextract(*mut Handle, *const c_char) -> c_int;
+    fn alpm_option_set_checkspace(*mut Handle, c_int) -> c_int;
+    fn alpm_option_set_usesyslog(*mut Handle, c_int) -> c_int;
+    fn alpm_option_set_parallel_downloads(*mut Handle, libc::c_uint) -> c_int;
     fn alpm_option_set_default_siglevel(*mut Handle, c_int) -> c_int;
     fn alpm_option_set_sandboxuser(*mut Handle, *const c_char) -> c_int;
     fn alpm_option_set_disable_dl_timeout(*mut Handle, c_ushort) -> c_int;
@@ -107,6 +122,8 @@ bindings! {
     fn alpm_get_localdb(*mut Handle) -> *mut Database;
     fn alpm_register_syncdb(*mut Handle, *const c_char, c_int) -> *mut Database;
     fn alpm_db_set_usage(*mut Database, c_int) -> c_int;
+    fn alpm_db_get_siglevel(*mut Database) -> c_int;
+    fn alpm_db_add_cache_server(*mut Database, *const c_char) -> c_int;
     fn alpm_db_add_server(*mut Database, *const c_char) -> c_int;
     fn alpm_db_get_name(*mut Database) -> *const c_char;
     fn alpm_db_get_valid(*mut Database) -> c_int;
@@ -114,6 +131,8 @@ bindings! {
     fn alpm_db_update(*mut Handle, *mut List, c_int) -> c_int;
     fn alpm_db_get_pkg(*mut Database, *const c_char) -> *mut Package;
     fn alpm_list_free(*mut List) -> ();
+    fn alpm_pkg_get_filename(*mut Package) -> *const c_char;
+    fn alpm_pkg_get_base64_sig(*mut Package) -> *const c_char;
     fn alpm_pkg_get_name(*mut Package) -> *const c_char;
     fn alpm_pkg_get_version(*mut Package) -> *const c_char;
     fn alpm_pkg_get_sha256sum(*mut Package) -> *const c_char;
@@ -124,12 +143,14 @@ bindings! {
     fn alpm_sync_sysupgrade(*mut Handle, c_int) -> c_int;
     fn alpm_add_pkg(*mut Handle, *mut Package) -> c_int;
     fn alpm_trans_prepare(*mut Handle, *mut *mut List) -> c_int;
+    fn alpm_trans_commit(*mut Handle, *mut *mut List) -> c_int;
     fn alpm_trans_get_add(*mut Handle) -> *mut List;
     fn alpm_trans_get_remove(*mut Handle) -> *mut List;
     fn alpm_trans_release(*mut Handle) -> c_int;
     fn alpm_dep_compute_string(*const Dependency) -> *mut c_char;
     fn alpm_depmissing_free(*mut MissingDependency) -> ();
     fn alpm_conflict_free(*mut DependencyConflict) -> ();
+    fn alpm_fileconflict_free(*mut FileConflict) -> ();
 }
 
 /// The caller supplies a live NUL-terminated C string or null.

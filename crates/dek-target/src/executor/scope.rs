@@ -8,7 +8,13 @@ use crate::state::{ActionResult, RunRecord};
 /// The reviewed program is ordered. Validate it before resolving live changes.
 pub(super) fn validate_order(plan: &Plan) -> Result<(), ExecutionError> {
     let mut previous = BTreeSet::new();
+    let mut repository_transaction = false;
     for action in &plan.actions {
+        if matches!(action.kind, ActionKind::RepositoryTransaction(_))
+            && std::mem::replace(&mut repository_transaction, true)
+        {
+            return Err(ExecutionError::action(action, "审阅计划只允许一项仓库事务"));
+        }
         let bad_sources = if let ActionKind::NotifyService {
             effect, sources, ..
         } = &action.kind

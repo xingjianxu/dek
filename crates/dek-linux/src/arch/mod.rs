@@ -1,8 +1,9 @@
-//! Arch package state, read-only native transaction planning and reviewed removals.
+//! Arch package state, native transaction planning, and reviewed package changes.
 
 mod alpm;
 mod aur;
 mod removal;
+mod transaction;
 mod upgrade;
 
 use std::{
@@ -17,6 +18,7 @@ use dek_core::{
 };
 use dek_target::backend::{
     ActionContext, ActionReadiness, Backend, BackendError, PlannedAction, PlannedPackages,
+    RepositoryPreparation,
 };
 
 pub struct PacmanBackend {
@@ -187,7 +189,7 @@ impl Backend for PacmanBackend {
     fn validate_action(&self, action: &Action) -> Result<(), BackendError> {
         match action.kind {
             ActionKind::RepositoryTransaction(_) => {
-                Err(BackendError("当前 pacman 后端仅预览仓库事务".into()))
+                transaction::reviewed_install(action).map(|_| ())
             }
             ActionKind::BuildAurPackage { .. } => {
                 Err(BackendError("当前后端只支持 AUR 规划".into()))
@@ -196,7 +198,17 @@ impl Backend for PacmanBackend {
         }
     }
 
+    fn prepare_repository_transaction(
+        &self,
+        action: &Action,
+    ) -> Result<RepositoryPreparation, BackendError> {
+        alpm::prepare_install(transaction::reviewed_install(action)?)
+    }
+
     fn inspect_action(&self, action: &Action) -> Result<ActionReadiness, BackendError> {
+        if matches!(action.kind, ActionKind::RepositoryTransaction(_)) {
+            return self.inspect_install(transaction::reviewed_install(action)?);
+        }
         let (package, version) = reviewed_removal(action)?;
         Ok(match self.installed(package)? {
             None => ActionReadiness::Satisfied,
@@ -233,6 +245,11 @@ impl Backend for PacmanBackend {
     }
 
     fn verify(&self, action: &ActionKind) -> Result<bool, BackendError> {
+        if let ActionKind::RepositoryTransaction(transaction) = action {
+            return self
+                .inspect_install(transaction)
+                .map(|result| result == ActionReadiness::Satisfied);
+        }
         self.installed(removal_package(action)?)
             .map(|version| version.is_none())
     }

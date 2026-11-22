@@ -13,7 +13,7 @@ use thiserror::Error;
 use crate::{
     backend::{
         ActionContext, ActionReadiness, Backend, BackendError, BackendRegistry, NotificationError,
-        PriorAttempt, RecoveryReadiness,
+        PriorAttempt, RecoveryReadiness, RepositoryCommit, RepositoryPreparation,
     },
     planner::{self, PlanError},
     state::{
@@ -244,14 +244,17 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             }
         }
 
-        let fresh = planner::plan_for_host_with_contents(
-            self.registry,
-            binding.repository_id,
-            binding.logical_host,
-            &reviewed.resources,
-            &reviewed.plan.used_inputs,
-            &reviewed.contents,
-        )?;
+        let replan = || {
+            planner::plan_for_host_with_contents(
+                self.registry,
+                binding.repository_id,
+                binding.logical_host,
+                &reviewed.resources,
+                &reviewed.plan.used_inputs,
+                &reviewed.contents,
+            )
+        };
+        let fresh = replan()?;
         let resumed = match &application {
             Application::Resume(run) => Some(run.as_ref()),
             Application::New { .. } => None,
@@ -289,6 +292,30 @@ impl<'a, 'backend> Executor<'a, 'backend> {
 
         if conflict.is_none() {
             self.validate_batches(reviewed, &live)?;
+        }
+
+        let mut repository_commit = None;
+        if conflict.is_none()
+            && let Some(action) = reviewed.plan.actions.iter().find(|action| {
+                live.contains(action.id.as_str())
+                    && matches!(action.kind, ActionKind::RepositoryTransaction(_))
+            })
+        {
+            match self
+                .backend(action)?
+                .prepare_repository_transaction(action)
+                .map_err(|error| ExecutionError::action(action, error.0))?
+            {
+                RepositoryPreparation::Ready(commit) => repository_commit = Some(commit),
+                RepositoryPreparation::Changed => {
+                    return self.replacement(
+                        binding,
+                        reviewed,
+                        &replan()?,
+                        ReviewReason::ScopeExpanded,
+                    );
+                }
+            }
         }
 
         let run = match application {
@@ -330,7 +357,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             return Err(failure);
         }
 
-        self.run_actions(&run, binding, reviewed, &live)?;
+        self.run_actions(&run, binding, reviewed, &live, repository_commit)?;
         let guard = self.store.lock()?;
         guard.finish_run(&run.id, binding)?;
         Ok(ExecutionOutcome::Finished(Box::new(
@@ -388,6 +415,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         binding: PlanBinding<'_>,
         reviewed: &ReviewedPlan,
         live: &BTreeSet<&str>,
+        mut repository_commit: Option<RepositoryCommit>,
     ) -> Result<(), ExecutionError> {
         let mut triggered = BTreeSet::new();
         let mut deferred = BTreeSet::new();
@@ -488,7 +516,21 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                 return Err(ExecutionError::action(action, TERMINAL_REQUIRED));
             }
             let attempt = self.begin(run, binding, action)?;
-            let outcome = self.dispatch(run, binding, reviewed, action, backend, readiness);
+            let outcome = if matches!(&readiness, Ok(ActionReadiness::Ready))
+                && matches!(action.kind, ActionKind::RepositoryTransaction(_))
+                && let Some(commit) = repository_commit.take()
+            {
+                Self::queue_dependent_notifications(self.store, run, binding, action, true)
+                    .map_err(ExecutionError::from)
+                    .and_then(|()| {
+                        commit()
+                            .and_then(|()| verify(backend, action))
+                            .map(|()| true)
+                            .map_err(|error| ExecutionError::action(action, error.0))
+                    })
+            } else {
+                self.dispatch(run, binding, reviewed, action, backend, readiness)
+            };
             self.record(run, binding, action, attempt, &outcome.as_ref().copied())?;
             if outcome? && !runtime_content_check(&action.kind) {
                 triggered.insert(item.action.id.as_str());

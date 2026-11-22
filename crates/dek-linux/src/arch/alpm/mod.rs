@@ -1,6 +1,8 @@
-//! Resolve native ALPM transactions from an isolated copy of target metadata.
+//! Prepare native ALPM plans and execute reviewed repository transactions.
 
+mod cache;
 mod config;
+mod execution;
 mod native;
 
 use std::{
@@ -20,6 +22,8 @@ use dek_target::backend::BackendError;
 
 use config::{Config, INSTALL, Repository, SYNC, UPGRADE};
 use native::{Database, Handle, List, Native, Package, Question, ReplaceQuestion, items, text};
+
+pub(super) use execution::prepare_install;
 
 pub(super) fn preview(
     installed: &BTreeMap<&str, &str>,
@@ -72,7 +76,7 @@ pub(super) fn preview(
         // remains private and ALPM owns the temporary download directory.
         fs::set_permissions(path, fs::Permissions::from_mode(0o711)).map_err(db_error)?;
     }
-    let alpm = Alpm::open(&config, path)?;
+    let alpm = Alpm::open(&config, path, &gpg, &path.join("pacman.log"))?;
     let local = alpm.local_versions()?;
     if local.len() != installed.len()
         || local
@@ -142,14 +146,14 @@ fn ignore_missing_or_permissions(copied: io::Result<u64>) -> io::Result<()> {
     }
 }
 
-struct Alpm<'a> {
+struct Alpm {
     native: Native,
     handle: NonNull<Handle>,
-    repositories: Vec<(&'a Repository, NonNull<Database>)>,
+    repositories: Vec<(Repository, NonNull<Database>)>,
     sync: std::path::PathBuf,
 }
 
-impl Drop for Alpm<'_> {
+impl Drop for Alpm {
     fn drop(&mut self) {
         // SAFETY: the native handle is initialized and exclusively owned here.
         unsafe { (self.native.alpm_release)(self.handle.as_ptr()) };
@@ -160,43 +164,48 @@ fn as_c(value: impl AsRef<[u8]>) -> Result<CString, BackendError> {
     CString::new(value.as_ref()).map_err(|_| BackendError("pacman 参数含有 NUL 字节".into()))
 }
 
-impl<'a> Alpm<'a> {
-    fn open(config: &'a Config, scratch: &Path) -> Result<Self, BackendError> {
+impl Alpm {
+    fn open(
+        config: &Config,
+        database: &Path,
+        gpg: &Path,
+        log: &Path,
+    ) -> Result<Self, BackendError> {
         let native = Native::load()?;
         let root = as_c(config.root.as_os_str().as_bytes())?;
-        let db = as_c(scratch.as_os_str().as_bytes())?;
+        let db = as_c(database.as_os_str().as_bytes())?;
         let mut error = 0;
         // SAFETY: all strings live through the call and ALPM copies the paths.
         let handle = unsafe { (native.alpm_initialize)(root.as_ptr(), db.as_ptr(), &mut error) };
         let handle = NonNull::new(handle).ok_or_else(|| {
             // SAFETY: ALPM returned this error code from initialization.
             let message = unsafe { text((native.alpm_strerror)(error)) }.unwrap_or_default();
-            BackendError(format!("无法初始化隔离的 pacman 数据库：{message}"))
+            BackendError(format!("无法初始化 pacman 数据库：{message}"))
         })?;
         let mut alpm = Self {
             native,
             handle,
             repositories: Vec::new(),
-            sync: scratch.join("sync"),
+            sync: database.join("sync"),
         };
-        alpm.configure(config, scratch)?;
+        alpm.configure(config, gpg, log)?;
         Ok(alpm)
     }
 
-    fn configure(&mut self, config: &'a Config, scratch: &Path) -> Result<(), BackendError> {
+    fn configure(&mut self, config: &Config, gpg: &Path, log: &Path) -> Result<(), BackendError> {
         let native = &self.native;
         let handle = self.handle.as_ptr();
-        let gpg = as_c(scratch.join("gnupg").as_os_str().as_bytes())?;
-        let log = as_c(scratch.join("pacman.log").as_os_str().as_bytes())?;
+        let gpg = as_c(gpg.as_os_str().as_bytes())?;
+        let log = as_c(log.as_os_str().as_bytes())?;
         // SAFETY: the handle is live, and ALPM copies strings passed to its setters.
         unsafe {
             self.check(
                 (native.alpm_option_set_gpgdir)(handle, gpg.as_ptr()),
-                "设置预览密钥目录",
+                "设置密钥目录",
             )?;
             self.check(
                 (native.alpm_option_set_logfile)(handle, log.as_ptr()),
-                "设置预览日志路径",
+                "设置日志路径",
             )?;
             self.check(
                 (native.alpm_option_set_default_siglevel)(handle, config.signatures),
@@ -270,7 +279,14 @@ impl<'a> Alpm<'a> {
                         &format!("设置仓库 {} 的镜像", repo.name),
                     )?;
                 }
-                self.repositories.push((repo, database));
+                for server in &repo.cache_servers {
+                    let server = as_c(server)?;
+                    self.check(
+                        (native.alpm_db_add_cache_server)(database.as_ptr(), server.as_ptr()),
+                        &format!("设置仓库 {} 的缓存源", repo.name),
+                    )?;
+                }
+                self.repositories.push((repo.clone(), database));
             }
         }
         Ok(())
@@ -300,21 +316,10 @@ impl<'a> Alpm<'a> {
         if !upgrade.changes.is_empty() {
             return Err("本机同步数据库已有待升级的软件包".into());
         }
-        let local = self.local_versions().map_err(uncertain)?;
-        for (name, installed) in local {
-            if let Some(pkg) = self.find_package(&name, UPGRADE) {
-                let version = self.package_version(pkg).map_err(uncertain)?;
-                let installed = as_c(&installed).map_err(uncertain)?;
-                let candidate = as_c(&version).map_err(uncertain)?;
-                // SAFETY: both versions are NUL-terminated strings.
-                if unsafe { (self.native.alpm_pkg_vercmp)(installed.as_ptr(), candidate.as_ptr()) }
-                    > 0
-                {
-                    return Err(format!(
-                        "无法确认补装与本机一致。已安装的 {name} 比本机同步数据库中的 {version} 更新"
-                    ));
-                }
-            }
+        if let Some((name, version)) = self.local_ahead().map_err(uncertain)? {
+            return Err(format!(
+                "无法确认补装与本机一致。已安装的 {name} 比本机同步数据库中的 {version} 更新"
+            ));
         }
         let install = self
             .resolve(RepositoryTransactionScope::Install, targets.to_vec())
@@ -327,6 +332,23 @@ impl<'a> Alpm<'a> {
             return Err("无法确认补装与本机一致。补装会改变已有软件包".into());
         }
         Ok(install)
+    }
+
+    fn local_ahead(&self) -> Result<Option<(String, String)>, BackendError> {
+        for (name, installed) in self.local_versions()? {
+            if let Some(pkg) = self.find_package(&name, UPGRADE) {
+                let version = self.package_version(pkg)?;
+                let installed = as_c(&installed)?;
+                let candidate = as_c(&version)?;
+                // SAFETY: both versions are NUL-terminated strings.
+                if unsafe { (self.native.alpm_pkg_vercmp)(installed.as_ptr(), candidate.as_ptr()) }
+                    > 0
+                {
+                    return Ok(Some((name, version)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn refresh(&self, config: &Config, sync: &Path) -> Result<(), BackendError> {

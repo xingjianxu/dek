@@ -13,6 +13,14 @@ pub(super) struct Config {
     pub root: PathBuf,
     pub db: PathBuf,
     pub gpg: PathBuf,
+    pub log: PathBuf,
+    pub cache_dirs: Vec<PathBuf>,
+    pub hook_dirs: Vec<PathBuf>,
+    pub no_upgrade: Vec<String>,
+    pub no_extract: Vec<String>,
+    pub parallel_downloads: u32,
+    pub check_space: bool,
+    pub use_syslog: bool,
     pub signatures: i32,
     pub architectures: Vec<String>,
     pub ignored_packages: Vec<String>,
@@ -25,11 +33,13 @@ pub(super) struct Config {
     pub repositories: Vec<Repository>,
 }
 
+#[derive(Clone)]
 pub(super) struct Repository {
     pub name: String,
     pub usage: i32,
     pub signatures: i32,
     pub servers: Vec<String>,
+    pub cache_servers: Vec<String>,
 }
 
 impl Config {
@@ -71,6 +81,7 @@ impl Config {
                     usage: 0,
                     signatures: INHERIT_SIGNATURES,
                     servers: Vec::new(),
+                    cache_servers: Vec::new(),
                 });
                 continue;
             }
@@ -80,6 +91,7 @@ impl Config {
                     "Usage" => repo.usage |= usage(value)?,
                     "SigLevel" => signature_flag(&mut repo.signatures, value)?,
                     "Server" => repo.servers.push(value.into()),
+                    "CacheServer" => repo.cache_servers.push(value.into()),
                     _ => {}
                 }
             } else {
@@ -87,6 +99,18 @@ impl Config {
                     "RootDir" => config.root = value.into(),
                     "DBPath" => config.db = value.into(),
                     "GPGDir" => config.gpg = value.into(),
+                    "LogFile" => config.log = value.into(),
+                    "CacheDir" => config.cache_dirs.push(value.into()),
+                    "HookDir" => config.hook_dirs.push(value.into()),
+                    "NoUpgrade" => config.no_upgrade.push(value.into()),
+                    "NoExtract" => config.no_extract.push(value.into()),
+                    "CheckSpace" => config.check_space = true,
+                    "UseSyslog" => config.use_syslog = true,
+                    "ParallelDownloads" => {
+                        config.parallel_downloads = value.parse().map_err(|error| {
+                            BackendError(format!("无效的 pacman ParallelDownloads：{error}"))
+                        })?
+                    }
                     "Architecture" => config.architectures.push(value.into()),
                     "IgnorePkg" => config.ignored_packages.push(value.into()),
                     "IgnoreGroup" => config.ignored_groups.push(value.into()),

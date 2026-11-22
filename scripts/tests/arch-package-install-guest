@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Run only in a fresh Arch test guest.
+set -euo pipefail
+[[ $(id -u) == 0 && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+pacman --version
+export LC_ALL=C SOURCE_DATE_EPOCH=1700000000
+base=/run/dek-install-fixture
+install -d -m 0755 "$base"/{a,b,hooks,cache-first,cache-second,repo}
+install -d -m 0700 "$base"/{signing,keyring,state,cache}
+work=$(mktemp -d)
+port=42846
+server=''
+stop_repo() {
+    if [[ -n "$server" ]]; then
+        kill "$server"
+        wait "$server" || true
+        server=''
+    fi
+}
+trap stop_repo EXIT
+start_repo() {
+    python3 -u -m http.server --bind 127.0.0.1 --directory "$base/$1" "$port" > "$work/http" 2>&1 &
+    server=$!
+    for ((i=0; i<50; i++)); do
+        if curl -fsSI "http://127.0.0.1:$port/" >/dev/null 2>&1; then return; fi
+        sleep 0.1
+    done
+    cat "$work/http" >&2
+    return 1
+}
+
+export GNUPGHOME="$base/signing"
+gpg --batch --pinentry-mode loopback --passphrase '' \
+    --quick-generate-key 'Dek Arch Install Fixture <install@example.invalid>' ed25519 sign 0
+key=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+gpg --batch --export "$key" > "$work/fixture-key.gpg"
+pacman-key --gpgdir "$base/keyring" --init
+pacman-key --gpgdir "$base/keyring" --add "$work/fixture-key.gpg"
+pacman-key --gpgdir "$base/keyring" --lsign-key "$key"
+
+mkpkg() {
+    local directory=$1 name=$2 version=$3
+    shift 3
+    local source="$work/$name" archive="$base/$directory/$name-$version-any.pkg.tar.zst"
+    install -d -m 0755 "$source/usr/share/$name"
+    {
+        printf 'pkgname = %s\npkgver = %s\npkgdesc = dek install fixture\n' "$name" "$version"
+        printf 'url = https://example.invalid/dek-fixture\nbuilddate = %s\nsize = 1\narch = any\n' "$SOURCE_DATE_EPOCH"
+        if [[ $# != 0 ]]; then printf '%s\n' "$@"; fi
+    } > "$source/.PKGINFO"
+    printf '%s\n' "$version" > "$source/usr/share/$name/version"
+    tar --mtime="@$SOURCE_DATE_EPOCH" --sort=name --owner=0 --group=0 --numeric-owner \
+        -cf - -C "$source" .PKGINFO usr | zstd -q -o "$archive"
+    gpg --batch --local-user "$key" --detach-sign "$archive"
+    rm -r -- "$source"
+}
+
+mkpkg a dek-fixture-full 1-1 'depend = dek-fixture-full-dep'
+mkpkg a dek-fixture-full-dep 1-1
+mkpkg a dek-fixture-partial 1-1 'depend = dek-fixture-partial-dep'
+mkpkg a dek-fixture-partial-dep 1-1
+mkpkg a dek-fixture-drift 1-1 'depend = dek-fixture-drift-dep'
+mkpkg a dek-fixture-drift-dep 1-1
+cp -- "$base/a/"*.pkg.tar.zst* "$base/b/"
+rm -- "$base/b/dek-fixture-drift-1-1-any.pkg.tar.zst"{,.sig}
+mkpkg b dek-fixture-drift 2-1 'depend = dek-fixture-drift-dep' 'depend = dek-fixture-drift-new'
+mkpkg b dek-fixture-drift-new 1-1
+for state in a b; do
+    (cd "$base/$state" && repo-add --sign --key "$key" fixture.db.tar.gz ./*.pkg.tar.zst && sha256sum -- fixture.db fixture.db.sig ./*.pkg.tar.zst)
+done
+
+cat > /etc/pacman.conf <<CONF
+[options]
+Architecture = auto
+SigLevel = Required TrustedOnly
+GPGDir = $base/keyring
+CacheDir = $base/cache-first
+CacheDir = $base/cache-second
+HookDir = $base/hooks
+DownloadUser = alpm
+[fixture]
+Server = http://127.0.0.1:$port
+CONF
+cat > "$base/hooks/91-dek-install-fixture.hook" <<HOOK
+[Trigger]
+Operation = Install
+Type = Package
+Target = dek-fixture-*
+
+[Action]
+Description = Confirming repository install before dependent config
+When = PostTransaction
+NeedsTargets
+Exec = /usr/bin/bash $base/check-order
+HOOK
+cat > "$base/check-order" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+base=/run/dek-install-fixture
+[[ -f /var/lib/pacman/db.lck ]]
+while read -r target; do
+    pacman -Q "$target" >/dev/null
+    [[ -f "/usr/share/$target/version" && ! -e "/usr/share/$target/managed.conf" ]]
+done
+printf 'packages installed before configuration\n' >> "$base/hook.log"
+SH
+
+cat > "$base/repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.install":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$base/repo/options.json" <<'JSON'
+{"options":[{"path":"lab.install.enable","type":"boolean","default":true,"description":"Enable the fixture"},{"path":"lab.install.package","type":"string","description":"Package required by the fixture file"}]}
+JSON
+cat > "$base/repo/expand.rb" <<'RUBY'
+name = option("lab.install.package")
+file_resource "/usr/share/#{name}/managed.conf", content: "installed #{name}\n",
+  depends_on: [{package: {source: "official", name: name}}]
+RUBY
+entry() {
+    printf '{"schemaVersion":1,"imports":[],"options":[{"path":"environment.systemPackages","value":["%s"]},{"path":"lab.install.package","value":"%s"}]}\n' \
+        "$1" "$1" > "$base/repo/entry.json"
+    [[ ! -e "/usr/share/$1" ]]
+}
+dek() {
+    XDG_CACHE_HOME="$base/cache" /usr/local/bin/dek --repo "$base/repo" -H fixture "$@" --state-dir "$base/state"
+}
+check_plan() {
+    local json=$1 target=$2 version=$3
+    shift 3
+    python3 - "$json" "$target" "$version" "$@" <<'PY'
+import json
+import pathlib
+import sys
+
+path, target, version, *dependencies = sys.argv[1:]
+plan = json.loads(pathlib.Path(path).read_text())
+(package, file) = plan['actions']
+transaction = package['kind']['repositoryTransaction']
+assert transaction['scope'] == 'install' and transaction['targets'] == [target], transaction
+candidates = {change['install']['candidate']['name']: change['install']['candidate'] for change in transaction['changes']}
+assert candidates.keys() == {target, *dependencies}, candidates
+assert candidates[target]['version'] == version and candidates[target]['repository'] == 'fixture'
+assert all(len(candidate['sha256']) == 64 for candidate in candidates.values())
+assert all(condition['packageVersion']['expected'] is None for condition in package['preconditions'])
+assert 'writeFile' in file['kind'] and package['id'] in file['dependsOn']
+print(plan['plan_id'])
+PY
+}
+plan() { dek plan --json; }
+verify_install() {
+    [[ $(pacman -Q "$1") == "$1 1-1" && $(pacman -Q "$1-dep") == "$1-dep 1-1" ]]
+    grep -Fxq "installed $1" "/usr/share/$1/managed.conf"
+    grep -Fxq "$1-dep 1-1" <(pacman -Qd)
+    [[ $(wc -l < "$base/hook.log") == "$2" ]]
+}
+
+start_repo a
+pacman -Syy --noconfirm
+stop_repo
+cp -- "$base/a/"dek-fixture-full*.pkg.tar.zst* "$base/cache-first/"
+entry dek-fixture-full
+plan > "$work/full.json"
+full_plan=$(check_plan "$work/full.json" dek-fixture-full 1-1 dek-fixture-full-dep)
+printf 'Offline reviewed plan %s\n' "$full_plan"
+dek apply
+verify_install dek-fixture-full 1
+
+cp -- "$base/a/"dek-fixture-partial-dep*.pkg.tar.zst* "$base/cache-second/"
+printf 'wrong archive bytes\n' > "$base/cache-first/dek-fixture-partial-dep-1-1-any.pkg.tar.zst"
+entry dek-fixture-partial
+start_repo a
+plan > "$work/partial.json"
+partial_plan=$(check_plan "$work/partial.json" dek-fixture-partial 1-1 dek-fixture-partial-dep)
+printf 'Partial cache reviewed plan %s\n' "$partial_plan"
+dek apply
+verify_install dek-fixture-partial 2
+stop_repo
+cat "$work/http"
+mapfile -t requested < <(sed -n 's/.*"GET \/\([^ ]*\) HTTP.*/\1/p' "$work/http" | sort)
+[[ ${requested[*]} == 'dek-fixture-partial-1-1-any.pkg.tar.zst dek-fixture-partial-1-1-any.pkg.tar.zst.sig' ]]
+grep -Fxq 'wrong archive bytes' "$base/cache-first/dek-fixture-partial-dep-1-1-any.pkg.tar.zst"
+
+entry dek-fixture-drift
+plan > "$work/drift-before.json"
+old=$(check_plan "$work/drift-before.json" dek-fixture-drift 1-1 dek-fixture-drift-dep)
+start_repo b
+pacman -Syy --noconfirm
+stop_repo
+snapshot() {
+    find /var/lib/pacman/local /var/lib/pacman/sync -type f -print0 | sort -z | xargs -0 sha256sum
+    sha256sum /usr/share/dek-fixture-{full,partial}/managed.conf "$base/hook.log"
+}
+snapshot > "$work/before"
+if dek apply --plan "$old" > "$work/drift.log" 2>&1; then
+    printf 'Stale plan was unexpectedly applied\n' >&2
+    exit 1
+fi
+cat "$work/drift.log"
+! grep -q '^run_id ' "$work/drift.log"
+new=$(awk '/^计划 / { print $2 }' "$work/drift.log")
+[[ "$new" =~ ^[0-9a-f]{64}$ && "$old" != "$new" && -f "$base/state/plans/$new.mpk" ]]
+plan > "$work/drift-after.json"
+[[ $(check_plan "$work/drift-after.json" dek-fixture-drift 2-1 dek-fixture-drift-dep dek-fixture-drift-new) == "$new" ]]
+snapshot > "$work/after"
+cmp "$work/before" "$work/after"
+[[ ! -e /usr/share/dek-fixture-drift/managed.conf ]]
+! pacman -Q dek-fixture-drift
+printf 'Drift returned a saved plan and preserved package database, file and hook state: '
+sha256sum "$work/after"
