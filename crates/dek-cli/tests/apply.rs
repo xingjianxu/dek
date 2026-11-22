@@ -18,6 +18,7 @@ use dek_core::{
 };
 use dek_target::backend::{
     ActionContext, ActionReadiness, Backend, BackendError, BackendRegistry, PlannedAction,
+    PlannedNotification,
 };
 use serde_json::{Value, json};
 use tempfile::{NamedTempFile, TempDir};
@@ -56,6 +57,20 @@ impl Backend for Probe {
             return Vec::new();
         }
         let mut capabilities = LocalFileBackend.capabilities();
+        if self.mode == "notice-probe" {
+            capabilities.push(ResourceCapability {
+                kind: ResourceKind::SystemdUnit,
+                version: 1,
+                attributes: ["reload".to_owned()].into(),
+            });
+        }
+        if self.mode == "package-probe" {
+            capabilities.push(ResourceCapability {
+                kind: ResourceKind::Package,
+                version: 1,
+                attributes: Default::default(),
+            });
+        }
         if self.mode == "extra-capability" {
             capabilities.push(ResourceCapability {
                 kind: ResourceKind::Directory,
@@ -67,10 +82,19 @@ impl Backend for Probe {
     }
 
     fn validate(&self, resource: &DesiredResource) -> Result<(), BackendError> {
+        if self.mode == "package-probe" && matches!(resource, DesiredResource::Package(_)) {
+            return Ok(());
+        }
         LocalFileBackend.validate(resource)
     }
 
     fn observe(&self, resource: &DesiredResource) -> Result<Vec<Precondition>, BackendError> {
+        if let DesiredResource::Package(package) = resource {
+            return Ok(vec![Precondition::PackageVersion {
+                package: package.package.clone(),
+                expected: None,
+            }]);
+        }
         LocalFileBackend.observe(resource)
     }
 
@@ -79,18 +103,60 @@ impl Backend for Probe {
         resource: &DesiredResource,
         observed: &[Precondition],
     ) -> Result<Vec<PlannedAction>, BackendError> {
+        if let DesiredResource::Package(package) = resource {
+            return Ok(vec![PlannedAction {
+                kind: ActionKind::InstallPackage {
+                    package: package.package.clone(),
+                    candidate_version: "1.0".into(),
+                },
+                reason: "probe package absent".into(),
+                content_changed: false,
+                preconditions: observed.to_vec(),
+            }]);
+        }
         LocalFileBackend.plan(resource, observed)
+    }
+
+    fn plan_notification(
+        &self,
+        notice: &dek_core::ServiceNotification,
+        _: bool,
+    ) -> Result<Option<PlannedNotification>, BackendError> {
+        Ok(Some(PlannedNotification {
+            reason: "probe service reload".into(),
+            preconditions: vec![Precondition::UnitRunning {
+                unit: notice.unit.clone(),
+                expected: true,
+            }],
+        }))
     }
 
     fn validate_action(&self, action: &Action) -> Result<(), BackendError> {
         match &action.kind {
-            ActionKind::WriteFile { .. } => Ok(()),
+            ActionKind::WriteFile { .. }
+            | ActionKind::InstallPackage { .. }
+            | ActionKind::NotifyService { .. } => Ok(()),
             _ => Err(BackendError("probe can only write files".into())),
         }
     }
 
     fn inspect_action(&self, action: &Action) -> Result<ActionReadiness, BackendError> {
+        if matches!(action.kind, ActionKind::NotifyService { .. }) {
+            return Ok(ActionReadiness::Ready);
+        }
+        if let ActionKind::InstallPackage { package, .. } = &action.kind {
+            self.events
+                .borrow_mut()
+                .push(format!("observe {}", package.name));
+            return Ok(ActionReadiness::Ready);
+        }
         let (path, content) = write_action(&action.kind);
+        if self.mode == "interrupt-during-inspection" {
+            std::process::exit(76);
+        }
+        if self.mode == "observe-first" && Path::new(path).ends_with("first") {
+            self.events.borrow_mut().push(format!("observe {path}"));
+        }
         let resource = DesiredResource::File(dek_core::FileResource {
             path: path.into(),
             state: dek_core::FileState::Present(content.clone()),
@@ -108,6 +174,12 @@ impl Backend for Probe {
     }
 
     fn execute(&self, context: &ActionContext<'_>) -> Result<(), BackendError> {
+        if let ActionKind::NotifyService { unit, .. } = &context.action.kind {
+            self.events
+                .borrow_mut()
+                .push(format!("notify {}", unit.name));
+            return Ok(());
+        }
         let (path, content) = write_action(&context.action.kind);
         assert_eq!(Path::new(path).parent(), Some(self.root.as_path()));
         assert_eq!(self.inspect_action(context.action)?, ActionReadiness::Ready);
@@ -121,12 +193,26 @@ impl Backend for Probe {
         if self.mode == "hold" {
             wait_for(&self.root.join("release"));
         }
+        if self.mode == "fail-second" && Path::new(path).ends_with("second") {
+            return Err(BackendError("probe second write failed".into()));
+        }
         self.events.borrow_mut().push(format!("write {path}"));
         fs::write(path, context.content(&content.digest)?)
-            .map_err(|error| BackendError(error.to_string()))
+            .map_err(|error| BackendError(error.to_string()))?;
+        if self.mode == "interrupt-after-write" || self.root.join("interrupt").exists() {
+            drop(_active);
+            std::process::exit(75);
+        }
+        Ok(())
     }
 
     fn verify(&self, action: &ActionKind) -> Result<bool, BackendError> {
+        if let ActionKind::NotifyService { unit, .. } = action {
+            self.events
+                .borrow_mut()
+                .push(format!("verify {}", unit.name));
+            return Ok(true);
+        }
         let (path, content) = write_action(action);
         self.events.borrow_mut().push(format!("verify {path}"));
         if self.mode == "fail-verify" {
@@ -225,7 +311,11 @@ impl Fixture {
     }
 
     fn plan(&self) -> String {
-        let report = self.run("", &["plan", "--json"]);
+        self.plan_mode("")
+    }
+
+    fn plan_mode(&self, mode: &str) -> String {
+        let report = self.run(mode, &["plan", "--json"]);
         assert!(report["error"].is_null(), "{report}");
         let plan: Value = serde_json::from_str(stdout(&report)).unwrap();
         plan["plan_id"].as_str().unwrap().into()
@@ -317,7 +407,10 @@ fn run_probe() {
             HostSelector::Named("server"),
             &probe.registry(),
             &probe.root.join("state"),
-            id,
+            dek_cli::applying::ApplySelection {
+                plan: id,
+                ..Default::default()
+            },
             |_, _, _| Ok(LoadedPlan::Expired),
         )
     } else {
@@ -553,9 +646,6 @@ fn an_interrupted_attempt_is_observed_before_clearing_its_original_receipt() {
             },
         )
     };
-    let error = apply().unwrap_err().to_string();
-    assert!(error.contains("待核验"), "{error}");
-    assert!(probe.events.borrow().is_empty());
     assert_eq!(fixture.latest().actions[0].result, ActionResult::Unverified);
 
     fs::write(fixture.target("first"), b"A").unwrap();
@@ -638,4 +728,259 @@ fn expired_approval_returns_the_newly_issued_id_even_when_desired_state_is_ident
     let report = fixture.run("", &["apply", "--plan", fresh_id]);
     assert!(report["error"].is_null(), "{report}");
     assert_eq!(events(&report).len(), 4);
+}
+
+fn run_id(report: &Value) -> &str {
+    stdout(report)
+        .lines()
+        .find_map(|line| line.strip_prefix("run_id "))
+        .unwrap_or_else(|| panic!("missing run ID: {report}"))
+}
+
+fn status_for(fixture: &Fixture, run: Option<&str>) -> Value {
+    let mut args = vec!["status", "--json"];
+    if let Some(id) = run {
+        args.extend_from_slice(&["--run", id]);
+    }
+    let report = fixture.run("", &args);
+    assert!(report["error"].is_null(), "{report}");
+    serde_json::from_str(stdout(&report)).unwrap()
+}
+
+#[test]
+fn status_reports_partial_execution_and_plain_apply_resumes_only_the_failed_step() {
+    let fixture = Fixture::new();
+    let plan_id = fixture.plan();
+    let failed = fixture.run("fail-second", &["apply", "--plan", &plan_id]);
+    assert!(
+        error(&failed).contains("probe second write failed"),
+        "{failed}"
+    );
+    let id = run_id(&failed);
+    let partial = status_for(&fixture, Some(id));
+    assert_eq!(partial["run_id"], id);
+    assert_eq!(partial["plan_id"], plan_id);
+    assert_eq!(partial["actions"][0]["result"]["verified"]["changed"], true);
+    assert!(partial["actions"][1]["result"]["failed"]["message"].is_string());
+
+    fs::remove_dir_all(fixture.root.path().join("cache")).unwrap();
+    fs::remove_file(fixture.repo().join("host.json")).unwrap();
+    assert_eq!(status_for(&fixture, Some(id)), partial);
+    let path = fixture.state().join("plans").join(format!("{plan_id}.mpk"));
+    let mut record: Value = rmp_serde::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["createdAt"] = json!(1);
+    fs::write(path, rmp_serde::to_vec_named(&record).unwrap()).unwrap();
+
+    let resumed = fixture.run("", &["apply"]);
+    assert!(resumed["error"].is_null(), "{resumed}");
+    assert_eq!(run_id(&resumed), id);
+    assert!(stdout(&resumed).contains("恢复"), "{resumed}");
+    assert_eq!(
+        events(&resumed),
+        [
+            format!("write {}", fixture.target("second")),
+            format!("verify {}", fixture.target("second")),
+        ]
+    );
+    assert_eq!(fs::read(fixture.target("first")).unwrap(), b"A");
+    let finished = status_for(&fixture, None);
+    assert_eq!(finished["run_id"], id);
+    assert_eq!(finished["finished"], true);
+    assert_eq!(finished["actions"][1]["attempt"], 2);
+}
+
+#[test]
+fn replay_survives_review_collection_and_status_distinguishes_previous_runs() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan();
+    let args = ["apply", "--plan", &plan, "--request-id", "job-1"];
+    let first = fixture.run("", &args);
+    assert!(first["error"].is_null(), "{first}");
+    let original = status_for(&fixture, None);
+    let first_id = run_id(&first);
+    assert_eq!(original["run_id"], first_id);
+    assert_eq!(original["request_id"], "job-1");
+    fs::remove_file(fixture.state().join("plans").join(format!("{plan}.mpk"))).unwrap();
+
+    let replay = fixture.run("", &args);
+    assert!(replay["error"].is_null(), "{replay}");
+    assert_eq!(run_id(&replay), first_id);
+    assert!(events(&replay).is_empty());
+    let explicit = fixture.run("", &["apply", "--run", first_id]);
+    assert!(explicit["error"].is_null(), "{explicit}");
+    assert_eq!(run_id(&explicit), first_id);
+    assert!(events(&explicit).is_empty());
+
+    let latest = fixture.run("", &["apply"]);
+    assert!(latest["error"].is_null(), "{latest}");
+    assert_ne!(run_id(&latest), first_id);
+    assert_eq!(status_for(&fixture, None)["run_id"], run_id(&latest));
+    assert_eq!(status_for(&fixture, Some(first_id)), original);
+    let plan = status_for(&fixture, None)["plan_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let changed = fixture.run("", &["apply", "--plan", &plan, "--request-id", "job-1"]);
+    assert!(error(&changed).contains(first_id), "{changed}");
+    assert!(events(&changed).is_empty());
+
+    for subcommand in ["status", "apply"] {
+        let rejected = fixture.run("wrong-target", &[subcommand, "--run", first_id]);
+        assert!(
+            error(&rejected).contains("另一仓库或目标主机"),
+            "{rejected}"
+        );
+        assert!(events(&rejected).is_empty());
+    }
+    let text = fixture.run("", &["status", "--run", first_id]);
+    assert!(
+        stdout(&text).contains("已核验") && stdout(&text).contains(&fixture.target("first")),
+        "{text}"
+    );
+}
+
+#[test]
+fn real_interruption_reobserves_achieved_content_before_continuing() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan();
+    let args = ["apply", "--plan", &plan, "--request-id", "restart-probe"];
+    let (child, _) = fixture.launch("interrupt-after-write", &args);
+    let interrupted = child.wait_with_output().unwrap();
+    assert_eq!(interrupted.status.code(), Some(75), "{interrupted:?}");
+    let pending = status_for(&fixture, None);
+    let id = pending["run_id"].as_str().unwrap();
+    assert_eq!(pending["actions"][0]["result"], "unverified");
+    assert_eq!(fs::read(fixture.target("first")).unwrap(), b"A");
+
+    let recovered = fixture.run("observe-first", &args);
+    assert!(recovered["error"].is_null(), "{recovered}");
+    assert_eq!(run_id(&recovered), id);
+    assert_eq!(
+        events(&recovered),
+        [
+            format!("observe {}", fixture.target("first")),
+            format!("write {}", fixture.target("second")),
+            format!("verify {}", fixture.target("second")),
+        ]
+    );
+    let finished = status_for(&fixture, Some(id));
+    assert_eq!(finished["actions"][0]["attempt"], 1);
+    assert_eq!(
+        finished["actions"][0]["result"]["verified"]["changed"],
+        false
+    );
+}
+
+#[test]
+fn an_uncertain_package_attempt_stays_unverified_and_is_not_dispatched() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "host.json",
+        json!({
+            "schemaVersion": 1,
+            "imports": [],
+            "options": [{"path": "environment.systemPackages", "value": ["recovery-probe"]}]
+        })
+        .to_string(),
+    );
+    let plan = fixture.plan_mode("package-probe");
+    let repo = fixture.repo().canonicalize().unwrap();
+    let repository_id = CacheDigest::of_bytes(repo.as_os_str().as_encoded_bytes()).to_string();
+    let registry = local_registry(&LocalFileBackend).unwrap();
+    let binding = PlanBinding {
+        repository_id: &repository_id,
+        logical_host: "server",
+        target: registry.target(),
+    };
+    let store = StateStore::open(&fixture.state()).unwrap();
+    let guard = store.lock().unwrap();
+    let run = guard
+        .begin_run(&plan, binding, "uncertain-package")
+        .unwrap();
+    assert!(matches!(
+        run.actions[0].action.kind,
+        ActionKind::InstallPackage { .. }
+    ));
+    guard
+        .begin_action(&run.id, binding, &run.actions[0].action.id)
+        .unwrap();
+    drop(guard);
+
+    let report = fixture.run("package-probe", &["apply", "--run", &run.id]);
+    assert!(
+        error(&report).contains("无法从当前状态确认包事务"),
+        "{report}"
+    );
+    assert_eq!(events(&report), ["observe recovery-probe"]);
+    let status = status_for(&fixture, Some(&run.id));
+    assert_eq!(status["actions"][0]["result"], "unverified");
+    assert_eq!(status["actions"][0]["attempt"], 1);
+    assert!(
+        status["actions"][0]["recoveryDiagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("包事务")
+    );
+    assert!(!Path::new(&fixture.target("first")).exists());
+}
+
+#[test]
+fn later_plan_surfaces_the_original_queued_notice_and_recovery_completes_it() {
+    let fixture = Fixture::new();
+    let path = fixture.target("first");
+    fixture.write("expand.rb", format!(
+        "file_resource {path:?}, source: 'source', notifications: [{{unit: {{scope: 'system', name: 'probe.service'}}, when: 'contentChanged', effect: 'reload'}}]\n"
+    ));
+    let plan = fixture.plan_mode("notice-probe");
+    let interrupt = fixture.root.path().join("interrupt");
+    fs::write(&interrupt, b"exit before receipt").unwrap();
+    let (child, _) = fixture.launch("notice-probe", &["apply", "--plan", &plan]);
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(75));
+    fs::remove_file(interrupt).unwrap();
+
+    let original = status_for(&fixture, None);
+    let id = original["run_id"].as_str().unwrap();
+    assert_eq!(
+        original["pending_notifications"][0]["unit"]["name"],
+        "probe.service"
+    );
+    let preview = fixture.run("notice-probe", &["plan", "--json"]);
+    assert!(preview["error"].is_null(), "{preview}");
+    let preview: Value = serde_json::from_str(stdout(&preview)).unwrap();
+    assert_eq!(preview["actions"], json!([]));
+    assert_eq!(preview["pending_notifications"][0]["runId"], id);
+    assert_eq!(
+        preview["pending_notifications"][0]["prerequisitesVerified"],
+        false
+    );
+
+    let resumed = fixture.run("notice-probe", &["apply"]);
+    assert!(resumed["error"].is_null(), "{resumed}");
+    assert_eq!(run_id(&resumed), id);
+    assert_eq!(
+        events(&resumed),
+        ["notify probe.service", "verify probe.service"]
+    );
+    assert_eq!(
+        status_for(&fixture, Some(id))["pending_notifications"],
+        json!([])
+    );
+}
+
+#[test]
+fn interruption_during_read_only_inspection_leaves_the_action_pending() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan();
+    let (child, _) = fixture.launch("interrupt-during-inspection", &["apply", "--plan", &plan]);
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(76));
+    let pending = status_for(&fixture, None);
+    assert_eq!(pending["actions"][0]["result"], "pending");
+    assert_eq!(pending["actions"][0]["attempt"], 0);
+    assert!(!Path::new(&fixture.target("first")).exists());
+
+    let resumed = fixture.run("", &["apply"]);
+    assert!(resumed["error"].is_null(), "{resumed}");
+    assert_eq!(run_id(&resumed), pending["run_id"].as_str().unwrap());
+    assert_eq!(events(&resumed).len(), 4);
+    assert_eq!(status_for(&fixture, None)["actions"][0]["attempt"], 1);
 }

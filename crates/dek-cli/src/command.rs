@@ -5,9 +5,10 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(not(target_os = "linux"))]
+use crate::plan_output::write_plan;
 use crate::{
-    evaluation::normal_cache, local_target::LocalEvaluationTarget, plan_output::write_plan,
-    planning::plan_host_with_cache,
+    evaluation::normal_cache, local_target::LocalEvaluationTarget, planning::plan_host_with_cache,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dek_controller::{
@@ -81,9 +82,28 @@ enum Command {
         /// 已审阅的计划 ID。
         #[arg(long, value_name = "计划ID")]
         plan: Option<String>,
+        /// 恢复指定的执行记录。
+        #[arg(long, value_name = "执行ID", conflicts_with = "plan")]
+        run: Option<String>,
+        /// 同一计划可重发的请求标识。
+        #[arg(long, value_name = "标识", requires = "plan")]
+        request_id: Option<String>,
         /// 使用指定的私有目标状态目录。默认 /var/lib/dek。
         #[arg(long, value_name = "目录")]
         state_dir: Option<PathBuf>,
+    },
+    /// 查看最近或指定的本机执行记录。
+    #[cfg(target_os = "linux")]
+    Status {
+        /// 指定执行 ID。默认显示最近执行。
+        #[arg(long, value_name = "执行ID")]
+        run: Option<String>,
+        /// 使用指定的私有目标状态目录。默认 /var/lib/dek。
+        #[arg(long, value_name = "目录")]
+        state_dir: Option<PathBuf>,
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
     },
     /// 观测本机目标并预览配置差异。
     Plan {
@@ -151,11 +171,14 @@ fn run_command<'target>(
     #[cfg(target_os = "linux")]
     let systemd = dek_linux::systemd::SystemdBackend;
     #[cfg(target_os = "linux")]
+    let accounts = dek_linux::accounts::AccountBackend::default();
+    #[cfg(target_os = "linux")]
     let local_target = || {
         let mut registry = local_target()?;
         if _production {
             registry.register(&secrets)?;
             registry.register(&systemd)?;
+            registry.register(&accounts)?;
         }
         Ok::<_, Box<dyn Error>>(registry)
     };
@@ -229,7 +252,12 @@ fn run_command<'target>(
             dek_target::transport::serve(&local_target()?, &mut io::stdin().lock(), &mut out)?;
         }
         #[cfg(target_os = "linux")]
-        Command::Apply { plan, state_dir } => {
+        Command::Apply {
+            plan,
+            run,
+            request_id,
+            state_dir,
+        } => {
             use dek_target::state::DEFAULT_ROOT;
 
             let repo = discover_repo(cli.repo.as_deref())?;
@@ -242,7 +270,33 @@ fn run_command<'target>(
                 selection.selector(),
                 &registry,
                 &state_dir,
-                plan.as_deref(),
+                crate::applying::ApplySelection {
+                    plan: plan.as_deref(),
+                    run: run.as_deref(),
+                    request_id: request_id.as_deref(),
+                },
+            )?;
+        }
+        #[cfg(target_os = "linux")]
+        Command::Status {
+            run,
+            state_dir,
+            json,
+        } => {
+            use dek_target::state::DEFAULT_ROOT;
+
+            let repo = discover_repo(cli.repo.as_deref())?;
+            let selection = HostSelection::from_arg(cli.host)?;
+            let registry = local_target()?;
+            let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
+            crate::status::show_status(
+                &mut out,
+                &repo,
+                selection.selector(),
+                registry.target(),
+                &state_dir,
+                run.as_deref(),
+                json,
             )?;
         }
         Command::Plan {
@@ -263,8 +317,8 @@ fn run_command<'target>(
                 cache.as_ref(),
             )?;
             #[cfg(target_os = "linux")]
-            let plan = {
-                use dek_target::state::{DEFAULT_ROOT, StateStore};
+            let (plan, pending) = {
+                use dek_target::state::{DEFAULT_ROOT, PlanBinding, StateStore};
 
                 let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
                 let store = StateStore::open(&state_dir).map_err(|err| {
@@ -272,16 +326,24 @@ fn run_command<'target>(
                         "{err}。请使用持有目标状态目录的账户，或用 --state-dir 指定该账户的私有目录"
                     )
                 })?;
-                store.lock()?.save_plan(
+                let guard = store.lock()?;
+                let plan = guard.save_plan(
                     &planned.name,
                     &planned.plan,
                     &planned.expanded.resources,
                     &planned.expanded.contents,
-                )?
+                )?;
+                let pending = guard.pending_notifications(PlanBinding {
+                    repository_id: &plan.repository_id,
+                    logical_host: &planned.name,
+                    target: registry.target(),
+                })?;
+                (plan, pending)
             };
+            #[cfg(target_os = "linux")]
+            crate::status::write_plan_with_pending(&mut out, &planned.name, &plan, json, &pending)?;
             #[cfg(not(target_os = "linux"))]
-            let plan = planned.plan;
-            write_plan(&mut out, &planned.name, &plan, json)?;
+            write_plan(&mut out, &planned.name, &planned.plan, json)?;
         }
     }
     Ok(())
