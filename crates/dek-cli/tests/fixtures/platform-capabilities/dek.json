@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "hosts": {
+    "arch": {"entry": "arch.rb", "target": {"local": true}},
+    "memory": {"entry": "memory.rb", "target": {"local": true}},
+    "forced-timer": {"entry": "forced-timer.rb", "target": {"local": true}},
+    "alias": {"entry": "alias.rb", "target": {"local": true}}
+  },
+  "profiles": {
+    "shared": {"entry": "shared.rb", "inputs": "sdk"},
+    "timer": {"entry": "timer.rb", "inputs": "sdk"}
+  },
+  "modules": {
+    "lab.platform": {"schema": "options.json", "expand": "expand.rb", "inputs": "sdk"}
+  }
+}
