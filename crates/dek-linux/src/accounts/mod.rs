@@ -3,7 +3,7 @@
 mod database;
 mod nss;
 mod primary;
-mod tools;
+pub(crate) mod tools;
 
 pub(crate) use nss::{UserAccount, user_account};
 
@@ -19,6 +19,22 @@ use dek_target::backend::{ActionContext, ActionReadiness, Backend, BackendError,
 use database::{Database, LocalUser, Snapshot};
 
 pub use nss::{group_id, user_id};
+
+pub(crate) use database::LocalUser as SshUser;
+
+pub(crate) fn ssh_user(user: &str) -> Result<Option<SshUser>, BackendError> {
+    name(user, false)?;
+    Ok(Database::default().read()?.user(user, None)?.cloned())
+}
+
+pub(crate) fn ensure_unique_ssh_home(
+    user: &str,
+    home: &std::path::Path,
+) -> Result<(), BackendError> {
+    Database::default()
+        .read()?
+        .ensure_unique_ssh_home(user, home)
+}
 
 #[derive(Default)]
 pub struct AccountBackend {

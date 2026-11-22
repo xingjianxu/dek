@@ -233,12 +233,13 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             }
         }
 
-        let fresh = planner::plan_for_host(
+        let fresh = planner::plan_for_host_with_contents(
             self.registry,
             binding.repository_id,
             binding.logical_host,
             &reviewed.resources,
             &reviewed.plan.used_inputs,
+            &reviewed.contents,
         )?;
         let resumed = match &application {
             Application::Resume(run) => Some(run.as_ref()),
@@ -832,7 +833,7 @@ fn action_kind(action: &ActionKind) -> ResourceKind {
         | ActionKind::SetUnitEnabled { .. }
         | ActionKind::SetUnitRunning { .. }
         | ActionKind::NotifyService { .. } => ResourceKind::SystemdUnit,
-        ActionKind::UpdateAuthorizedKeys(_) => ResourceKind::AuthorizedKeys,
+        ActionKind::UpdateAuthorizedKeys { .. } => ResourceKind::AuthorizedKeys,
         ActionKind::DeployAgeSecret(_) | ActionKind::SetAgeSecretAttributes(_) => {
             ResourceKind::AgeSecret
         }

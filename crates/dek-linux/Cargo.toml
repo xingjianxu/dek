@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 age = { version = "0.12.1", default-features = false, features = ["armor"] }
+base64 = "0.23"
 dek-core.workspace = true
 dek-target.workspace = true
 hmac = "0.12"

@@ -175,6 +175,8 @@ fn run_command<'target>(
     #[cfg(target_os = "linux")]
     let accounts = dek_linux::accounts::AccountBackend::default();
     #[cfg(target_os = "linux")]
+    let authorized_keys = dek_linux::ssh_keys::AuthorizedKeysBackend;
+    #[cfg(target_os = "linux")]
     let directories = dek_linux::filesystem::DirectoryBackend;
     #[cfg(target_os = "linux")]
     let local_target = || {
@@ -186,6 +188,7 @@ fn run_command<'target>(
             }
             registry.register(&systemd)?;
             registry.register(&accounts)?;
+            registry.register(&authorized_keys)?;
             registry.register(&directories)?;
         }
         Ok::<_, Box<dyn Error>>(registry)

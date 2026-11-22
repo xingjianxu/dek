@@ -68,6 +68,21 @@ pub struct ActionContext<'a> {
     before_content_change: Option<&'a (dyn Fn(bool) -> Result<(), BackendError> + Sync)>,
 }
 
+/// Inputs available to backends that need reviewed bytes while planning.
+pub struct PlanningContext<'a> {
+    pub resources: &'a ResourceSet,
+    pub(crate) contents: &'a BTreeMap<ContentDigest, Vec<u8>>,
+}
+
+impl PlanningContext<'_> {
+    pub fn content(&self, digest: &ContentDigest) -> Result<&[u8], BackendError> {
+        self.contents
+            .get(digest)
+            .map(Vec::as_slice)
+            .ok_or_else(|| BackendError(format!("缺少已审阅内容 {}", digest.0)))
+    }
+}
+
 impl<'a> ActionContext<'a> {
     #[cfg(target_os = "linux")]
     pub(crate) fn new(action: &'a Action, contents: &'a BTreeMap<ContentDigest, Vec<u8>>) -> Self {
@@ -150,6 +165,18 @@ pub trait Backend {
         resource: &DesiredResource,
         observed: &[Precondition],
     ) -> Result<Vec<PlannedAction>, BackendError>;
+
+    fn plan_with_contents(
+        &self,
+        resource: &DesiredResource,
+        _: &PlanningContext<'_>,
+    ) -> Result<Vec<PlannedAction>, BackendError> {
+        let observed = self
+            .observe(resource)
+            .map_err(|err| BackendError(format!("observe: {err}")))?;
+        self.plan(resource, &observed)
+            .map_err(|err| BackendError(format!("plan: {err}")))
+    }
 
     fn validate_notification(&self, _: &ServiceNotification) -> Result<(), BackendError> {
         Ok(())

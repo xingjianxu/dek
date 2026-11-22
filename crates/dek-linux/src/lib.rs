@@ -13,4 +13,7 @@ pub mod filesystem;
 pub mod secrets;
 
 #[cfg(target_os = "linux")]
+pub mod ssh_keys;
+
+#[cfg(target_os = "linux")]
 pub mod systemd;

@@ -22,6 +22,34 @@ pub(crate) struct TargetPath {
 }
 
 impl TargetPath {
+    pub(crate) fn child_of(parent: OwnedFd, name: &str) -> Self {
+        Self {
+            parent,
+            name: name.into(),
+        }
+    }
+
+    pub(crate) fn open_directory(&self) -> io::Result<Option<OwnedFd>> {
+        match openat(
+            &self.parent,
+            &self.name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => Ok(Some(fd)),
+            Err(Errno::NOENT) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub(crate) fn require_current_parent(&self, path: &Path) -> io::Result<()> {
+        let current = Self::open(path)?.ok_or_else(changed_path)?;
+        if !same_inode(&fstat(&self.parent)?, &fstat(&current.parent)?) {
+            return Err(changed_path());
+        }
+        Ok(())
+    }
+
     /// Open the parent without following links. None means an ancestor is absent.
     pub(crate) fn open(path: &Path) -> io::Result<Option<Self>> {
         if !path.is_absolute() {

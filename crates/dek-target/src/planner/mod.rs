@@ -13,7 +13,7 @@ use dek_core::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::backend::BackendRegistry;
+use crate::backend::{BackendRegistry, PlanningContext};
 use graph::{prepare, topological_order};
 
 #[derive(Debug, Error)]
@@ -72,7 +72,14 @@ pub fn plan(
     resources: &ResourceSet,
     used_inputs: &[InputObservation],
 ) -> Result<Plan, PlanError> {
-    plan_with_host(registry, repository_id, None, resources, used_inputs)
+    plan_with_host(
+        registry,
+        repository_id,
+        None,
+        resources,
+        used_inputs,
+        &BTreeMap::new(),
+    )
 }
 
 /// Build a reviewed plan whose ID also binds the exact repository host name.
@@ -83,12 +90,32 @@ pub fn plan_for_host(
     resources: &ResourceSet,
     used_inputs: &[InputObservation],
 ) -> Result<Plan, PlanError> {
+    plan_for_host_with_contents(
+        registry,
+        repository_id,
+        logical_host,
+        resources,
+        used_inputs,
+        &BTreeMap::new(),
+    )
+}
+
+/// Build a host plan with the immutable blobs referenced by its desired resources.
+pub fn plan_for_host_with_contents(
+    registry: &BackendRegistry<'_>,
+    repository_id: &str,
+    logical_host: &str,
+    resources: &ResourceSet,
+    used_inputs: &[InputObservation],
+    contents: &BTreeMap<ContentDigest, Vec<u8>>,
+) -> Result<Plan, PlanError> {
     plan_with_host(
         registry,
         repository_id,
         Some(logical_host),
         resources,
         used_inputs,
+        contents,
     )
 }
 
@@ -98,10 +125,15 @@ fn plan_with_host(
     logical_host: Option<&str>,
     resources: &ResourceSet,
     used_inputs: &[InputObservation],
+    contents: &BTreeMap<ContentDigest, Vec<u8>>,
 ) -> Result<Plan, PlanError> {
     let (prepared, used_capabilities) = prepare(registry, resources)?;
     let order = topological_order(registry, &prepared)?;
     let mut actions = Actions::default();
+    let context = PlanningContext {
+        resources,
+        contents,
+    };
 
     for id in order {
         let prepared_resource = &prepared[&id];
@@ -109,12 +141,9 @@ fn plan_with_host(
         let (_, backend) = registry
             .backend(resource.desired.kind())
             .expect("validated backend");
-        let observed = backend
-            .observe(&resource.desired)
-            .map_err(|err| resource_error(registry, resource, format!("observe: {err}")))?;
         let drafts = backend
-            .plan(&resource.desired, &observed)
-            .map_err(|err| resource_error(registry, resource, format!("plan: {err}")))?;
+            .plan_with_contents(&resource.desired, &context)
+            .map_err(|err| resource_error(registry, resource, err.0))?;
         let mut predecessors = prepared_resource
             .dependencies
             .iter()

@@ -58,7 +58,7 @@ impl Plan {
                     digests.insert(&content.digest);
                 }
                 ActionKind::DeployUnit { definition, .. } => definition.add_digests(&mut digests),
-                ActionKind::UpdateAuthorizedKeys(keys) => digests.extend(&keys.key_files),
+                ActionKind::UpdateAuthorizedKeys { keys, .. } => digests.extend(&keys.key_files),
                 ActionKind::DeployAgeSecret(secret)
                 | ActionKind::SetAgeSecretAttributes(secret) => {
                     digests.insert(&secret.ciphertext);
@@ -169,7 +169,11 @@ pub enum ActionKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sources: Vec<NotificationSource>,
     },
-    UpdateAuthorizedKeys(AuthorizedKeysResource),
+    UpdateAuthorizedKeys {
+        keys: AuthorizedKeysResource,
+        home: String,
+        managed_digest: ContentDigest,
+    },
     DeployAgeSecret(AgeSecretResource),
     SetAgeSecretAttributes(AgeSecretResource),
 }
