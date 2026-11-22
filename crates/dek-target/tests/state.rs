@@ -134,10 +134,10 @@ fn restrictive_umask_keeps_new_records_and_objects_readable() {
         let plan = plan_for_host(&registry, "repo", "host", &resources, &[]).unwrap();
         let (digest, _) = wanted(b"reviewed");
 
-        state.put_object(&digest, b"reviewed").unwrap();
         state
             .save_plan("host", &plan, &resources, &BTreeMap::new())
             .unwrap();
+        state.put_object(&digest, b"reviewed").unwrap();
         assert_eq!(
             state
                 .load_plan(&plan.id, binding("host", &target))

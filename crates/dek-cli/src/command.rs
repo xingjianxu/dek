@@ -187,7 +187,7 @@ pub fn run<'target>(
                 cache.as_ref(),
             )?;
             #[cfg(target_os = "linux")]
-            {
+            let plan = {
                 use dek_target::state::{DEFAULT_ROOT, StateStore};
 
                 let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
@@ -201,9 +201,11 @@ pub fn run<'target>(
                     &planned.plan,
                     &planned.expanded.resources,
                     &planned.expanded.contents,
-                )?;
-            }
-            write_plan(&mut out, &planned.name, &planned.plan, json)?;
+                )?
+            };
+            #[cfg(not(target_os = "linux"))]
+            let plan = planned.plan;
+            write_plan(&mut out, &planned.name, &plan, json)?;
         }
     }
     Ok(())

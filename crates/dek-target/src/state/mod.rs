@@ -1,6 +1,7 @@
 //! Target-owned reviewed plans and content-addressed objects.
 
 mod fs;
+mod retention;
 mod runs;
 
 pub use runs::{ActionAttempt, ActionReceipt, ActionResult, RunAction, RunNotification, RunRecord};
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use self::fs::Directory;
+use self::{fs::Directory, retention::RetentionPolicy};
 use crate::planner::{plan_id, resource_digest};
 
 pub const DEFAULT_ROOT: &str = "/var/lib/dek";
@@ -28,6 +29,10 @@ const FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum StateError {
+    #[error("计划 {id} 已于 Unix 时间 {expired_at} 过期。请重新运行 dek plan 并审阅新计划")]
+    ExpiredPlan { id: String, expired_at: u64 },
+    #[error("缺少已审阅计划 {id}（{path}）。请重新运行 dek plan")]
+    MissingPlan { id: String, path: PathBuf },
     #[error("无法{action} {path}：{source}。请检查目标状态目录后重新运行 dek plan")]
     Io {
         action: &'static str,
@@ -61,6 +66,8 @@ pub struct StateStore {
     root: Directory,
     plans: Directory,
     objects: Directory,
+    expired: Directory,
+    clock: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
 /// A target-wide transaction. A later state consumer can pin a plan reference
@@ -70,6 +77,7 @@ pub struct StateGuard<'a> {
     store: &'a StateStore,
     _lock: File,
     _single_thread: PhantomData<Cell<()>>,
+    retention: RetentionPolicy,
 }
 
 #[derive(Clone, Copy)]
@@ -95,6 +103,8 @@ struct Record<P, R, H> {
     format_version: u32,
     logical_host: H,
     created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issuance: Option<u64>,
     plan: P,
     resources: R,
 }
@@ -103,22 +113,40 @@ type OwnedRecord = Record<Plan, ResourceSet, String>;
 
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self, StateError> {
+        Self::open_with_clock(path, || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
+    }
+
+    /// Use an explicit Unix-seconds clock for the target plan lifecycle.
+    pub fn open_with_clock(
+        path: &Path,
+        clock: impl Fn() -> u64 + Send + Sync + 'static,
+    ) -> Result<Self, StateError> {
         let root = Directory::open_root(path)?;
         let plans = root.private_child("plans")?;
         let objects = root.private_child("objects")?;
+        let expired = root.private_child("expired")?;
         Ok(Self {
             root,
             plans,
             objects,
+            expired,
+            clock: Box::new(clock),
         })
     }
 
     pub fn lock(&self) -> Result<StateGuard<'_>, StateError> {
         let lock = self.root.lock("state.lock")?;
+        let retention = RetentionPolicy::read(&self.root)?;
         Ok(StateGuard {
             store: self,
             _lock: lock,
             _single_thread: PhantomData,
+            retention,
         })
     }
 }
@@ -146,16 +174,28 @@ impl StateGuard<'_> {
         Ok(())
     }
 
+    /// Save a planner-produced review and return its current executable ID.
     pub fn save_plan(
         &self,
         logical_host: &str,
         plan: &Plan,
         resources: &ResourceSet,
         supplied: &BTreeMap<ContentDigest, Vec<u8>>,
-    ) -> Result<(), StateError> {
+    ) -> Result<Plan, StateError> {
         let name = self.plan_name(&plan.id)?;
         let path = self.store.plans.path.join(&name);
-        self.validate_record(&path, &plan.id, logical_host, plan, resources)?;
+        checked_fingerprint(&path, &plan.id, logical_host, plan, resources, None)?;
+
+        let now = (self.store.clock)();
+        let history = self.plan_history()?;
+        let prior = history
+            .iter()
+            .filter(|review| {
+                review.fingerprint == plan.id
+                    && !review.retired
+                    && !self.retention.is_expired(review.record.created_at, now)
+            })
+            .max_by_key(|review| (review.record.created_at, review.record.issuance));
         let mut pending = Vec::new();
         for digest in referenced(plan, resources) {
             let bytes = supplied.get(digest);
@@ -167,41 +207,44 @@ impl StateGuard<'_> {
                 let bytes = bytes.ok_or_else(|| {
                     StateError::invalid(&path, format!("缺少内容对象 {}", digest.0))
                 })?;
-                pending.push((key, bytes));
+                pending.push((key, bytes.as_slice()));
             }
         }
 
-        let prior = self.load_record(&name)?;
-        if let Some(record) = &prior {
-            // Reuse the prior publication only if it has the same reviewed payload.
-            if record.plan != *plan
-                || record.resources != *resources
-                || record.logical_host != logical_host
-            {
-                return Err(StateError::invalid(&path, "已有同 ID 计划的内容不同"));
-            }
+        if let Some(prior) = prior {
+            self.publish_objects(pending)?;
+            self.store.plans.sync()?;
+            return Ok(prior.record.plan.clone());
         }
 
-        for (key, bytes) in pending {
-            self.store.objects.publish(key, bytes)?;
-        }
-        self.store.objects.sync()?;
-        if prior.is_some() {
-            return self.store.plans.sync();
-        }
+        let (issued, issuance) = self.issue_plan(plan, &history, now)?;
+        let name = self.plan_name(&issued.id)?;
         let record = Record {
             format_version: FORMAT_VERSION,
             logical_host,
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            plan,
+            created_at: now,
+            issuance,
+            plan: &issued,
             resources,
         };
-        let data = rmp_serde::to_vec_named(&record)
-            .map_err(|err| StateError::invalid(&path, format!("无法编码计划：{err}")))?;
-        self.store.plans.publish(&name, &data)
+        let data = rmp_serde::to_vec_named(&record).map_err(|err| {
+            StateError::invalid(
+                &self.store.plans.path.join(&name),
+                format!("无法编码计划：{err}"),
+            )
+        })?;
+        let collection = self.review_collection(&history, referenced(plan, resources), now)?;
+        self.publish_objects(pending)?;
+        self.collect_reviews(collection)?;
+        self.store.plans.publish(&name, &data)?;
+        Ok(issued)
+    }
+
+    fn publish_objects(&self, pending: Vec<(&str, &[u8])>) -> Result<(), StateError> {
+        for (key, bytes) in pending {
+            self.store.objects.publish(key, bytes)?;
+        }
+        self.store.objects.sync()
     }
 
     pub fn load_plan(
@@ -209,39 +252,86 @@ impl StateGuard<'_> {
         id: &str,
         binding: PlanBinding<'_>,
     ) -> Result<ReviewedPlan, StateError> {
+        self.load_review(id, binding, false)
+    }
+
+    /// Resume an unfinished, bound run without enforcing the new-execution deadline.
+    pub fn load_run_plan(
+        &self,
+        run_id: &str,
+        binding: PlanBinding<'_>,
+    ) -> Result<ReviewedPlan, StateError> {
+        let run = self.load_run(run_id, binding)?;
+        if run.finished {
+            return Err(StateError::invalid(
+                &self.store.root.path,
+                format!("执行 {run_id} 已完成"),
+            ));
+        }
+        self.load_review(&run.plan_id, binding, true)
+    }
+
+    fn load_review(
+        &self,
+        id: &str,
+        binding: PlanBinding<'_>,
+        resume: bool,
+    ) -> Result<ReviewedPlan, StateError> {
         let name = self.plan_name(id)?;
         let path = self.store.plans.path.join(&name);
-        let record = self
-            .load_record(&name)?
-            .ok_or_else(|| StateError::invalid(&path, "缺少已审阅计划"))?;
-        if record.plan.repository_id != binding.repository_id {
-            return Err(StateError::invalid(
+        let retired = self.expired_record(&name)?;
+        if let Some(retired) = &retired {
+            check_binding(
                 &path,
-                format!(
-                    "计划仓库 {} 与当前仓库 {} 不符",
-                    record.plan.repository_id, binding.repository_id
-                ),
-            ));
+                &retired.repository_id,
+                &retired.logical_host,
+                &retired.target,
+                binding,
+            )?;
+            if !resume {
+                return Err(StateError::ExpiredPlan {
+                    id: id.into(),
+                    expired_at: retired.expired_at,
+                });
+            }
         }
-        if record.logical_host != binding.logical_host || record.plan.target != *binding.target {
-            return Err(StateError::invalid(
-                &path,
-                format!(
-                    "计划主机 {}（{}）与当前主机 {}（{}）不符",
-                    record.logical_host,
-                    record.plan.target.id,
-                    binding.logical_host,
-                    binding.target.id
-                ),
-            ));
-        }
-        self.validate_record(
+        let Some(record) = self.load_record(&name)? else {
+            if let Some(retired) = retired {
+                return Err(StateError::ExpiredPlan {
+                    id: id.into(),
+                    expired_at: retired.expired_at,
+                });
+            }
+            return Err(StateError::MissingPlan {
+                id: id.into(),
+                path,
+            });
+        };
+        check_binding(
+            &path,
+            &record.plan.repository_id,
+            &record.logical_host,
+            &record.plan.target,
+            binding,
+        )?;
+        checked_fingerprint(
             &path,
             id,
             &record.logical_host,
             &record.plan,
             &record.resources,
+            record.issuance,
         )?;
+        if !resume
+            && self
+                .retention
+                .is_expired(record.created_at, (self.store.clock)())
+        {
+            return Err(StateError::ExpiredPlan {
+                id: id.into(),
+                expired_at: self.retention.expires_at(record.created_at),
+            });
+        }
         let contents = referenced(&record.plan, &record.resources)
             .into_iter()
             .map(|digest| {
@@ -319,27 +409,57 @@ impl StateGuard<'_> {
         }
         Ok(Some(record))
     }
+}
 
-    fn validate_record(
-        &self,
-        path: &Path,
-        id: &str,
-        logical_host: &str,
-        plan: &Plan,
-        resources: &ResourceSet,
-    ) -> Result<(), StateError> {
-        let encode = |err| StateError::invalid(path, format!("无法计算计划摘要：{err}"));
-        if plan.id != id
-            || plan_id(plan, Some(logical_host)).map_err(encode)? != id
-            || resource_digest(resources).map_err(encode)? != plan.resource_digest
-        {
-            return Err(StateError::invalid(
-                path,
-                "计划 ID 或资源摘要与审阅内容不符",
-            ));
-        }
-        Ok(())
+fn checked_fingerprint(
+    path: &Path,
+    id: &str,
+    logical_host: &str,
+    plan: &Plan,
+    resources: &ResourceSet,
+    issuance: Option<u64>,
+) -> Result<String, StateError> {
+    let encode = |err| StateError::invalid(path, format!("无法计算计划摘要：{err}"));
+    let fingerprint = plan_id(plan, Some(logical_host)).map_err(encode)?;
+    let issued = issuance.map(|generation| retention::renewed_id(&fingerprint, generation));
+    if plan.id != id
+        || issued.as_deref().unwrap_or(&fingerprint) != id
+        || resource_digest(resources).map_err(encode)? != plan.resource_digest
+    {
+        return Err(StateError::invalid(
+            path,
+            "计划 ID 或资源摘要与审阅内容不符",
+        ));
     }
+    Ok(fingerprint)
+}
+
+fn check_binding(
+    path: &Path,
+    repository: &str,
+    host: &str,
+    target: &TargetIdentity,
+    binding: PlanBinding<'_>,
+) -> Result<(), StateError> {
+    if repository != binding.repository_id {
+        return Err(StateError::invalid(
+            path,
+            format!(
+                "计划仓库 {repository} 与当前仓库 {} 不符",
+                binding.repository_id
+            ),
+        ));
+    }
+    if host != binding.logical_host || target != binding.target {
+        return Err(StateError::invalid(
+            path,
+            format!(
+                "计划主机 {host}（{}）与当前主机 {}（{}）不符",
+                target.id, binding.logical_host, binding.target.id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn referenced<'a>(plan: &'a Plan, resources: &'a ResourceSet) -> BTreeSet<&'a ContentDigest> {
@@ -354,3 +474,6 @@ fn valid_hash(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
+
+#[cfg(test)]
+mod retention_tests;
