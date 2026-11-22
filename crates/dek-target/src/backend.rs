@@ -35,6 +35,22 @@ pub enum ActionReadiness {
     Conflict(String),
 }
 
+/// State of the previous execution attempt before a recovery observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PriorAttempt {
+    Failed,
+    Unverified,
+}
+
+/// Conclusions the backend can support from a recovery observation.
+#[derive(Debug, Eq, PartialEq)]
+pub enum RecoveryReadiness {
+    Satisfied,
+    Retry,
+    Conflict(String),
+    Indeterminate(String),
+}
+
 /// A reviewed action and the verified content available to its backend.
 pub struct ActionContext<'a> {
     pub action: &'a Action,
@@ -110,6 +126,30 @@ pub trait Backend {
     /// Return Satisfied only for effects that the backend can actually verify.
     fn inspect_action(&self, _: &Action) -> Result<ActionReadiness, BackendError> {
         Err(BackendError("后端未提供此动作的前置条件核对".into()))
+    }
+
+    /// Reobserve a recorded attempt. Backends may override this when they can
+    /// independently determine the outcome of a package transaction or effect.
+    fn inspect_recovery(
+        &self,
+        action: &Action,
+        _prior: PriorAttempt,
+    ) -> Result<RecoveryReadiness, BackendError> {
+        let ambiguous = matches!(
+            action.kind,
+            ActionKind::InstallPackage { .. }
+                | ActionKind::RemovePackage { .. }
+                | ActionKind::ReloadManager(_)
+                | ActionKind::NotifyService { .. }
+        );
+        Ok(match self.inspect_action(action)? {
+            ActionReadiness::Conflict(reason) => RecoveryReadiness::Conflict(reason),
+            _ if ambiguous => RecoveryReadiness::Indeterminate(
+                "无法从当前状态确认包事务或服务动作的结果，请在目标机查核后查看 dek status".into(),
+            ),
+            ActionReadiness::Ready => RecoveryReadiness::Retry,
+            ActionReadiness::Satisfied => RecoveryReadiness::Satisfied,
+        })
     }
 
     /// Apply the reviewed action. Backends check the supplied preconditions at

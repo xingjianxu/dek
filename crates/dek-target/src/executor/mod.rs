@@ -8,11 +8,13 @@ use dek_core::{Action, ActionKind, InputObservation, Observation, Plan, Resource
 use thiserror::Error;
 
 use crate::{
-    backend::{ActionContext, ActionReadiness, Backend, BackendRegistry},
+    backend::{
+        ActionContext, ActionReadiness, Backend, BackendRegistry, PriorAttempt, RecoveryReadiness,
+    },
     planner::{self, PlanError},
     state::{
-        ActionAttempt, ActionReceipt, ActionResult, PlanBinding, ReviewedPlan, RunRecord,
-        StateError, StateGuard, StateStore,
+        ActionAttempt, ActionReceipt, ActionResult, PlanBinding, ReviewedPlan, RunAction,
+        RunRecord, StateError, StateGuard, StateStore,
     },
 };
 
@@ -35,6 +37,7 @@ pub enum ReviewReason {
     Expired,
     InputChanged(String),
     ScopeExpanded,
+    CompletedActionDrift,
 }
 
 impl std::fmt::Display for ReviewReason {
@@ -43,6 +46,7 @@ impl std::fmt::Display for ReviewReason {
             Self::Expired => out.write_str("已审阅计划过期"),
             Self::InputChanged(input) => write!(out, "已审阅的目标输入 {input} 发生变化"),
             Self::ScopeExpanded => out.write_str("目标实际所需的变更超出已审阅范围"),
+            Self::CompletedActionDrift => out.write_str("上次已核验的动作需要重新规划"),
         }
     }
 }
@@ -81,6 +85,8 @@ pub enum ExecutionError {
     Input { input: String, message: String },
     #[error("执行记录 {0} 的动作与已审阅计划不符，请重新规划")]
     RunMismatch(String),
+    #[error("请求标识已绑定执行 {id} 的计划 {plan}，请使用原计划或另一个请求标识")]
+    RequestMismatch { id: String, plan: String },
     #[error("无法输出执行 ID：{0}")]
     Output(#[source] io::Error),
 }
@@ -93,6 +99,11 @@ impl ExecutionError {
             message: message.into(),
         }
     }
+}
+
+enum Application<'a> {
+    New { request_id: &'a str },
+    Resume(Box<RunRecord>),
 }
 
 pub struct Executor<'a, 'backend> {
@@ -117,18 +128,85 @@ impl<'a, 'backend> Executor<'a, 'backend> {
     pub fn apply_with_loader(
         &self,
         request: ExecutionRequest<'_>,
-        mut observe_input: impl FnMut(&InputObservation) -> Result<Observation, String>,
+        observe_input: impl FnMut(&InputObservation) -> Result<Observation, String>,
         started: impl FnOnce(&str) -> io::Result<()>,
         load: impl FnOnce(&StateGuard<'_>, &str, PlanBinding<'_>) -> Result<LoadedPlan, StateError>,
     ) -> Result<ExecutionOutcome, ExecutionError> {
         let _lease = self.store.execution_lease()?;
-        let loaded = {
-            let guard = self.store.lock()?;
-            load(&guard, request.plan_id, request.binding)?
-        };
+        let previous = self
+            .store
+            .lock()?
+            .run_for_request(request.binding, request.request_id)?;
+        if let Some(run) = previous {
+            if run.plan_id != request.plan_id {
+                return Err(ExecutionError::RequestMismatch {
+                    id: run.id,
+                    plan: run.plan_id,
+                });
+            }
+            return self.resume_locked(request.binding, run, observe_input, started);
+        }
+        let loaded = load(&self.store.lock()?, request.plan_id, request.binding)?;
         let LoadedPlan::Approved(reviewed) = loaded else {
             return Ok(ExecutionOutcome::review(ReviewReason::Expired));
         };
+        if reviewed.plan.id != request.plan_id {
+            return Err(ExecutionError::RunMismatch(request.plan_id.to_owned()));
+        }
+        self.run_review(
+            request.binding,
+            &reviewed,
+            Application::New {
+                request_id: request.request_id,
+            },
+            observe_input,
+            started,
+        )
+    }
+
+    /// Resume only the bound run. A complete run remains readable after plan GC.
+    pub fn resume(
+        &self,
+        binding: PlanBinding<'_>,
+        run_id: &str,
+        observe_input: impl FnMut(&InputObservation) -> Result<Observation, String>,
+        started: impl FnOnce(&str) -> io::Result<()>,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        let _lease = self.store.execution_lease()?;
+        let run = self.store.lock()?.load_run(run_id, binding)?;
+        self.resume_locked(binding, run, observe_input, started)
+    }
+
+    fn resume_locked(
+        &self,
+        binding: PlanBinding<'_>,
+        run: RunRecord,
+        observe_input: impl FnMut(&InputObservation) -> Result<Observation, String>,
+        started: impl FnOnce(&str) -> io::Result<()>,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        if run.finished {
+            started(&run.id).map_err(ExecutionError::Output)?;
+            return Ok(ExecutionOutcome::Finished(Box::new(run)));
+        }
+        let reviewed = self.store.lock()?.load_run_plan(&run.id, binding)?;
+        validate_run(&run, &reviewed)?;
+        self.run_review(
+            binding,
+            &reviewed,
+            Application::Resume(Box::new(run)),
+            observe_input,
+            started,
+        )
+    }
+
+    fn run_review(
+        &self,
+        binding: PlanBinding<'_>,
+        reviewed: &ReviewedPlan,
+        application: Application<'_>,
+        mut observe_input: impl FnMut(&InputObservation) -> Result<Observation, String>,
+        started: impl FnOnce(&str) -> io::Result<()>,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
         planner::check_compatibility(self.registry, &reviewed.plan)?;
         validate_order(&reviewed.plan)?;
 
@@ -146,69 +224,105 @@ impl<'a, 'backend> Executor<'a, 'backend> {
 
         let fresh = planner::plan_for_host(
             self.registry,
-            request.binding.repository_id,
-            request.binding.logical_host,
+            binding.repository_id,
+            binding.logical_host,
             &reviewed.resources,
             &reviewed.plan.used_inputs,
         )?;
         let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh) else {
-            let fresh = self.store.lock()?.save_plan(
-                request.binding.logical_host,
-                &fresh,
-                &reviewed.resources,
-                &reviewed.contents,
-            )?;
-            return Ok(ExecutionOutcome::ReviewRequired {
-                reason: ReviewReason::ScopeExpanded,
-                replacement: Some(Box::new(fresh)),
-            });
+            return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
         };
+        if let Application::Resume(run) = &application
+            && run.actions.iter().any(|item| {
+                matches!(item.result, ActionResult::Verified { .. })
+                    && live.contains(item.action.id.as_str())
+            })
+        {
+            return self.replacement(
+                binding,
+                reviewed,
+                &fresh,
+                ReviewReason::CompletedActionDrift,
+            );
+        }
         for action in &reviewed.plan.actions {
+            if let Application::Resume(run) = &application
+                && run.actions.iter().any(|item| {
+                    item.action.id == action.id
+                        && matches!(item.result, ActionResult::Verified { .. })
+                })
+            {
+                continue;
+            }
             self.backend(action)?
                 .validate_action(action)
                 .map_err(|error| ExecutionError::action(action, error.0))?;
         }
 
-        let run =
-            self.store
-                .lock()?
-                .begin_run(request.plan_id, request.binding, request.request_id);
-        let run = match run {
-            Err(StateError::ExpiredPlan { .. }) => {
-                return Ok(ExecutionOutcome::review(ReviewReason::Expired));
+        let run = match application {
+            Application::New { request_id } => {
+                let result = self
+                    .store
+                    .lock()?
+                    .begin_run(&reviewed.plan.id, binding, request_id);
+                match result {
+                    Err(StateError::ExpiredPlan { .. }) => {
+                        return Ok(ExecutionOutcome::review(ReviewReason::Expired));
+                    }
+                    result => result?,
+                }
             }
-            result => result?,
+            Application::Resume(run) => *run,
         };
-        if !run
-            .actions
-            .iter()
-            .map(|item| &item.action)
-            .eq(&reviewed.plan.actions)
-        {
-            return Err(ExecutionError::RunMismatch(run.id));
-        }
+        validate_run(&run, reviewed)?;
         started(&run.id).map_err(ExecutionError::Output)?;
-        if run.finished {
-            return Ok(ExecutionOutcome::Finished(Box::new(run)));
-        }
         if let Some(action) = conflict {
             let failure = ExecutionError::action(action, "前置条件已改变，请重新规划");
-            let attempt = self
-                .store
-                .lock()?
-                .begin_action(&run.id, request.binding, &action.id)?;
-            if let ActionAttempt::Started(attempt) = attempt {
-                self.record(&run, request.binding, action, attempt, &Err(&failure))?;
+            let item = run
+                .actions
+                .iter()
+                .find(|item| item.action.id == action.id)
+                .ok_or_else(|| ExecutionError::RunMismatch(run.id.clone()))?;
+            if item.attempt == 0 {
+                let attempt = self.begin(&run, binding, action)?;
+                self.record(&run, binding, action, attempt, &Err(&failure))?;
+            } else {
+                self.store.lock()?.record_recovery_diagnostic(
+                    &run.id,
+                    binding,
+                    &action.id,
+                    item.attempt,
+                    failure.to_string(),
+                )?;
             }
             return Err(failure);
         }
 
-        self.run_actions(&run, request.binding, &reviewed, &live)?;
+        self.run_actions(&run, binding, reviewed, &live)?;
         let guard = self.store.lock()?;
-        guard.finish_run(&run.id, request.binding)?;
+        guard.finish_run(&run.id, binding)?;
         Ok(ExecutionOutcome::Finished(Box::new(
-            guard.load_run(&run.id, request.binding)?,
+            guard.load_run(&run.id, binding)?,
         )))
+    }
+
+    fn replacement(
+        &self,
+        binding: PlanBinding<'_>,
+        reviewed: &ReviewedPlan,
+        fresh: &Plan,
+        reason: ReviewReason,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        let stored = self.store.lock()?.save_plan(
+            binding.logical_host,
+            fresh,
+            &reviewed.resources,
+            &reviewed.contents,
+        )?;
+        Ok(ExecutionOutcome::ReviewRequired {
+            reason,
+            replacement: Some(Box::new(stored)),
+        })
     }
 
     fn run_actions(
@@ -218,67 +332,140 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         reviewed: &ReviewedPlan,
         live: &BTreeSet<&str>,
     ) -> Result<(), ExecutionError> {
-        let mut changed = BTreeSet::new();
+        let mut triggered = BTreeSet::new();
         for item in &run.actions {
             let action = &item.action;
-            match item.result {
-                ActionResult::Verified { changed: wrote } => {
-                    if wrote {
-                        changed.insert(action.id.as_str());
-                    }
-                    continue;
+            if let ActionResult::Verified { changed } = item.result {
+                if changed {
+                    triggered.insert(action.id.as_str());
                 }
-                ActionResult::Failed { .. } => {
-                    return Err(ExecutionError::action(
-                        action,
-                        "已有失败回执，请查询执行记录",
-                    ));
-                }
-                ActionResult::Pending | ActionResult::Unverified => {}
+                continue;
             }
 
             let backend = self.backend(action)?;
-            let no_trigger = matches!(action.kind, ActionKind::NotifyService { .. })
-                && !live.contains(action.id.as_str())
-                && !run
-                    .pending_notifications
-                    .iter()
-                    .any(|notice| notice.action_id == action.id)
-                && action
-                    .depends_on
-                    .iter()
-                    .all(|id| !changed.contains(id.as_str()));
-            let readiness = if no_trigger && item.result == ActionResult::Pending {
-                Ok(ActionReadiness::Satisfied)
-            } else {
-                backend
-                    .inspect_action(action)
-                    .map_err(|error| ExecutionError::action(action, error.0))
-            };
-            let attempt = self
-                .store
-                .lock()?
-                .begin_action(&run.id, binding, &action.id)?;
-            match attempt {
-                ActionAttempt::NeedsVerification(attempt) => {
-                    if matches!(readiness, Ok(ActionReadiness::Satisfied))
-                        && !is_effect(&action.kind)
-                    {
+            let attempt = match &item.result {
+                ActionResult::Pending => {
+                    let no_trigger = matches!(action.kind, ActionKind::NotifyService { .. })
+                        && !live.contains(action.id.as_str())
+                        && !run
+                            .pending_notifications
+                            .iter()
+                            .any(|notice| notice.action_id == action.id)
+                        && action
+                            .depends_on
+                            .iter()
+                            .all(|id| !triggered.contains(id.as_str()));
+                    if no_trigger {
+                        let attempt = self.begin(run, binding, action)?;
                         self.record(run, binding, action, attempt, &Ok(false))?;
-                    } else {
-                        return Err(ExecutionError::action(action, "先前尝试的结果仍待核验"));
+                        continue;
                     }
+                    self.begin(run, binding, action)?
                 }
-                ActionAttempt::Started(attempt) => {
-                    let outcome = self.dispatch(run, binding, reviewed, action, backend, readiness);
-                    self.record(run, binding, action, attempt, &outcome.as_ref().copied())?;
-                    if outcome? {
-                        changed.insert(action.id.as_str());
-                    }
+                ActionResult::Failed { .. } | ActionResult::Unverified => {
+                    let Some(attempt) = self.recover_attempt(run, binding, item, backend)? else {
+                        triggered.insert(action.id.as_str());
+                        continue;
+                    };
+                    attempt
                 }
+                ActionResult::Verified { .. } => unreachable!("verified actions were handled"),
+            };
+            let readiness = backend
+                .inspect_action(action)
+                .map_err(|error| ExecutionError::action(action, error.0));
+            let readiness = if !live.contains(action.id.as_str())
+                && matches!(action.kind, ActionKind::WriteFile { .. })
+                && matches!(readiness, Ok(ActionReadiness::Ready))
+            {
+                Err(ExecutionError::action(
+                    action,
+                    "文件在复核后变化，请重新规划",
+                ))
+            } else {
+                readiness
+            };
+            let outcome = self.dispatch(run, binding, reviewed, action, backend, readiness);
+            self.record(run, binding, action, attempt, &outcome.as_ref().copied())?;
+            if outcome? {
+                triggered.insert(action.id.as_str());
             }
         }
         Ok(())
+    }
+
+    fn recover_attempt(
+        &self,
+        run: &RunRecord,
+        binding: PlanBinding<'_>,
+        item: &RunAction,
+        backend: &dyn Backend,
+    ) -> Result<Option<u32>, ExecutionError> {
+        let action = &item.action;
+        let unverified = item.result == ActionResult::Unverified;
+        let prior = if unverified {
+            PriorAttempt::Unverified
+        } else {
+            PriorAttempt::Failed
+        };
+        let readiness = backend
+            .inspect_recovery(action, prior)
+            .unwrap_or_else(|error| {
+                RecoveryReadiness::Indeterminate(format!("无法观察先前尝试：{}", error.0))
+            });
+        match readiness {
+            RecoveryReadiness::Satisfied => {
+                let attempt = if unverified {
+                    item.attempt
+                } else {
+                    self.begin(run, binding, action)?
+                };
+                self.record(run, binding, action, attempt, &Ok(false))?;
+                Ok(None)
+            }
+            RecoveryReadiness::Retry => {
+                if unverified {
+                    self.store.lock()?.record_action_result(
+                        &run.id,
+                        binding,
+                        &action.id,
+                        item.attempt,
+                        ActionReceipt::Failed {
+                            message: "复查显示该动作仍需执行，前置条件允许续办".into(),
+                        },
+                    )?;
+                }
+                Ok(Some(self.begin(run, binding, action)?))
+            }
+            RecoveryReadiness::Conflict(reason) | RecoveryReadiness::Indeterminate(reason) => {
+                self.store.lock()?.record_recovery_diagnostic(
+                    &run.id,
+                    binding,
+                    &action.id,
+                    item.attempt,
+                    reason.clone(),
+                )?;
+                Err(ExecutionError::action(action, reason))
+            }
+        }
+    }
+
+    fn begin(
+        &self,
+        run: &RunRecord,
+        binding: PlanBinding<'_>,
+        action: &Action,
+    ) -> Result<u32, ExecutionError> {
+        match self
+            .store
+            .lock()?
+            .begin_action(&run.id, binding, &action.id)?
+        {
+            ActionAttempt::Started(attempt) => Ok(attempt),
+            ActionAttempt::NeedsVerification(_) => {
+                Err(ExecutionError::action(action, "先前尝试的结果仍待核验"))
+            }
+        }
     }
 
     fn dispatch(
@@ -356,11 +543,17 @@ impl<'a, 'backend> Executor<'a, 'backend> {
     }
 }
 
-fn is_effect(action: &ActionKind) -> bool {
-    matches!(
-        action,
-        ActionKind::ReloadManager(_) | ActionKind::NotifyService { .. }
-    )
+fn validate_run(run: &RunRecord, reviewed: &ReviewedPlan) -> Result<(), ExecutionError> {
+    if run
+        .actions
+        .iter()
+        .map(|item| &item.action)
+        .eq(&reviewed.plan.actions)
+    {
+        Ok(())
+    } else {
+        Err(ExecutionError::RunMismatch(run.id.clone()))
+    }
 }
 
 fn action_kind(action: &ActionKind) -> ResourceKind {

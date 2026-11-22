@@ -11,3 +11,5 @@ pub mod planning;
 mod refresh;
 mod repository;
 mod show;
+#[cfg(target_os = "linux")]
+mod status;
