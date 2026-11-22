@@ -179,6 +179,10 @@ pub enum Precondition {
         path: String,
         expected: FileObservation,
     },
+    Directory {
+        path: String,
+        expected: Option<DirectoryObservation>,
+    },
     AgeSecret {
         path: String,
         expected: AgeSecretObservation,
@@ -214,6 +218,17 @@ pub enum Precondition {
 pub enum FileObservation {
     Missing,
     Present(FileContent),
+}
+
+/// Target directory identity and the metadata present in the desired declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryObservation {
+    pub device: u64,
+    pub inode: u64,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: Option<u32>,
 }
 
 /// Local account identity and observed managed fields, with no credential data.

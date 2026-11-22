@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# Run each phase through scripts/run-arch-vm ssh in the same disposable guest.
+set -euo pipefail
+export LC_ALL=C
+[[ "$(id -u)" == 0 && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+uname -r
+/usr/local/bin/dek --version
+
+repo=/srv/dek30-fixture
+export XDG_CACHE_HOME="$repo/cache"
+primary=/srv/research
+pending_parent=/srv/dek30-missing-parent
+pending="$pending_parent/research"
+alice=alice
+research=research
+
+configuration() {
+    python3 - "$1" "$alice" "$research" "$primary" "$pending" > "$repo/host.json" <<'PY'
+import json, sys
+phase, user, group, primary, pending = sys.argv[1:]
+options = {
+    "users.groups." + group: {},
+    "users.users." + user + ".isNormalUser": True,
+    "users.users." + user + ".group": group,
+}
+attributes = {"user": user, "group": group, "mode": "0750"}
+directories = {
+    "pending": {pending: {"d": attributes}},
+    "normal": {primary: {"d": attributes}, pending: {"d": attributes}},
+    "owner-only": {primary: {"d": {"user": user}}, pending: {"d": attributes}},
+    "omit": {},
+}[phase]
+if directories:
+    options["systemd.tmpfiles.settings.fixture"] = directories
+print(json.dumps({"schemaVersion": 1, "imports": [], "options": [
+    {"path": path, "value": value} for path, value in options.items()
+]}))
+PY
+}
+dek_command() {
+    local command=$1
+    shift
+    /usr/local/bin/dek --repo "$repo" -H fixture "$command" --state-dir "$repo/state" "$@"
+}
+plan() { dek_command plan --json; }
+assert_empty_plan() {
+    plan | python3 -c 'import json, sys; assert json.load(sys.stdin)["actions"] == []'
+}
+verify_child() {
+    [[ "$(cat "$primary/marker")" == 'directory fixture marker' ]]
+    [[ "$(stat -c '%a' "$primary/marker")" == 640 ]]
+}
+
+case "${1-}" in
+    exercise)
+        [[ ! -e "$repo" && ! -e "$primary" && ! -e "$pending_parent" ]]
+        ! getent passwd "$alice"
+        ! getent group "$research"
+        install -d -m 0700 "$repo"
+        cat /proc/sys/kernel/random/boot_id > "$repo/initial-boot"
+        cat > "$repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"target":{"local":true},"entry":"host.json"}}}
+JSON
+        configuration pending
+        plan > "$repo/initial-plan.json"
+        approved=$(python3 - "$repo/initial-plan.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    plan = json.load(source)
+group, user, directory = plan["actions"]
+assert list(group["kind"]) == ["ensureGroup"]
+assert list(user["kind"]) == ["ensureUser"]
+assert list(directory["kind"]) == ["ensureDirectory"]
+assert set(directory["dependsOn"]) == {group["id"], user["id"]}
+print(plan["plan_id"])
+PY
+)
+        if dek_command apply --plan "$approved" > "$repo/failed-apply" 2> "$repo/creation-error"; then
+            printf 'Expected the missing parent to stop the directory action.\n' >&2
+            exit 1
+        fi
+        cat "$repo/failed-apply"
+        failed_run=$(awk '$1 == "run_id" { print $2 }' "$repo/failed-apply")
+        [[ -n "$failed_run" ]]
+        grep -F '目标父目录尚未创建' "$repo/creation-error"
+        [[ ! -e "$pending_parent" ]]
+        uid_before=$(id -u "$alice")
+        gid_before=$(getent group "$research" | cut -d: -f3)
+        [[ "$(id -g "$alice")" == "$gid_before" ]]
+        printf '%s:%s\n' "$uid_before" "$gid_before" > "$repo/identity"
+
+        install -d -m 0755 "$pending_parent"
+        plan | python3 -c 'import json,sys; [action] = json.load(sys.stdin)["actions"]; assert list(action["kind"]) == ["ensureDirectory"]'
+        dek_command apply | tee "$repo/resumed-apply"
+        grep -Fx "run_id $failed_run" "$repo/resumed-apply"
+        [[ "$(stat -c '%u:%g:%a' "$pending")" == "$uid_before:$gid_before:750" ]]
+        [[ "$(id -u "$alice"):$(id -g "$alice")" == "$uid_before:$gid_before" ]]
+        assert_empty_plan
+
+        readless=$(mktemp -d)
+        mkdir -m 000 "$readless/managed"
+        cat > "$readless/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"target":{"local":true},"entry":"host.json"}}}
+JSON
+        python3 - "$readless" > "$readless/host.json" <<'PYTHON'
+import json, sys
+print(json.dumps({"schemaVersion": 1, "imports": [], "options": [
+    {"path": "systemd.tmpfiles.settings.fixture", "value": {
+        sys.argv[1] + "/managed": {"d": {"mode": "0700"}},
+    }},
+]}))
+PYTHON
+        chown "$alice:$research" "$readless" "$readless/managed"
+        runuser -u "$alice" -- env XDG_CACHE_HOME="$readless/cache" \
+            /usr/local/bin/dek --repo "$readless" -H fixture apply --state-dir "$readless/state"
+        stat -c 'Unprivileged directory repair %U:%G:%a' "$readless/managed"
+        [[ "$(stat -c '%U:%G:%a' "$readless/managed")" == "$alice:$research:700" ]]
+
+        configuration normal
+        dek_command apply
+        stat -c '%n %U:%G:%a' "$primary" "$pending"
+        [[ "$(stat -c '%U:%G:%a' "$primary")" == "$alice:$research:750" ]]
+        assert_empty_plan
+
+        printf 'directory fixture marker\n' > "$primary/marker"
+        chmod 0640 "$primary/marker"
+        chmod 0777 "$primary"
+        inode=$(stat -c '%d:%i' "$primary")
+        plan | python3 -c 'import json,sys; [action] = json.load(sys.stdin)["actions"]; assert list(action["kind"]) == ["ensureDirectory"]'
+        dek_command apply
+        [[ "$(stat -c '%d:%i' "$primary")" == "$inode" ]]
+        [[ "$(stat -c '%a' "$primary")" == 750 ]]
+        verify_child
+
+        configuration owner-only
+        chown root "$primary"
+        chmod 3751 "$primary"
+        dek_command apply
+        [[ "$(stat -c '%U:%G:%a' "$primary")" == "$alice:$research:3751" ]]
+        verify_child
+
+        mv "$primary" "$primary.saved"
+        touch "$primary"
+        if plan 2> "$repo/file-error"; then
+            printf 'Expected a regular-file path conflict.\n' >&2
+            exit 1
+        fi
+        grep -F '目录路径类型冲突' "$repo/file-error"
+        rm -- "$primary"
+        ln -s "$primary.saved" "$primary"
+        if plan 2> "$repo/link-error"; then
+            printf 'Expected a symbolic-link path conflict.\n' >&2
+            exit 1
+        fi
+        grep -F '目录路径类型冲突' "$repo/link-error"
+        rm -- "$primary"
+        mv "$primary.saved" "$primary"
+
+        configuration omit
+        chmod 00731 "$primary"
+        assert_empty_plan
+        dek_command apply
+        [[ "$(stat -c '%a' "$primary")" == 731 ]]
+        verify_child
+        printf 'Allocation, failed action, retry, drift, type conflicts and withdrawal passed.\n'
+        ;;
+    after-reboot)
+        [[ "$(cat /proc/sys/kernel/random/boot_id)" != "$(cat "$repo/initial-boot")" ]]
+        assert_empty_plan
+        [[ "$(id -u "$alice"):$(id -g "$alice")" == "$(cat "$repo/identity")" ]]
+        [[ "$(stat -c '%U:%G:%a' "$primary")" == "$alice:$research:731" ]]
+        [[ "$(stat -c '%U:%G:%a' "$pending")" == "$alice:$research:750" ]]
+        verify_child
+        printf 'A new boot preserved both directories, account IDs, child data and manual permissions.\n'
+        ;;
+    *)
+        printf 'usage: %s {exercise|after-reboot}\n' "$0" >&2
+        exit 2
+        ;;
+esac
