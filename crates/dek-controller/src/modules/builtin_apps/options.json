@@ -1,0 +1,44 @@
+{
+  "options": [
+    {
+      "path": "environment.systemPackages",
+      "type": {"list": "string"},
+      "merge": "set",
+      "description": "要安装的 Arch 官方仓库包名称。"
+    },
+    {
+      "path": "dek.arch.aurPackages",
+      "type": {"list": "string"},
+      "merge": "set",
+      "description": "要安装的 AUR 包名称。"
+    },
+    {
+      "path": "programs.git.enable",
+      "type": "boolean",
+      "default": false,
+      "description": "安装 Git 并应用已声明的系统级 Git 配置。"
+    },
+    {
+      "path": "programs.git.config",
+      "type": {"map": {"map": "any"}},
+      "description": "要写入 /etc/gitconfig 的 Git 节、变量和子节。"
+    },
+    {
+      "path": "services.openssh.enable",
+      "type": "boolean",
+      "default": false,
+      "description": "安装 OpenSSH，并启用及运行系统级 sshd.service。"
+    },
+    {
+      "path": "services.caddy.enable",
+      "type": "boolean",
+      "default": false,
+      "description": "安装 Caddy，并启用及运行系统级 caddy.service。"
+    },
+    {
+      "path": "services.caddy.configFile",
+      "type": "sourceFile",
+      "description": "以声明文件为基准的 Caddyfile 路径。"
+    }
+  ]
+}
