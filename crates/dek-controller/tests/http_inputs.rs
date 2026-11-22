@@ -76,7 +76,14 @@ fn refresh_compares_response_content_and_preserves_the_last_success_on_error() {
     server.respond("/data", 503, "failure");
     let error = RefreshHttpInputs::new(&store).read(&url).unwrap_err();
     assert!(error.contains(&url) && error.contains("503"), "{error}");
-    assert_eq!(server.count("/data"), 4);
+    server.respond("/data", 200, [0xff]);
+    let invalid = RefreshHttpInputs::new(&store).read(&url).unwrap_err();
+    assert!(invalid.contains("UTF-8"), "{invalid}");
+
+    server.respond("/data", 206, "partial");
+    let partial = RefreshHttpInputs::new(&store).read(&url).unwrap_err();
+    assert!(partial.contains("206"), "{partial}");
+    assert_eq!(server.count("/data"), 6);
     assert_eq!(
         CachedHttpInputs::new(&store).read(&url).unwrap().as_deref(),
         Some("revised")

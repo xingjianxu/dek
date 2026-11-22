@@ -12,7 +12,7 @@ use std::{
 
 #[derive(Default)]
 struct ServerState {
-    responses: BTreeMap<String, (u16, String)>,
+    responses: BTreeMap<String, (u16, Vec<u8>)>,
     requests: BTreeMap<String, usize>,
 }
 
@@ -62,13 +62,14 @@ impl Server {
                         .responses
                         .get(&path)
                         .cloned()
-                        .unwrap_or((404, String::new()))
+                        .unwrap_or((404, Vec::new()))
                 };
                 write!(
                     stream,
-                    "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 ).unwrap();
+                stream.write_all(&body).unwrap();
             }
         });
         Self {
@@ -83,12 +84,12 @@ impl Server {
         format!("http://127.0.0.1:{}{path}", self.port)
     }
 
-    pub fn respond(&self, path: &str, status: u16, body: &str) {
+    pub fn respond(&self, path: &str, status: u16, body: impl AsRef<[u8]>) {
         self.state
             .lock()
             .unwrap()
             .responses
-            .insert(path.into(), (status, body.into()));
+            .insert(path.into(), (status, body.as_ref().to_vec()));
     }
 
     pub fn count(&self, path: &str) -> usize {

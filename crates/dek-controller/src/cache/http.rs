@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
@@ -85,13 +85,15 @@ impl<'a> RefreshHttpInputs<'a> {
             .get(url)
             .call()
             .map_err(|error| error.to_string())?;
-        if !response.status().is_success() {
+        if !response.status().is_success() || response.status().as_u16() == 206 {
             return Err(format!("HTTP {}", response.status()));
         }
-        let body = response
+        let bytes = response
             .body_mut()
-            .read_to_string()
+            .read_to_vec()
             .map_err(|error| error.to_string())?;
+        let body = String::from_utf8(bytes)
+            .map_err(|error| format!("invalid UTF-8 HTTP response: {error}"))?;
         if old.as_deref() == Some(&body) {
             self.stats.unchanged += 1;
         } else {
@@ -134,6 +136,5 @@ fn replace_response(parent: &Path, path: &Path, body: &str) -> io::Result<()> {
     let mut staged = NamedTempFile::new_in(parent)?;
     staged.write_all(body.as_bytes())?;
     staged.as_file().sync_all()?;
-    staged.persist(path).map_err(|error| error.error)?;
-    File::open(parent)?.sync_all()
+    staged.persist(path).map(drop).map_err(|error| error.error)
 }
