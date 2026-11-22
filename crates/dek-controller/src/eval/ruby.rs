@@ -8,19 +8,61 @@ use std::{
 };
 
 use dek_core::{
-    InputObservation, Observation, Origin,
+    InputKind, InputObservation, Observation, Origin,
     protocol::{
         EVALUATOR_PROTOCOL_VERSION, EvalFailure, EvalOperation, EvalPayload, EvalRequest,
-        TargetQuery, TargetReply,
+        InputQuery, TargetQuery, TargetQueryKind, TargetReply,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-const EVALUATOR: &str = include_str!("../../../../sdk/ruby/evaluator.rb");
+const EVALUATOR: &str = concat!(
+    include_str!("../../../../sdk/ruby/inputs.rb"),
+    "\n",
+    include_str!("../../../../sdk/ruby/declarations.rb"),
+    "\n",
+    include_str!("../../../../sdk/ruby/evaluator.rb"),
+);
 
 pub trait TargetProvider {
     fn query(&mut self, query: &TargetQuery) -> Result<TargetAnswer, String>;
+}
+
+/// Supplies an explicit HTTP input. `None` means no response is available.
+pub trait HttpInputProvider {
+    fn read(&mut self, url: &str) -> Result<Option<String>, String>;
+}
+
+pub struct RubyProviders<'a> {
+    pub target: &'a mut dyn TargetProvider,
+    pub http: Option<&'a mut dyn HttpInputProvider>,
+}
+
+impl RubyProviders<'_> {
+    pub(super) fn reborrow(&mut self) -> RubyProviders<'_> {
+        RubyProviders {
+            target: &mut *self.target,
+            http: self
+                .http
+                .as_mut()
+                .map(|provider| &mut **provider as &mut dyn HttpInputProvider),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum QueryKind {
+    Target(TargetQueryKind),
+    Http(HttpKind),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum HttpKind {
+    Http,
 }
 
 #[derive(Debug)]
@@ -78,6 +120,50 @@ impl RubySession {
         context: Value,
         target: &mut dyn TargetProvider,
     ) -> Result<EvalOutput, RubyError> {
+        self.evaluate_request(
+            operation,
+            EvalPayload {
+                entry,
+                context: &context,
+                repo_root: None,
+            },
+            RubyProviders { target, http: None },
+        )
+    }
+
+    /// Enable the SDK and observe the request's entry, loaded code, and explicit inputs.
+    /// Collect returns a UnitSpec, and expand preserves the script's result.
+    pub fn evaluate_with_sdk(
+        &mut self,
+        operation: EvalOperation,
+        repo_root: &Path,
+        entry: &Path,
+        context: Value,
+        providers: RubyProviders<'_>,
+    ) -> Result<EvalOutput, RubyError> {
+        self.evaluate_request(
+            operation,
+            EvalPayload {
+                entry,
+                context: &context,
+                repo_root: Some(repo_root),
+            },
+            providers,
+        )
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.failed = true;
+        self.process.take();
+    }
+
+    fn evaluate_request(
+        &mut self,
+        operation: EvalOperation,
+        payload: EvalPayload<'_>,
+        providers: RubyProviders<'_>,
+    ) -> Result<EvalOutput, RubyError> {
+        let entry = payload.entry;
         let error = |failure: EvalFailure| RubyError {
             operation,
             entry: entry.to_owned(),
@@ -94,15 +180,11 @@ impl RubySession {
             protocol_version: EVALUATOR_PROTOCOL_VERSION,
             id: &id,
             operation,
-            payload: EvalPayload {
-                entry,
-                context: &context,
-            },
+            payload,
         };
-        let result = self.exchange(&request, target);
+        let result = self.exchange(&request, providers);
         if result.is_err() {
-            self.failed = true;
-            self.process.take();
+            self.invalidate();
         }
         result.map_err(error)
     }
@@ -110,7 +192,7 @@ impl RubySession {
     fn exchange(
         &mut self,
         request: &EvalRequest<'_>,
-        target: &mut dyn TargetProvider,
+        mut providers: RubyProviders<'_>,
     ) -> Result<EvalOutput, EvalFailure> {
         if self.process.is_none() {
             self.process = Some(Process::start(EVALUATOR)?);
@@ -123,12 +205,12 @@ impl RubySession {
         loop {
             let frame = process.receive()?;
             if frame.get("parentId").is_some() {
-                let query: TargetQuery = serde_json::from_value(frame)
-                    .map_err(|err| failure(format!("invalid target query: {err}")))?;
+                let query: InputQuery<QueryKind> = serde_json::from_value(frame)
+                    .map_err(|err| failure(format!("invalid evaluator query: {err}")))?;
                 if query.parent_id != request.id || !queries.insert(query.id.clone()) {
                     return Err(failure("unexpected target query request ID"));
                 }
-                let answer = target.query(&query).map_err(|message| EvalFailure {
+                let (kind, answer) = providers.answer(&query).map_err(|message| EvalFailure {
                     origin: query.origin.clone(),
                     message,
                 })?;
@@ -139,7 +221,7 @@ impl RubySession {
                     result: &answer.value,
                 })?;
                 inputs.push(InputObservation {
-                    kind: query.kind.input_kind(),
+                    kind,
                     id: query.key,
                     observation: answer.observation,
                     origin: query.origin,
@@ -147,7 +229,7 @@ impl RubySession {
                 continue;
             }
 
-            let result = response(frame, request.id)?;
+            let result = response(frame, request.id, &mut inputs)?;
             return Ok(EvalOutput {
                 id: request.id.to_owned(),
                 result,
@@ -157,15 +239,75 @@ impl RubySession {
     }
 }
 
-fn response(mut frame: Value, id: &str) -> Result<Value, EvalFailure> {
+impl RubyProviders<'_> {
+    fn answer(
+        &mut self,
+        query: &InputQuery<QueryKind>,
+    ) -> Result<(InputKind, TargetAnswer), String> {
+        match query.kind {
+            QueryKind::Target(kind) => {
+                let answer = self.target.query(&TargetQuery {
+                    protocol_version: query.protocol_version,
+                    parent_id: query.parent_id.clone(),
+                    id: query.id.clone(),
+                    kind,
+                    key: query.key.clone(),
+                    origin: query.origin.clone(),
+                })?;
+                if kind == TargetQueryKind::Fact && answer.observation == Observation::Missing {
+                    return Err(format!("target fact {:?} is unavailable", query.key));
+                }
+                Ok((kind.input_kind(), answer))
+            }
+            QueryKind::Http(HttpKind::Http) => {
+                let url = &query.key;
+                let response = match &mut self.http {
+                    Some(http) => http
+                        .read(url)
+                        .map_err(|err| format!("HTTP input {url:?}: {err}"))?,
+                    None => None,
+                }
+                .ok_or_else(|| format!("HTTP input {url:?} is unavailable; run dek refresh"))?;
+                let observation = Observation::Digest(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(response.as_bytes())
+                ));
+                Ok((
+                    InputKind::Http,
+                    TargetAnswer {
+                        value: Value::String(response),
+                        observation,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+fn response(
+    mut frame: Value,
+    id: &str,
+    inputs: &mut Vec<InputObservation>,
+) -> Result<Value, EvalFailure> {
     if frame.get("id").and_then(Value::as_str) != Some(id) {
         return Err(failure("unexpected evaluator response ID"));
     }
     match frame.get("ok").and_then(Value::as_bool) {
-        Some(true) if frame.get("error").is_none() => frame
-            .as_object_mut()
-            .and_then(|object| object.remove("result"))
-            .ok_or_else(|| failure("evaluator response has no result")),
+        Some(true) if frame.get("error").is_none() => {
+            let object = frame
+                .as_object_mut()
+                .expect("response with an ID is an object");
+            if let Some(observations) = object.remove("inputs") {
+                let observations: Vec<InputObservation> = serde_json::from_value(observations)
+                    .map_err(|err| {
+                        failure(format!("invalid evaluator input observations: {err}"))
+                    })?;
+                inputs.extend(observations);
+            }
+            object
+                .remove("result")
+                .ok_or_else(|| failure("evaluator response has no result"))
+        }
         Some(false) if frame.get("result").is_none() => {
             let error = serde_json::from_value(frame["error"].take())
                 .map_err(|err| failure(format!("invalid evaluator error: {err}")))?;
