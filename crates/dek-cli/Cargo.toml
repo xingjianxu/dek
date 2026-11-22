@@ -1,0 +1,16 @@
+[package]
+name = "dek-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dek-core.workspace = true
+dek-controller.workspace = true
+dek-target.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dek-linux.workspace = true
+
+[[bin]]
+name = "dek"
+path = "src/main.rs"
