@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dek_core::{
     Action, ActionKind, PackageSource, Precondition, RepositoryPackageChange,
@@ -8,17 +8,88 @@ use dek_target::backend::{ActionReadiness, BackendError};
 
 use super::{PacmanBackend, package_rows, pacman_text, valid_package_name, valid_version};
 
-pub(super) fn reviewed_install(action: &Action) -> Result<&RepositoryTransaction, BackendError> {
+pub(super) fn reviewed_transaction(
+    action: &Action,
+) -> Result<&RepositoryTransaction, BackendError> {
     let ActionKind::RepositoryTransaction(transaction) = &action.kind else {
-        return Err(BackendError("需要已审阅的仓库补装事务".into()));
+        return Err(BackendError("需要已审阅的仓库事务".into()));
     };
-    if transaction.scope != RepositoryTransactionScope::Install {
-        return Err(BackendError("完整仓库升级仍需经确认的升级执行器".into()));
+    let versions = versions(transaction)?;
+    let targets: BTreeSet<_> = transaction.targets.iter().map(String::as_str).collect();
+    if (targets.is_empty() && transaction.scope == RepositoryTransactionScope::Install)
+        || targets.len() != transaction.targets.len()
+        || targets
+            .iter()
+            .any(|name| versions.before.get(name) != Some(&None))
+    {
+        return Err(BackendError("仓库事务缺少对应的请求软件包".into()));
     }
-    let mut names = BTreeSet::new();
+    if action.preconditions.len() != versions.before.len()
+        || action
+            .preconditions
+            .iter()
+            .filter_map(|condition| match condition {
+                Precondition::PackageVersion { package, expected }
+                    if package.source == PackageSource::Official =>
+                {
+                    Some((package.name.as_str(), expected.as_deref()))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>()
+            != versions.before
+    {
+        return Err(BackendError(
+            "仓库事务的本地版本前置条件与审阅清单不符".into(),
+        ));
+    }
+    Ok(transaction)
+}
+
+#[derive(Default)]
+struct Versions<'a> {
+    before: BTreeMap<&'a str, Option<&'a str>>,
+    after: BTreeMap<&'a str, Option<&'a str>>,
+}
+
+fn versions(transaction: &RepositoryTransaction) -> Result<Versions<'_>, BackendError> {
+    let mut result = Versions::default();
+    let mut candidates = BTreeMap::new();
     for change in &transaction.changes {
-        let RepositoryPackageChange::Install { candidate } = change else {
+        if transaction.scope == RepositoryTransactionScope::Install
+            && !matches!(change, RepositoryPackageChange::Install { .. })
+        {
             return Err(BackendError("独立补装事务包含对已安装软件包的变更".into()));
+        }
+        let candidate = match change {
+            RepositoryPackageChange::Install { candidate } => {
+                record_previous(&mut result, &candidate.name, None)?;
+                candidate
+            }
+            RepositoryPackageChange::Upgrade {
+                installed_version,
+                candidate,
+            } => {
+                record_previous(&mut result, &candidate.name, Some(installed_version))?;
+                candidate
+            }
+            RepositoryPackageChange::Replace {
+                package,
+                installed_version,
+                candidate,
+            } => {
+                record_previous(&mut result, package, Some(installed_version))?;
+                result.after.insert(package.as_str(), None);
+                candidate
+            }
+            RepositoryPackageChange::Remove {
+                package,
+                installed_version,
+            } => {
+                record_previous(&mut result, package, Some(installed_version))?;
+                result.after.insert(package.as_str(), None);
+                continue;
+            }
         };
         if !valid_package_name(&candidate.name)
             || !valid_version(&candidate.version)
@@ -28,67 +99,70 @@ pub(super) fn reviewed_install(action: &Action) -> Result<&RepositoryTransaction
                 .sha256
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
-            || !names.insert(candidate.name.as_str())
+            || candidates
+                .insert(candidate.name.as_str(), candidate)
+                .is_some_and(|old| old != candidate)
         {
             return Err(BackendError(format!(
-                "补装事务包含无效或重复的仓库候选 {}",
+                "仓库事务包含无效或不一致的候选 {}",
                 candidate.name
             )));
         }
     }
-    let targets: BTreeSet<_> = transaction.targets.iter().map(String::as_str).collect();
-    if targets.is_empty()
-        || targets.len() != transaction.targets.len()
-        || !targets.is_subset(&names)
+    for (name, candidate) in candidates {
+        result.before.entry(name).or_insert(None);
+        if result
+            .after
+            .insert(name, Some(&candidate.version))
+            .is_some()
+        {
+            return Err(BackendError(format!("仓库事务同时移除和安装 {name}")));
+        }
+    }
+    Ok(result)
+}
+
+fn record_previous<'a>(
+    versions: &mut Versions<'a>,
+    name: &'a str,
+    installed: Option<&'a str>,
+) -> Result<(), BackendError> {
+    if !valid_package_name(name)
+        || installed.is_some_and(|version| !valid_version(version))
+        || versions.before.insert(name, installed).is_some()
     {
-        return Err(BackendError("补装事务缺少对应的请求软件包".into()));
+        return Err(BackendError(format!(
+            "仓库事务包含无效或重复的软件包变更 {name}"
+        )));
     }
-    let missing: BTreeSet<_> = action
-        .preconditions
-        .iter()
-        .filter_map(|condition| match condition {
-            Precondition::PackageVersion {
-                package,
-                expected: None,
-            } if package.source == PackageSource::Official => Some(package.name.as_str()),
-            _ => None,
-        })
-        .collect();
-    if missing != names || action.preconditions.len() != names.len() {
-        return Err(BackendError("补装事务缺少软件包未安装的前置条件".into()));
-    }
-    Ok(transaction)
+    Ok(())
 }
 
 impl PacmanBackend {
-    pub(super) fn inspect_install(
+    pub(super) fn inspect_repository(
         &self,
         transaction: &RepositoryTransaction,
     ) -> Result<ActionReadiness, BackendError> {
+        let versions = versions(transaction)?;
         let output = self.installed_packages()?;
         let installed = package_rows(pacman_text(&output)?)?;
-        let mut present = 0;
-        for change in &transaction.changes {
-            let RepositoryPackageChange::Install { candidate } = change else {
-                return Err(BackendError("核对补装时遇到已安装软件包的变更".into()));
-            };
-            match installed.get(candidate.name.as_str()) {
-                Some(version) if *version == candidate.version => present += 1,
-                Some(version) => {
-                    return Ok(ActionReadiness::Conflict(format!(
-                        "软件包 {} 当前版本 {version} 与审阅候选 {} 不符",
-                        candidate.name, candidate.version
-                    )));
-                }
-                None => {}
-            }
-        }
-        Ok(if present == transaction.changes.len() {
+        let matches = |expected: &BTreeMap<&str, Option<&str>>| {
+            expected
+                .iter()
+                .all(|(name, expected)| installed.get(name).copied() == *expected)
+        };
+        Ok(if matches(&versions.after) {
+            self.inspect_installed_records(
+                versions
+                    .after
+                    .iter()
+                    .filter_map(|(&name, version)| version.map(|_| name)),
+            )?;
             ActionReadiness::Satisfied
-        } else if present == 0 {
+        } else if matches(&versions.before) {
             ActionReadiness::Ready
         } else {
-            ActionReadiness::Conflict("只有部分已审阅软件包存在，请重新规划".into())
+            ActionReadiness::Conflict("本机包数据库与审阅前后的完整事务均不符，请重新规划".into())
         })
     }
 }

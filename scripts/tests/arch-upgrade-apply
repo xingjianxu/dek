@@ -59,14 +59,17 @@ id=$(awk '/^计划 / {print $2}' "$evidence/remote-review.log")
 grep -Fq '3-1 → 4-1' "$evidence/remote-review.log"
 grep -Fq "dek apply -H fixture --plan $id" "$evidence/remote-review.log"
 ! grep -Fq 'run_id ' "$evidence/remote-review.log"
-"$scripts/run-arch-vm" ssh "$run" pacman -Q dek-upgrade-main | grep -Fx 'dek-upgrade-main 3-1'
+"$scripts/run-arch-vm" ssh "$run" sudo -n pacman -Q dek-upgrade-main | grep -Fx 'dek-upgrade-main 3-1'
 run_remote apply --plan "$id" --request-id remote-upgrade > "$evidence/remote-apply.log"
 run_id=$(awk '/^run_id / {print $2}' "$evidence/remote-apply.log")
 [[ "$run_id" =~ ^[0-9a-f]{64}$ ]]
 run_remote status --run "$run_id" --json > "$evidence/remote-status.json"
 jq -e --arg plan "$id" '.finished and .plan_id == $plan and .actions[0].result.verified.changed' \
     "$evidence/remote-status.json" >/dev/null
-"$scripts/run-arch-vm" ssh "$run" pacman -Q dek-upgrade-main | grep -Fx 'dek-upgrade-main 4-1'
+"$scripts/run-arch-vm" ssh "$run" sudo -n pacman -Q dek-upgrade-main | grep -Fx 'dek-upgrade-main 4-1'
 "$scripts/run-arch-vm" ssh "$run" cmp /run/dek-upgrade-apply/c/fixture.db /var/lib/pacman/sync/fixture.db
+"$scripts/run-arch-vm" ssh "$run" cmp /run/dek-upgrade-apply/c/fixture.db.sig /var/lib/pacman/sync/fixture.db.sig
+"$scripts/run-arch-vm" ssh "$run" sha256sum /var/lib/pacman/local/dek-upgrade-main-4-1/{desc,files,mtree} \
+    > "$evidence/remote-package-record.sha256"
 "$scripts/run-arch-vm" finish "$run" passed
 printf 'Reviewed local and SSH upgrade transactions passed.\n'

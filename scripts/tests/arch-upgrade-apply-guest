@@ -7,12 +7,22 @@ export LC_ALL=C SOURCE_DATE_EPOCH=1700000000
 
 base=/run/dek-upgrade-apply
 install -d -m 0755 "$base"/{seed,a,b,c,repo}
-install -d -m 0700 "$base"/{cache,state}
+install -d -m 0700 "$base"/{cache,state,signing,keyring}
 work=$(mktemp -d)
 chmod 0755 "$work"
+export GNUPGHOME="$base/signing"
+gpg --batch --pinentry-mode loopback --passphrase '' \
+    --quick-generate-key 'Dek Arch Upgrade Fixture <upgrade@example.invalid>' ed25519 sign 0
+key=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+gpg --batch --export "$key" > "$work/fixture-key.gpg"
+pacman-key --gpgdir "$base/keyring" --init
+pacman-key --gpgdir "$base/keyring" --add "$work/fixture-key.gpg"
+pacman-key --gpgdir "$base/keyring" --lsign-key "$key"
+unset GNUPGHOME
 mkpkg() {
     local directory=$1 name=$2 version=$3 hook=${4:-}
     local source="$work/$name"
+    local archive="$base/$directory/$name-$version-any.pkg.tar.zst"
     install -d -m 0755 "$source/usr/share/$name"
     {
         printf 'pkgname = %s\npkgver = %s\npkgdesc = dek reviewed upgrade fixture\n' "$name" "$version"
@@ -29,8 +39,11 @@ post_upgrade() {
 HOOK
         paths+=(.INSTALL)
     fi
+    bsdtar -cf - --format=mtree --options='!all,use-set,type,uid,gid,mode,size,sha256' \
+        -C "$source" "${paths[@]}" | gzip -n > "$source/.MTREE"
     tar --mtime="@$SOURCE_DATE_EPOCH" --sort=name --owner=0 --group=0 --numeric-owner \
-        -cf - -C "$source" "${paths[@]}" | zstd -q -o "$base/$directory/$name-$version-any.pkg.tar.zst"
+        -cf - -C "$source" "${paths[@]}" .MTREE | zstd -q -o "$archive"
+    gpg --homedir "$base/signing" --batch --local-user "$key" --detach-sign "$archive"
     rm -r -- "$source"
 }
 
@@ -40,16 +53,18 @@ mkpkg a dek-upgrade-addon 1-1
 mkpkg b dek-upgrade-main 3-1 hook
 mkpkg b dek-upgrade-addon 2-1
 mkpkg c dek-upgrade-main 4-1 hook
-cp -- "$base/b/dek-upgrade-addon-2-1-any.pkg.tar.zst" "$base/c/"
+cp -- "$base/b/dek-upgrade-addon-2-1-any.pkg.tar.zst"{,.sig} "$base/c/"
 for state in a b c; do
-    (cd "$base/$state" && repo-add fixture.db.tar.gz ./*.pkg.tar.zst && sha256sum -- fixture.db ./*.pkg.tar.zst)
+    (cd "$base/$state" &&
+        GNUPGHOME="$base/signing" repo-add --sign --key "$key" fixture.db.tar.gz ./*.pkg.tar.zst &&
+        sha256sum -- fixture.db fixture.db.sig ./*.pkg.tar.zst)
 done
 ln -s "$base/a" "$base/current"
 cat > /etc/pacman.conf <<CONF
 [options]
 Architecture = auto
-SigLevel = Never
-LocalFileSigLevel = Never
+SigLevel = Required TrustedOnly
+GPGDir = $base/keyring
 DownloadUser = alpm
 [fixture]
 Server = file://$base/current
@@ -120,10 +135,22 @@ snapshot > "$base/after-review.sha256"
 cmp "$base/initial.sha256" "$base/after-review.sha256"
 cat "$base/noninteractive.log" "$base/cancel.log"
 
+install -m 0600 /dev/stdin "$base/state/retention.json" <<'JSON'
+{"planTtlSeconds":1}
+JSON
+sleep 2
+expect_review expired apply --plan "$old"
+renewed=$(review_id "$base/expired.log")
+[[ "$renewed" != "$old" ]]
+grep -Fq '已审阅计划过期' "$base/expired.log"
+grep -Fq '完整仓库升级事务' "$base/expired.log"
+! grep -Fq 'run_id ' "$base/expired.log"
+rm -- "$base/state/retention.json"
+
 ln -sfn "$base/b" "$base/current"
-expect_review changed apply --plan "$old"
+expect_review changed apply --plan "$renewed"
 new=$(review_id "$base/changed.log")
-[[ "$old" != "$new" ]]
+[[ "$renewed" != "$new" ]]
 ! grep -Fq 'run_id ' "$base/changed.log"
 snapshot > "$base/after-stale.sha256"
 cmp "$base/initial.sha256" "$base/after-stale.sha256"
@@ -136,7 +163,14 @@ run_id=$(awk '/^run_id / { print $2 }' "$base/widened.log")
 [[ "$(tx_count)" == "$((before + 1))" ]]
 [[ "$(pacman -Q dek-upgrade-main)" == 'dek-upgrade-main 3-1' ]]
 [[ "$(pacman -Q dek-upgrade-addon)" == 'dek-upgrade-addon 2-1' ]]
+for package in dek-upgrade-main-3-1 dek-upgrade-addon-2-1; do
+    for record in desc files mtree; do
+        test -s "/var/lib/pacman/local/$package/$record"
+    done
+    sha256sum "/var/lib/pacman/local/$package/"{desc,files,mtree}
+done
 cmp "$base/b/fixture.db" /var/lib/pacman/sync/fixture.db
+cmp "$base/b/fixture.db.sig" /var/lib/pacman/sync/fixture.db.sig
 [[ "$(cat "$base/drifted.conf")" == package-generated && ! -e "$base/pending.conf" ]]
 [[ "$(cat "$base/hook-commits")" == '3-1' ]]
 run_dek status --run "$run_id" --json > "$base/partial.json"
@@ -167,6 +201,14 @@ printf 'Local configuration review, single native transaction and persisted jour
 # Prepare an independently reviewed remote transaction. The test VM grants its
 # fixed internal endpoint package privileges while Ruby remains on the controller.
 ln -sfn "$base/c" "$base/current"
+if ! run_dek plan --upgrade --json > "$base/next-local.json"; then
+    native=$(mktemp -d)
+    cp -a /var/lib/pacman/local "$native/"
+    install -d "$native/sync"
+    cp -- "$base/c/fixture.db"{,.sig} "$native/sync/"
+    pacman --debug --dbpath "$native" -Sup || true
+    exit 1
+fi
 mv /usr/local/bin/dek /usr/local/bin/dek-native
 cat > /usr/local/bin/dek <<'SH'
 #!/bin/sh

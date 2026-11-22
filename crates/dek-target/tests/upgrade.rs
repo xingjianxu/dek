@@ -3,6 +3,7 @@
 use std::{
     cell::Cell,
     collections::BTreeMap,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -19,7 +20,7 @@ use dek_core::{
 use dek_target::{
     backend::{
         ActionContext, ActionReadiness, Backend, BackendError, BackendRegistry, PlannedAction,
-        PlannedPackages,
+        PlannedPackages, RepositoryPreparation,
     },
     executor::{ExecutionOutcome, ExecutionRequest, Executor},
     planner::plan_for_host_with_contents_mode,
@@ -32,10 +33,10 @@ const REVIEWED: &[u8] = b"approved";
 const GENERATED: &[u8] = b"created by package hook";
 
 struct Target {
-    installed: Cell<&'static str>,
+    installed: Rc<Cell<&'static str>>,
     candidate: Cell<&'static str>,
-    content: Cell<&'static [u8]>,
-    package_writes: Cell<usize>,
+    content: Rc<Cell<&'static [u8]>>,
+    package_writes: Rc<Cell<usize>>,
     config_writes: Cell<usize>,
     hook_changes_config: bool,
 }
@@ -43,10 +44,10 @@ struct Target {
 impl Target {
     fn new(hook_changes_config: bool) -> Self {
         Self {
-            installed: Cell::new("1"),
+            installed: Rc::new(Cell::new("1")),
             candidate: Cell::new("2"),
-            content: Cell::new(REVIEWED),
-            package_writes: Cell::new(0),
+            content: Rc::new(Cell::new(REVIEWED)),
+            package_writes: Rc::new(Cell::new(0)),
             config_writes: Cell::new(0),
             hook_changes_config,
         }
@@ -164,15 +165,28 @@ impl Backend for Target {
         })
     }
 
+    fn prepare_repository_transaction(
+        &self,
+        _: &Action,
+    ) -> Result<RepositoryPreparation, BackendError> {
+        let installed = Rc::clone(&self.installed);
+        let content = Rc::clone(&self.content);
+        let writes = Rc::clone(&self.package_writes);
+        let candidate = self.candidate.get();
+        let hook_changes_config = self.hook_changes_config;
+        Ok(RepositoryPreparation::Ready(Box::new(move || {
+            writes.set(writes.get() + 1);
+            installed.set(candidate);
+            if hook_changes_config {
+                content.set(GENERATED);
+            }
+            Ok(())
+        })))
+    }
+
     fn execute(&self, action: &ActionContext<'_>) -> Result<(), BackendError> {
         match &action.action.kind {
-            ActionKind::RepositoryTransaction(_) => {
-                self.package_writes.set(self.package_writes.get() + 1);
-                self.installed.set(self.candidate.get());
-                if self.hook_changes_config {
-                    self.content.set(GENERATED);
-                }
-            }
+            ActionKind::RepositoryTransaction(_) => panic!("expected guarded native commit"),
             ActionKind::WriteFile { content, .. } => {
                 assert_eq!(action.content(&content.digest)?, REVIEWED);
                 self.config_writes.set(self.config_writes.get() + 1);
@@ -339,6 +353,25 @@ fn package_created_configuration_is_returned_for_review_after_the_transaction_is
         matches!(retry, ExecutionOutcome::ReviewRequired { replacement: Some(plan), .. } if plan.id == new.id)
     );
     assert_eq!(target.package_writes.get(), 1);
+}
+
+#[test]
+fn unchanged_reviewed_configuration_runs_after_the_verified_upgrade() {
+    let fixture = tempfile::tempdir().unwrap();
+    let target = Target::new(false);
+    target.content.set(GENERATED);
+    let registry = target.registry();
+    let store = StateStore::open(&fixture.path().join("state")).unwrap();
+    let plan = review(&store, &registry);
+    let binding = binding(&registry);
+    let outcome = apply(&Executor::new(&store, &registry), binding, &plan, |_| {});
+    assert!(
+        matches!(outcome, ExecutionOutcome::Finished(run) if run.actions.len() == 2
+        && run.actions.iter().all(|item| item.result == (ActionResult::Verified { changed: true })))
+    );
+    assert_eq!(target.package_writes.get(), 1);
+    assert_eq!(target.config_writes.get(), 1);
+    assert_eq!(target.content.get(), REVIEWED);
 }
 
 #[test]

@@ -63,23 +63,21 @@ impl PacmanBackend {
 
     fn installed_packages(&self) -> Result<Output, BackendError> {
         let output = self.output("查询本地软件包", &["--query", "--color", "never"])?;
-        let diagnostics = String::from_utf8_lossy(&output.stderr);
-        let errors = diagnostics
-            .lines()
-            .filter(|line| {
-                // pacman emits this while initializing configured sync databases,
-                // even when the operation only reads the local package database.
-                !line.starts_with("warning: database file for '")
-                    || !line.ends_with("' does not exist (use '-Sy' to download)")
-            })
-            .collect::<Vec<_>>();
-        if !errors.is_empty() {
-            return Err(BackendError(format!(
-                "pacman 无法完整读取本地数据库：{}",
-                errors.join("\n")
-            )));
-        }
+        check_local_query(&output)?;
         Ok(output)
+    }
+
+    fn inspect_installed_records<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), BackendError> {
+        let mut args = vec!["--query", "--info", "--list", "--color", "never", "--"];
+        let prefix = args.len();
+        args.extend(names);
+        if args.len() > prefix {
+            check_local_query(&self.output("核对本地包记录", &args)?)?;
+        }
+        Ok(())
     }
 
     fn installed(&self, package: &PackageId) -> Result<Option<String>, BackendError> {
@@ -189,7 +187,7 @@ impl Backend for PacmanBackend {
     fn validate_action(&self, action: &Action) -> Result<(), BackendError> {
         match action.kind {
             ActionKind::RepositoryTransaction(_) => {
-                transaction::reviewed_install(action).map(|_| ())
+                transaction::reviewed_transaction(action).map(|_| ())
             }
             ActionKind::BuildAurPackage { .. } => {
                 Err(BackendError("当前后端只支持 AUR 规划".into()))
@@ -202,12 +200,19 @@ impl Backend for PacmanBackend {
         &self,
         action: &Action,
     ) -> Result<RepositoryPreparation, BackendError> {
-        alpm::prepare_install(transaction::reviewed_install(action)?)
+        alpm::prepare_transaction(transaction::reviewed_transaction(action)?)
     }
 
     fn inspect_action(&self, action: &Action) -> Result<ActionReadiness, BackendError> {
         if matches!(action.kind, ActionKind::RepositoryTransaction(_)) {
-            return self.inspect_install(transaction::reviewed_install(action)?);
+            let transaction = transaction::reviewed_transaction(action)?;
+            return if transaction.changes.is_empty() {
+                // An explicitly reviewed upgrade can refresh its sync snapshot
+                // even when all installed package versions already match.
+                Ok(ActionReadiness::Ready)
+            } else {
+                self.inspect_repository(transaction)
+            };
         }
         let (package, version) = reviewed_removal(action)?;
         Ok(match self.installed(package)? {
@@ -247,12 +252,32 @@ impl Backend for PacmanBackend {
     fn verify(&self, action: &ActionKind) -> Result<bool, BackendError> {
         if let ActionKind::RepositoryTransaction(transaction) = action {
             return self
-                .inspect_install(transaction)
+                .inspect_repository(transaction)
                 .map(|result| result == ActionReadiness::Satisfied);
         }
         self.installed(removal_package(action)?)
             .map(|version| version.is_none())
     }
+}
+
+fn check_local_query(output: &Output) -> Result<(), BackendError> {
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    let errors = diagnostics
+        .lines()
+        .filter(|line| {
+            // pacman emits this while initializing configured sync databases,
+            // even when the operation only reads the local package database.
+            !line.starts_with("warning: database file for '")
+                || !line.ends_with("' does not exist (use '-Sy' to download)")
+        })
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
+        return Err(BackendError(format!(
+            "pacman 无法完整读取本地数据库：{}",
+            errors.join("\n")
+        )));
+    }
+    Ok(())
 }
 
 fn package_resource(resource: &DesiredResource) -> Result<&PackageResource, BackendError> {

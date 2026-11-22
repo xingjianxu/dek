@@ -17,13 +17,16 @@ use dek_core::{
 };
 use dek_target::backend::{BackendError, RepositoryPreparation};
 
-use super::{Alpm, Config, Package, as_c, cache, items, native::FileConflict, question, text};
+use super::{
+    Alpm, Config, Package, as_c, cache, items, native::FileConflict, question, text,
+    upgrade_apply::UpgradeDatabase,
+};
 
 const NEEDED: i32 = 1 << 13;
 const DOWNLOAD_ONLY: i32 = 1 << 9;
 const SIGNED_PACKAGE: i32 = 1;
 
-pub(in crate::arch) fn prepare_install(
+pub(in crate::arch) fn prepare_transaction(
     reviewed: &RepositoryTransaction,
 ) -> Result<RepositoryPreparation, BackendError> {
     if !rustix::process::geteuid().is_root() {
@@ -35,7 +38,26 @@ pub(in crate::arch) fn prepare_install(
     // directory. It can traverse the parent without modifying reviewed archives.
     fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o711)).map_err(cache_error)?;
 
-    let Some(fetch) = Transaction::begin(&config, stage.path(), NEEDED | DOWNLOAD_ONLY)? else {
+    let (live_lock, upgrade_db) = if reviewed.scope == RepositoryTransactionScope::Upgrade {
+        let lock = Transaction::lock_live(&config)?;
+        let snapshot = UpgradeDatabase::refresh(&config)?;
+        (Some(lock), Some(snapshot))
+    } else {
+        (None, None)
+    };
+    let database = upgrade_db
+        .as_ref()
+        .map_or(config.db.as_path(), UpgradeDatabase::path);
+    let private_keys = upgrade_db.as_ref().map(|db| db.path().join("gnupg"));
+    let keys = private_keys.as_deref().unwrap_or(&config.gpg);
+    let Some(fetch) = Transaction::begin(
+        &config,
+        database,
+        keys,
+        stage.path(),
+        NEEDED | DOWNLOAD_ONLY,
+    )?
+    else {
         return Ok(RepositoryPreparation::Changed);
     };
     let Some(archives) = fetch.reviewed_archives(reviewed)? else {
@@ -64,13 +86,16 @@ pub(in crate::arch) fn prepare_install(
             "缺少已审阅的软件包缓存，目标配置的 XferCommand 下载暂不可用".into(),
         ));
     }
-    fetch.commit("下载并验签已审阅软件包")?;
+    if !archives.is_empty() {
+        fetch.commit("下载并验签已审阅软件包")?;
+    }
     verify_archives(stage.path(), &archives)?;
     drop(fetch);
 
     // Package files are now pinned in our private directory. Reacquire the
     // database lock, recheck the exact transaction, and hold it through commit.
-    let Some(transaction) = Transaction::begin(&config, stage.path(), NEEDED)? else {
+    let Some(transaction) = Transaction::begin(&config, database, keys, stage.path(), NEEDED)?
+    else {
         return Ok(RepositoryPreparation::Changed);
     };
     if transaction.reviewed_archives(reviewed)?.as_ref() != Some(&archives)
@@ -78,9 +103,32 @@ pub(in crate::arch) fn prepare_install(
     {
         return Ok(RepositoryPreparation::Changed);
     }
+    let reviewed = reviewed.clone();
     Ok(RepositoryPreparation::Ready(Box::new(move || {
-        let _stage = stage;
-        transaction.commit("安装已审阅的仓库事务")
+        let Some(database) = upgrade_db.as_ref() else {
+            let _stage = stage;
+            return transaction.commit("安装已审阅的仓库事务");
+        };
+        database.publish(&config.db)?;
+        drop(transaction);
+        // ALPM commit requires the lock to belong to the committing handle.
+        // Reacquire it with the real DB path so archive scriptlets and metadata
+        // are installed by the same rules as an ordinary pacman transaction.
+        drop(live_lock);
+        if reviewed.changes.is_empty() {
+            return Ok(());
+        }
+        let keys = private_keys.as_deref().unwrap_or(&config.gpg);
+        let live = Transaction::begin(&config, &config.db, keys, stage.path(), NEEDED)?
+            .ok_or_else(|| BackendError("本机同步数据库在重新加锁时改变，请重新规划".into()))?;
+        if live.reviewed_archives(&reviewed)?.as_ref() != Some(&archives)
+            || !live.matches(&reviewed)?
+        {
+            return Err(BackendError(
+                "仓库事务在重新加锁后与审阅清单不符，请重新规划".into(),
+            ));
+        }
+        live.commit("执行已审阅的完整仓库升级")
     })))
 }
 
@@ -131,26 +179,39 @@ impl Drop for Transaction {
 }
 
 impl Transaction {
-    fn begin(config: &Config, cache: &Path, flags: i32) -> Result<Option<Self>, BackendError> {
-        if !config.db.join("local/ALPM_DB_VERSION").is_file() {
-            return Err(BackendError(
-                "本机 pacman 数据库缺少安装记录格式标识".into(),
-            ));
-        }
-        let databases = snapshot_sync(config)?;
-        let alpm = Alpm::open(config, &config.db, &config.gpg, &config.log)?;
-        alpm.configure_execution(config, cache)?;
+    fn lock_live(config: &Config) -> Result<Self, BackendError> {
+        validate_local_database(&config.db)?;
+        let alpm = Alpm::initialize(config, &config.db)?;
+        Self::lock(alpm, 0)
+    }
+
+    fn lock(alpm: Alpm, flags: i32) -> Result<Self, BackendError> {
         let handle = alpm.handle.as_ptr();
-        // SAFETY: ALPM owns the live handle and takes the configured database lock.
+        // SAFETY: ALPM owns the live handle and takes the selected database lock.
         alpm.check(
             unsafe { (alpm.native.alpm_trans_init)(handle, flags) },
-            "锁定本机 pacman 数据库",
+            "锁定 pacman 数据库",
         )?;
-        let mut transaction = Self {
+        Ok(Self {
             alpm,
             decisions: Box::new(Decisions(Vec::new())),
-        };
-        if snapshot_sync(config)? != databases {
+        })
+    }
+
+    fn begin(
+        config: &Config,
+        database: &Path,
+        keys: &Path,
+        cache: &Path,
+        flags: i32,
+    ) -> Result<Option<Self>, BackendError> {
+        validate_local_database(database)?;
+        let databases = snapshot_sync(config, database)?;
+        let alpm = Alpm::open(config, database, keys, &config.log)?;
+        alpm.configure_execution(config, cache)?;
+        let handle = alpm.handle.as_ptr();
+        let mut transaction = Self::lock(alpm, flags)?;
+        if snapshot_sync(config, database)? != databases {
             return Ok(None);
         }
         // SAFETY: callback state remains at a stable address until transaction release.
@@ -313,8 +374,21 @@ struct DatabaseSnapshot {
     changed: (i64, i64),
 }
 
-fn snapshot_sync(config: &Config) -> Result<Vec<Option<DatabaseSnapshot>>, BackendError> {
-    let dir = config.db.join("sync");
+fn validate_local_database(database: &Path) -> Result<(), BackendError> {
+    if database.join("local/ALPM_DB_VERSION").is_file() {
+        Ok(())
+    } else {
+        Err(BackendError(
+            "本机 pacman 数据库缺少安装记录格式标识".into(),
+        ))
+    }
+}
+
+fn snapshot_sync(
+    config: &Config,
+    database: &Path,
+) -> Result<Vec<Option<DatabaseSnapshot>>, BackendError> {
+    let dir = database.join("sync");
     config
         .repositories
         .iter()

@@ -418,7 +418,14 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         if let Some(transaction) = upgrade
             && !already_upgraded
         {
-            self.run_actions(&run, binding, reviewed, &live, repository_commit, Some(&transaction.id))?;
+            self.run_actions(
+                &run,
+                binding,
+                reviewed,
+                &live,
+                repository_commit,
+                Some(&transaction.id),
+            )?;
             let run = self.store.lock()?.load_run(&run.id, binding)?;
             if let Some(input) = changed_input(&reviewed.plan, &mut observe_input)? {
                 return Ok(ExecutionOutcome::review(ReviewReason::InputChanged {
@@ -637,7 +644,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             }
             let attempt = self.begin(run, binding, action)?;
             let outcome = if matches!(&readiness, Ok(ActionReadiness::Ready))
-                && matches!(action.kind, ActionKind::RepositoryTransaction(_))
+                && let ActionKind::RepositoryTransaction(transaction) = &action.kind
                 && let Some(commit) = repository_commit.take()
             {
                 Self::queue_dependent_notifications(self.store, run, binding, action, true)
@@ -645,7 +652,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                     .and_then(|()| {
                         commit()
                             .and_then(|()| verify(backend, action))
-                            .map(|()| true)
+                            .map(|()| !transaction.changes.is_empty())
                             .map_err(|error| ExecutionError::action(action, error.0))
                     })
             } else {
