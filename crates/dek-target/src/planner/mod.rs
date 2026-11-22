@@ -6,9 +6,9 @@ mod systemd;
 use std::collections::{BTreeMap, BTreeSet};
 
 use dek_core::{
-    Action, ActionKind, ContentDigest, InputObservation, NotifyWhen, Plan, PlanVersion, Resource,
-    ResourceId, ResourceKind, ResourceOrigin, ResourceSet, ServiceEffect, ServiceNotification,
-    UnitId,
+    Action, ActionKind, ContentDigest, InputObservation, NotificationSource, NotifyWhen, Plan,
+    PlanVersion, Resource, ResourceId, ResourceKind, ResourceOrigin, ResourceSet, ServiceEffect,
+    ServiceNotification, UnitId,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -269,7 +269,7 @@ struct Actions {
 struct PendingNotification {
     notification: ServiceNotification,
     origins: Vec<ResourceOrigin>,
-    predecessors: BTreeSet<usize>,
+    sources: BTreeMap<(usize, NotifyWhen), ServiceEffect>,
 }
 
 impl Actions {
@@ -303,7 +303,7 @@ impl Actions {
             .or_insert_with(|| PendingNotification {
                 notification: notification.clone(),
                 origins: Vec::new(),
-                predecessors: BTreeSet::new(),
+                sources: BTreeMap::new(),
             });
         if notification.effect == ServiceEffect::Restart {
             pending.notification.effect = ServiceEffect::Restart;
@@ -311,7 +311,13 @@ impl Actions {
         if notification.when == NotifyWhen::Changed {
             pending.notification.when = NotifyWhen::Changed;
         }
-        pending.predecessors.insert(predecessor);
+        let effect = pending
+            .sources
+            .entry((predecessor, notification.when))
+            .or_insert(notification.effect);
+        if notification.effect == ServiceEffect::Restart {
+            *effect = ServiceEffect::Restart;
+        }
         for origin in origins {
             if !pending.origins.contains(origin) {
                 pending.origins.push(origin.clone());
@@ -320,16 +326,16 @@ impl Actions {
     }
 
     fn finish(mut self, registry: &BackendRegistry<'_>) -> Result<Vec<Action>, PlanError> {
-        for (unit, mut pending) in std::mem::take(&mut self.notifications) {
+        for (unit, pending) in std::mem::take(&mut self.notifications) {
             let running_change = self.running_changes.get(&unit).copied();
             if matches!(running_change, Some((false, _))) {
                 continue;
             }
             if let Some((true, start)) = running_change
-                && pending.predecessors.iter().all(|&index| index < start)
+                && pending.sources.keys().all(|&(index, _)| index < start)
             {
                 let depends_on = &mut self.records[start].depends_on;
-                for id in pending.predecessors.iter().copied().map(action_id) {
+                for id in pending.sources.keys().map(|&(index, _)| action_id(index)) {
                     if !depends_on.contains(&id) {
                         depends_on.push(id);
                     }
@@ -349,17 +355,29 @@ impl Actions {
                     message: format!("plan service notification: {err}"),
                 })?;
             if let Some(planned) = planned {
+                let mut predecessors: BTreeSet<_> =
+                    pending.sources.keys().map(|&(index, _)| index).collect();
                 if let Some(ends) = self.ends.get(&ResourceId::SystemdUnit(unit.clone())) {
-                    pending.predecessors.extend(ends);
+                    predecessors.extend(ends);
                 }
+                let sources = pending
+                    .sources
+                    .into_iter()
+                    .map(|((index, when), effect)| NotificationSource {
+                        action: action_id(index),
+                        effect,
+                        when,
+                    })
+                    .collect();
                 self.push(
                     ActionKind::NotifyService {
                         unit,
                         effect: pending.notification.effect,
+                        sources,
                     },
                     planned.reason,
                     pending.origins,
-                    &pending.predecessors,
+                    &predecessors,
                     planned.preconditions,
                 );
             }

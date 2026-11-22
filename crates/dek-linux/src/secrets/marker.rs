@@ -1,7 +1,10 @@
 use std::{io::Read, path::Path};
 
 use dek_core::{AgeSecretResource, AgeSecretVerification};
-use dek_target::{backend::BackendError, state::StateStore};
+use dek_target::{
+    backend::BackendError,
+    state::{SecretVerification, StateError, StateStore},
+};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -19,10 +22,27 @@ pub(super) fn observe(
     file: &ExistingFile,
 ) -> Result<AgeSecretVerification, BackendError> {
     let id = marker_id(output);
-    let material = match StateStore::read_secret_verification(state_root, &id) {
-        Ok(Some(material)) => material,
-        Ok(None) => return Ok(AgeSecretVerification::Unverified),
-        Err(err) => return Err(BackendError(format!("读取加密文件验证状态：{err}"))),
+    let binding = binding(secret, output);
+    let state = |err: StateError| BackendError(format!("读取加密文件验证状态：{err}"));
+    let marker = StateStore::read_secret_verification(state_root, &id).map_err(state)?;
+    let current = verify_marker(marker, &binding, output, file)?;
+    if current != AgeSecretVerification::Matched {
+        let candidate = StateStore::read_secret_candidate(state_root, &id).map_err(state)?;
+        if verify_marker(candidate, &binding, output, file)? == AgeSecretVerification::Matched {
+            return Ok(AgeSecretVerification::Matched);
+        }
+    }
+    Ok(current)
+}
+
+fn verify_marker(
+    material: Option<SecretVerification>,
+    binding: &[u8; 32],
+    output: &Path,
+    file: &ExistingFile,
+) -> Result<AgeSecretVerification, BackendError> {
+    let Some(material) = material else {
+        return Ok(AgeSecretVerification::Unverified);
     };
     let key = Zeroizing::new(material.key);
     let marker = material.marker;
@@ -36,7 +56,6 @@ pub(super) fn observe(
         return Ok(AgeSecretVerification::Unverified);
     }
     let (reviewed_binding, expected_mac) = fields.split_at(32);
-    let binding = binding(secret, output);
     if reviewed_binding != binding {
         return Ok(AgeSecretVerification::InputsChanged);
     }
@@ -53,7 +72,7 @@ pub(super) fn observe(
             )));
         }
     };
-    let mac = content_mac(&key, &binding, &mut reader)?;
+    let mac = content_mac(&key, binding, &mut reader)?;
     if !file
         .unchanged(&reader)
         .map_err(|_| BackendError(format!("无法复核加密文件 {:?} 的观测状态", output)))?

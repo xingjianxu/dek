@@ -461,7 +461,19 @@ fn change_notifications_follow_writes_and_fold_to_one_service_action() {
         notify.kind,
         ActionKind::NotifyService {
             unit: service_id(),
-            effect: ServiceEffect::Restart
+            effect: ServiceEffect::Restart,
+            sources: vec![
+                dek_core::NotificationSource {
+                    action: first.id.clone(),
+                    effect: ServiceEffect::Reload,
+                    when: NotifyWhen::ContentChanged,
+                },
+                dek_core::NotificationSource {
+                    action: second.id.clone(),
+                    effect: ServiceEffect::Restart,
+                    when: NotifyWhen::Changed,
+                },
+            ],
         }
     );
     assert_eq!(

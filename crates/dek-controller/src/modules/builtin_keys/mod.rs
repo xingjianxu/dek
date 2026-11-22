@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use dek_core::{EffectiveOption, FileAttributes, HostConfig, Origin};
+use dek_core::{
+    EffectiveOption, FileAttributes, HostConfig, NotifyWhen, Origin, ServiceEffect,
+    ServiceNotification, UnitId, UnitScope,
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -124,7 +127,7 @@ fn expand(context: &ExpandContext<'_>) -> Result<ModuleOutput, String> {
             group: field(&fields, &prefix, "group")?,
             mode: field(&fields, &prefix, "mode")?,
         };
-        output.resources.push(declare(
+        let mut resource = declare(
             ResourceDraft::AgeSecret {
                 path,
                 ciphertext,
@@ -132,7 +135,24 @@ fn expand(context: &ExpandContext<'_>) -> Result<ModuleOutput, String> {
                 attributes,
             },
             origins,
-        ));
+        );
+        for (field_name, effect) in [
+            ("reloadUnits", ServiceEffect::Reload),
+            ("restartUnits", ServiceEffect::Restart),
+        ] {
+            let names = field::<Vec<String>>(&fields, &prefix, field_name)?.unwrap_or_default();
+            resource
+                .notifications
+                .extend(names.into_iter().map(|name| ServiceNotification {
+                    unit: UnitId {
+                        scope: UnitScope::System,
+                        name,
+                    },
+                    effect,
+                    when: NotifyWhen::ContentChanged,
+                }));
+        }
+        output.resources.push(resource);
     }
     Ok(output)
 }
@@ -160,7 +180,10 @@ fn collect_age_secrets(config: &HostConfig) -> BTreeMap<&str, Fields<'_>> {
             .as_str()
             .strip_prefix("age.secrets.")
             .and_then(|path| path.split_once('.'))
-            && matches!(field, "file" | "path" | "owner" | "group" | "mode")
+            && matches!(
+                field,
+                "file" | "path" | "owner" | "group" | "mode" | "reloadUnits" | "restartUnits"
+            )
         {
             secrets.entry(name).or_default().insert(field, option);
         }

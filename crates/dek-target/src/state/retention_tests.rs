@@ -97,6 +97,7 @@ impl Fixture {
                             name: "example.service".into(),
                         },
                         effect: ServiceEffect::Reload,
+                        sources: Vec::new(),
                     },
                     reason: "trigger".into(),
                     origins: Vec::new(),

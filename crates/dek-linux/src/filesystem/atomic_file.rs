@@ -10,7 +10,7 @@ use rustix::{
     fd::OwnedFd,
     fs::{
         AtFlags, FileType, Mode, OFlags, RenameFlags, Stat, fchmod, fchown, fstat, mkdirat, open,
-        openat, renameat, renameat_with, statat, unlinkat,
+        openat, renameat_with, statat, unlinkat,
     },
     io::Errno,
     process::{Gid, Uid, geteuid},
@@ -153,6 +153,10 @@ impl TargetPath {
         Ok(file)
     }
 
+    pub(crate) fn same_parent(&self, other: &Self) -> io::Result<bool> {
+        Ok(same_inode(&fstat(&self.parent)?, &fstat(&other.parent)?))
+    }
+
     pub(crate) fn require_unchanged(&self, expected: Option<&Stat>) -> io::Result<()> {
         let actual = self.observe()?;
         match (expected, actual.as_ref()) {
@@ -225,11 +229,16 @@ impl<'a> StagedFile<'a> {
     pub(crate) fn publish(self, expected: Option<&Stat>) -> io::Result<()> {
         let stage = &self.0;
         stage.target.require_unchanged(expected)?;
-        renameat(
+        renameat_with(
             &stage.directory,
             "content",
             &stage.target.parent,
             &stage.target.name,
+            if expected.is_none() {
+                RenameFlags::NOREPLACE
+            } else {
+                RenameFlags::empty()
+            },
         )?;
         rustix::fs::fsync(&stage.target.parent)?;
         Ok(())

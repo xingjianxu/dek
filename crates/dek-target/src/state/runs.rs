@@ -51,6 +51,8 @@ pub struct RunAction {
     pub attempt: u32,
     pub result: ActionResult,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_notification_effect: Option<ServiceEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_diagnostic: Option<String>,
 }
 
@@ -164,6 +166,7 @@ impl StateGuard<'_> {
                     action,
                     attempt: 0,
                     result: ActionResult::Pending,
+                    selected_notification_effect: None,
                     recovery_diagnostic: None,
                 })
                 .collect(),
@@ -283,6 +286,11 @@ impl StateGuard<'_> {
     ) -> Result<ActionAttempt, StateError> {
         let runs = self.runs_directory()?;
         let mut run = bound_run(&runs, run_id, binding)?;
+        let selected_effect = run
+            .pending_notifications
+            .iter()
+            .find(|notice| notice.action_id == action_id)
+            .map(|notice| notice.effect);
         let action = action_mut(&runs, &mut run, action_id)?;
         match action.result {
             ActionResult::Unverified => {
@@ -301,6 +309,10 @@ impl StateGuard<'_> {
             StateError::invalid(&runs.path, format!("动作 {action_id} 尝试次数已达上限"))
         })?;
         action.result = ActionResult::Unverified;
+        if matches!(&action.action.kind, ActionKind::NotifyService { sources, .. } if !sources.is_empty())
+        {
+            action.selected_notification_effect = selected_effect;
+        }
         action.recovery_diagnostic = None;
         let attempt = action.attempt;
         replace_run(&runs, &run)?;
@@ -387,24 +399,27 @@ impl StateGuard<'_> {
         replace_run(&runs, &run)
     }
 
-    /// Pre-register the notification before applying a file that may trigger it.
+    /// Pre-register a legacy notification or the effect of a known source.
     pub fn queue_notification(
         &self,
         run_id: &str,
         binding: PlanBinding<'_>,
         action_id: &str,
     ) -> Result<(), StateError> {
+        self.queue_notification_effect(run_id, binding, action_id, None)
+    }
+
+    pub(crate) fn queue_notification_effect(
+        &self,
+        run_id: &str,
+        binding: PlanBinding<'_>,
+        action_id: &str,
+        source_effect: Option<ServiceEffect>,
+    ) -> Result<(), StateError> {
         let runs = self.runs_directory()?;
         let mut run = bound_run(&runs, run_id, binding)?;
-        if run
-            .pending_notifications
-            .iter()
-            .any(|notice| notice.action_id == action_id)
-        {
-            return runs.sync();
-        }
         let action = action_mut(&runs, &mut run, action_id)?;
-        let ActionKind::NotifyService { unit, effect } = &action.action.kind else {
+        let ActionKind::NotifyService { unit, effect, .. } = &action.action.kind else {
             return Err(StateError::invalid(
                 &runs.path,
                 format!("动作 {action_id} 不是服务通知"),
@@ -416,10 +431,21 @@ impl StateGuard<'_> {
         let notice = RunNotification {
             action_id: action_id.into(),
             unit: unit.clone(),
-            effect: *effect,
+            effect: source_effect.unwrap_or(*effect),
             depends_on: action.action.depends_on.clone(),
         };
-        run.pending_notifications.push(notice);
+        if let Some(pending) = run
+            .pending_notifications
+            .iter_mut()
+            .find(|item| item.action_id == action_id)
+        {
+            if notice.effect != ServiceEffect::Restart || pending.effect == ServiceEffect::Restart {
+                return runs.sync();
+            }
+            pending.effect = ServiceEffect::Restart;
+        } else {
+            run.pending_notifications.push(notice);
+        }
         replace_run(&runs, &run)
     }
 

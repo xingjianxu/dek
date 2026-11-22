@@ -80,7 +80,7 @@ pub(crate) fn description(action: &ActionKind) -> String {
             };
             format!("{verb} {}", unit_name(unit))
         }
-        ActionKind::NotifyService { unit, effect } => {
+        ActionKind::NotifyService { unit, effect, .. } => {
             let verb = match effect {
                 ServiceEffect::Reload => "重载服务",
                 ServiceEffect::Restart => "重启服务",

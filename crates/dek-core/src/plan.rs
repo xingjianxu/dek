@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgeSecretResource, AuthorizedKeysResource, ContentDigest, DirectoryResource, FileAttributes,
-    FileContent, GroupResource, InputObservation, Observation, PackageId, ResourceId, ResourceKind,
-    ResourceOrigin, ServiceEffect, UnitDefinition, UnitId, UnitScope, UserResource,
+    FileContent, GroupResource, InputObservation, NotifyWhen, Observation, PackageId, ResourceId,
+    ResourceKind, ResourceOrigin, ServiceEffect, UnitDefinition, UnitId, UnitScope, UserResource,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -166,6 +166,8 @@ pub enum ActionKind {
     NotifyService {
         unit: UnitId,
         effect: ServiceEffect,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<NotificationSource>,
     },
     UpdateAuthorizedKeys {
         keys: AuthorizedKeysResource,
@@ -174,6 +176,15 @@ pub enum ActionKind {
     },
     DeployAgeSecret(AgeSecretResource),
     SetAgeSecretAttributes(AgeSecretResource),
+}
+
+/// A source that can request a specific effect once its actual change is known.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationSource {
+    pub action: String,
+    pub effect: ServiceEffect,
+    pub when: NotifyWhen,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -254,10 +265,22 @@ pub enum AgeSecretObservation {
     Missing,
     Present {
         verification: AgeSecretVerification,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<AgeSecretRevision>,
         uid: Option<u32>,
         gid: Option<u32>,
         mode: u32,
     },
+}
+
+/// Filesystem identity and change time for reviewed target bytes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgeSecretRevision {
+    pub device: u64,
+    pub inode: u64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
