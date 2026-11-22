@@ -1,15 +1,15 @@
 use std::collections::BTreeMap;
 
-use dek_core::{Action, Precondition, ServiceEffect, ServiceNotification, UnitId};
+use dek_core::{Action, Precondition, ServiceEffect, ServiceNotification, UnitId, UnitScope};
 use dek_target::backend::{ActionReadiness, BackendError, NotificationError, PlannedNotification};
 
-use super::{ctl, ctl_error, ctl_output, is_running, validate_unit};
+use super::{ctl, ctl_error, is_running, system_ctl_output, validate_unit};
 
 pub(super) fn validate(unit: &UnitId) -> Result<(), BackendError> {
     validate_unit(unit)?;
-    if !unit.name.ends_with(".service") {
+    if unit.scope != UnitScope::System || !unit.name.ends_with(".service") {
         return Err(BackendError(format!(
-            "服务通知需要完整的 .service 名称 {:?}",
+            "服务通知需要系统级 .service 单元 {:?}",
             unit.name
         )));
     }
@@ -20,7 +20,7 @@ pub(super) fn plan(
     notice: &ServiceNotification,
     service_will_start: bool,
 ) -> Result<Option<PlannedNotification>, BackendError> {
-    if !service_will_start && !is_running(&notice.unit)? {
+    if !service_will_start && is_running(&notice.unit)? != Some(true) {
         return Ok(None);
     }
     let reason = match notice.effect {
@@ -38,12 +38,16 @@ pub(super) fn inspect(
     unit: &UnitId,
     effect: ServiceEffect,
 ) -> Result<ActionReadiness, BackendError> {
-    let output = ctl(&[
-        "show",
-        "--property=LoadState,ActiveState,CanReload,NeedDaemonReload",
-        "--",
-        &unit.name,
-    ])?;
+    let output = ctl(
+        &UnitScope::System,
+        false,
+        &[
+            "show",
+            "--property=LoadState,ActiveState,CanReload,NeedDaemonReload",
+            "--",
+            &unit.name,
+        ],
+    )?;
     let fields: BTreeMap<_, _> = output
         .lines()
         .filter_map(|line| line.split_once('='))
@@ -72,7 +76,7 @@ pub(super) fn execute(unit: &UnitId, effect: ServiceEffect) -> Result<(), Notifi
         ServiceEffect::Reload => "reload",
         ServiceEffect::Restart => "restart",
     };
-    let output = ctl_output(&[
+    let output = system_ctl_output(&[
         "--no-ask-password",
         "--job-mode=fail",
         command,

@@ -281,7 +281,7 @@ Linux 管理机默认将缓存存放在 `$XDG_CACHE_HOME/dek/<repo-id>/units/<pr
 
 用户级 unit 安装在对应账户的 systemd 配置目录（通常为 `~/.config/systemd/user/`），文件写入与启用链接操作均使用该用户权限。针对该用户已运行的 manager 合并本批 `daemon-reload`，随后执行声明的启停动作。首次部署一对 `backup.service`（oneshot）与 `backup.timer` 时，两个 unit 文件都会落盘，但只需启用并启动 timer；service 由 timer 触发，执行完毕回到 `inactive` 属于正常状态。
 
-计划输出分别展示“文件已部署”“已为该用户启用”与“当前运行状态”。当目标用户的 manager 尚未运行时，可离线完成的部署与启用动作照常规划，立即启动动作则标明需要活跃的用户 manager，并在执行结果中区分“已完成”与“待激活”。通过 SSH 部署时，不会误把当前 SSH 登录用户、root 的用户 manager 或系统级 manager 当作目标用户的 manager。至于用户 manager 开机自启及登出后保活涉及的账户级 `linger` 策略，待后续确认（见第 11 节）。
+计划和状态输出分别展示文件部署、自启和即时运行。目标用户 manager 离线时，仍完成文件部署和自启链接，需在线的动作记录为“待激活”。管理员通过 `loginctl` 管理账户级 `linger`。用户重新登录或管理员启用 linger 后，重新应用即可核验并完成仍需执行的启动。目标 manager 按目标账户 UID 定位，同名的系统级和其他账户单元各自独立。
 
 **验收要点：** 在目标机上为 Alice 部署一组 service 和 timer。即使以管理员账户登录执行，也只能修改 Alice 声明的 unit，Bob 以及系统级的同名 unit 保持不变。分别验证 Alice 的用户 manager 在线与未运行两种场景，确认输出能清晰区分“已启用、待激活”与“当前已启动”。定时任务触发并正常退出后，再次执行 `plan` 不会因为 oneshot 服务处于 inactive 而误触发启动动作。
 
@@ -586,7 +586,6 @@ cargo test --locked --workspace
 
 | 事项 | 所在章节 | 当前状态与待定问题 |
 |---|---|---|
-| 用户级 `linger` 策略 | 6.1 节 | 是否在 dek 中显式提供 `linger` 开关以支持用户级 systemd manager 开机自启及登出保活，还是交由管理员手动通过 `loginctl` 管理。 |
 | 集成测试网络策略 | 10.8 节 | Arch 虚拟机集成测试中，官方仓库包下载与 AUR 源码拉取采用离线本地镜像、代理缓存还是按用例允许联网。 |
 
 ## 12. 术语表

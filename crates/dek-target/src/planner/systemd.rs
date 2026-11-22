@@ -1,51 +1,77 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use dek_core::{Action, ActionKind, TargetIdentity, UnitScope};
+use dek_core::{
+    Action, ActionKind, Precondition, ResourceId, ResourceOrigin, TargetIdentity, UnitScope,
+};
 
 use super::{PlanError, action_id};
+
+#[derive(Default)]
+struct ManagerChanges {
+    definitions: Vec<String>,
+    origins: Vec<ResourceOrigin>,
+    account: Vec<Precondition>,
+}
 
 pub(super) fn coalesce_reload(
     mut actions: Vec<Action>,
     target: &TargetIdentity,
 ) -> Result<Vec<Action>, PlanError> {
-    let mut definitions = Vec::new();
-    let mut origins = Vec::new();
+    let mut managers = BTreeMap::<UnitScope, ManagerChanges>::new();
     for action in &actions {
         if let ActionKind::DeployUnit { unit, .. } = &action.kind
-            && unit.scope == UnitScope::System
+            && unit.scope != UnitScope::UserGlobal
         {
-            definitions.push(action.id.clone());
+            let manager = managers.entry(unit.scope.clone()).or_default();
+            manager.definitions.push(action.id.clone());
             for origin in &action.origins {
-                if !origins.contains(origin) {
-                    origins.push(origin.clone());
+                if !manager.origins.contains(origin) {
+                    manager.origins.push(origin.clone());
+                }
+            }
+            for condition in &action.preconditions {
+                if matches!(
+                    condition,
+                    Precondition::ResourceState {
+                        resource: ResourceId::User(_),
+                        ..
+                    }
+                ) && !manager.account.contains(condition)
+                {
+                    manager.account.push(condition.clone());
                 }
             }
         }
     }
-    if definitions.is_empty() {
+    if managers.is_empty() {
         return Ok(actions);
     }
 
-    let id = action_id(actions.len());
-    for action in &mut actions {
-        if matches!(
-            &action.kind,
-            ActionKind::SetUnitEnabled { unit, .. }
-                | ActionKind::SetUnitRunning { unit, .. }
-                | ActionKind::NotifyService { unit, .. }
-                if unit.scope == UnitScope::System
-        ) {
-            action.depends_on.push(id.clone());
+    for (scope, manager) in managers {
+        let id = action_id(actions.len());
+        for action in &mut actions {
+            let after_reload = match &action.kind {
+                ActionKind::SetUnitRunning { unit, .. }
+                | ActionKind::NotifyService { unit, .. } => unit.scope == scope,
+                ActionKind::SetUnitEnabled { unit, .. } => {
+                    // User enablement is an on-disk action and remains available offline.
+                    scope == UnitScope::System && unit.scope == scope
+                }
+                _ => false,
+            };
+            if after_reload {
+                action.depends_on.push(id.clone());
+            }
         }
+        actions.push(Action {
+            id,
+            kind: ActionKind::ReloadManager(scope),
+            reason: "此 manager 的单元定义发生变化".into(),
+            origins: manager.origins,
+            depends_on: manager.definitions,
+            preconditions: manager.account,
+        });
     }
-    actions.push(Action {
-        id,
-        kind: ActionKind::ReloadManager(UnitScope::System),
-        reason: "本批系统级单元定义发生变化".into(),
-        origins,
-        depends_on: definitions,
-        preconditions: Vec::new(),
-    });
     order(actions, target)
 }
 
