@@ -5,6 +5,7 @@ mod origin;
 mod plan;
 pub mod protocol;
 mod resource;
+pub mod target_protocol;
 
 pub use config::{
     EffectiveOption, HostConfig, InputKind, InputObservation, InvalidOptionPath, Observation,

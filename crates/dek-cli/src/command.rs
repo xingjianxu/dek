@@ -1,12 +1,20 @@
-use std::{error::Error, ffi::OsString, io::Write, path::PathBuf};
+use std::{
+    error::Error,
+    ffi::OsString,
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use crate::{
     evaluation::normal_cache, local_target::LocalEvaluationTarget, plan_output::write_plan,
     planning::plan_host_with_cache,
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use dek_controller::repo::{EntryLanguage, HostSelector, Repository, Target, initialize};
-use dek_core::OptionPath;
+use dek_controller::{
+    repo::{EntryLanguage, HostSelector, Repository, Target, initialize},
+    transport::SshSession,
+};
+use dek_core::{OptionPath, TargetCapabilities};
 use serde_json::json;
 
 use crate::{
@@ -59,6 +67,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// 核对目标身份并显示协议版本与资源能力。
+    TargetInfo {
+        /// 输出 JSON。
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(name = "__target-stdio", hide = true)]
+    TargetStdio,
     /// 观测本机目标并预览配置差异。
     Plan {
         /// 使用指定的私有目标状态目录。默认 /var/lib/dek。
@@ -130,6 +146,28 @@ pub fn run<'target>(
             } else {
                 refresh::refresh(&mut out, &repo, selector, &mut show::UnavailableTarget)?;
             }
+        }
+        Command::TargetInfo { json } => {
+            let repo = discover_repo(cli.repo.as_deref())?;
+            let selection = HostSelection::from_arg(cli.host)?;
+            let (name, entry) = repo.select_host(selection.selector())?;
+            let capabilities = match &entry.target {
+                Target::Local => local_target()?.capabilities(),
+                Target::Ssh(alias) => {
+                    let expected = entry.target_id.as_deref().unwrap_or(name);
+                    let session = SshSession::connect(alias, expected)?;
+                    let capabilities = session.capabilities().clone();
+                    session.finish()?;
+                    capabilities
+                }
+            };
+            write_target_info(&mut out, &capabilities, json)?;
+        }
+        Command::TargetStdio => {
+            if cli.repo.is_some() || cli.host.is_some() {
+                return Err("目标端入口无需 --repo 或 --host".into());
+            }
+            dek_target::transport::serve(&local_target()?, &mut io::stdin().lock(), &mut out)?;
         }
         Command::Plan {
             json,
@@ -203,6 +241,39 @@ fn list_hosts(
                 Target::Ssh(alias) => writeln!(out, "{name}\t{path}\tssh {alias}")?,
             }
         }
+    }
+    Ok(())
+}
+
+fn write_target_info(
+    mut out: impl Write,
+    capabilities: &TargetCapabilities,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if json {
+        serde_json::to_writer_pretty(&mut out, capabilities)?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    let target = &capabilities.target;
+    writeln!(
+        out,
+        "目标 {}（{} {} {}）",
+        target.id,
+        target.os,
+        target.distribution.as_deref().unwrap_or("未知发行版"),
+        target.architecture,
+    )?;
+    writeln!(out, "协议版本 {}", capabilities.protocol_version)?;
+    for capability in &capabilities.resources {
+        let attributes = capability.attributes.iter().cloned().collect::<Vec<_>>();
+        writeln!(
+            out,
+            "{:?} v{} {}",
+            capability.kind,
+            capability.version,
+            attributes.join(", "),
+        )?;
     }
     Ok(())
 }

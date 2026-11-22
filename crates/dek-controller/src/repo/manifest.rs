@@ -38,6 +38,8 @@ pub struct HostEntry {
     pub entry: PathBuf,
     pub target: Target,
     pub inputs: Option<InputPolicy>,
+    #[serde(rename = "targetId")]
+    pub target_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -158,6 +160,14 @@ impl Manifest {
         for (name, host) in &self.hosts {
             validate_name("hosts", name)?;
             validate_path(&format!("hosts[{name:?}].entry"), &host.entry)?;
+            if let Some(id) = &host.target_id {
+                if host.target == Target::Local {
+                    return Err(format!("hosts[{name:?}].targetId 仅适用于 SSH 目标"));
+                }
+                if id.is_empty() || id.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+                    return Err(format!("hosts[{name:?}].targetId 需要非空目标标识"));
+                }
+            }
         }
         for (name, profile) in &self.profiles {
             validate_name("profiles", name)?;

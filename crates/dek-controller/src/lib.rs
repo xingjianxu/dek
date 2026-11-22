@@ -4,5 +4,6 @@ pub mod cache;
 pub mod eval;
 pub mod modules;
 pub mod repo;
+pub mod transport;
 
 mod json_object;
