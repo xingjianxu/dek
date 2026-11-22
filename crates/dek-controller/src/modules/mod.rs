@@ -5,3 +5,20 @@ mod schema;
 
 pub use merge::MergeError;
 pub use schema::{SchemaError, SchemaLocation, SchemaRegistry, ValueMismatch};
+
+mod builtin_apps;
+pub use builtin_apps::{register_app_modules, register_app_schemas};
+
+mod expansion;
+mod resources;
+
+pub use expansion::{
+    ExpandContext, ExpansionError, ModuleDefinition, ModuleExpansion, ModuleRegistry,
+};
+pub use resources::{
+    DeclaredResource, ExpandedResources, FileSource, ModuleOutput, ResourceDraft,
+    assemble_resources,
+};
+
+mod builtin_system;
+pub use builtin_system::{register_system_modules, register_system_schemas};
