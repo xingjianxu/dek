@@ -8,7 +8,7 @@ use std::{
 };
 
 use rustix::{
-    fs::{Mode, OFlags, RenameFlags, fchmod, mkdirat, openat, renameat_with, unlinkat},
+    fs::{Dir, Mode, OFlags, RenameFlags, fchmod, mkdirat, openat, renameat_with, unlinkat},
     process::geteuid,
 };
 
@@ -135,7 +135,32 @@ impl Directory {
         Ok(fd)
     }
 
+    pub(super) fn file_names(&self) -> Result<Vec<String>, StateError> {
+        let error = |err: rustix::io::Errno| StateError::io("列出目录", &self.path, err.into());
+        let mut files = Vec::new();
+        for entry in Dir::read_from(&self.fd).map_err(error)? {
+            let entry = entry.map_err(error)?;
+            if let Ok(name) = entry.file_name().to_str() {
+                files.push(name.into());
+            }
+        }
+        Ok(files)
+    }
+
     pub(super) fn publish(&self, name: &str, data: &[u8]) -> Result<(), StateError> {
+        self.write_atomically(name, data, RenameFlags::NOREPLACE)
+    }
+
+    pub(super) fn replace(&self, name: &str, data: &[u8]) -> Result<(), StateError> {
+        self.write_atomically(name, data, RenameFlags::empty())
+    }
+
+    fn write_atomically(
+        &self,
+        name: &str,
+        data: &[u8],
+        rename_flags: RenameFlags,
+    ) -> Result<(), StateError> {
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
         let path = self.path.join(name);
         let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
@@ -155,14 +180,8 @@ impl Directory {
             .and_then(|()| file.write_all(data))
             .and_then(|()| file.sync_all())
             .and_then(|()| {
-                renameat_with(
-                    &self.fd,
-                    temp.as_str(),
-                    &self.fd,
-                    name,
-                    RenameFlags::NOREPLACE,
-                )
-                .map_err(io::Error::from)
+                renameat_with(&self.fd, temp.as_str(), &self.fd, name, rename_flags)
+                    .map_err(io::Error::from)
             });
         if let Err(err) = result {
             let _ = unlinkat(&self.fd, temp.as_str(), rustix::fs::AtFlags::empty());
