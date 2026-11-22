@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use dek_core::{
-    ActionKind, DesiredResource, Precondition, ResourceCapability, ResourceKind,
-    ServiceNotification, TargetCapabilities, TargetIdentity,
+    Action, ActionKind, ContentDigest, DesiredResource, Precondition, ResourceCapability,
+    ResourceKind, ServiceNotification, TargetCapabilities, TargetIdentity,
 };
 use thiserror::Error;
 
@@ -25,6 +25,34 @@ pub struct PlannedAction {
 pub struct PlannedNotification {
     pub reason: String,
     pub preconditions: Vec<Precondition>,
+}
+
+/// The current disposition of a reviewed action against live target state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionReadiness {
+    Ready,
+    Satisfied,
+    Conflict(String),
+}
+
+/// A reviewed action and the verified content available to its backend.
+pub struct ActionContext<'a> {
+    pub action: &'a Action,
+    contents: &'a BTreeMap<ContentDigest, Vec<u8>>,
+}
+
+impl<'a> ActionContext<'a> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new(action: &'a Action, contents: &'a BTreeMap<ContentDigest, Vec<u8>>) -> Self {
+        Self { action, contents }
+    }
+
+    pub fn content(&self, digest: &ContentDigest) -> Result<&[u8], BackendError> {
+        self.contents
+            .get(digest)
+            .map(Vec::as_slice)
+            .ok_or_else(|| BackendError(format!("缺少已审阅内容 {}", digest.0)))
+    }
 }
 
 /// A resource backend supplies read-only planning operations and execution hooks.
@@ -64,7 +92,22 @@ pub trait Backend {
         ))
     }
 
-    fn execute(&self, action: &ActionKind) -> Result<(), BackendError>;
+    /// Validate execution support without observing or mutating the resource.
+    fn validate_action(&self, _: &Action) -> Result<(), BackendError> {
+        Err(BackendError("后端未提供此动作的执行能力".into()))
+    }
+
+    /// Compare the action goal and reviewed preconditions with live state.
+    /// Return Satisfied only for effects that the backend can actually verify.
+    fn inspect_action(&self, _: &Action) -> Result<ActionReadiness, BackendError> {
+        Err(BackendError("后端未提供此动作的前置条件核对".into()))
+    }
+
+    /// Apply the reviewed action. Backends check the supplied preconditions at
+    /// their mutation boundary and use only the reviewed bytes from context.
+    fn execute(&self, context: &ActionContext<'_>) -> Result<(), BackendError>;
+
+    /// Observe the result after the execution hook succeeds.
     fn verify(&self, action: &ActionKind) -> Result<bool, BackendError>;
 }
 

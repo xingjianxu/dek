@@ -75,6 +75,16 @@ enum Command {
     },
     #[command(name = "__target-stdio", hide = true)]
     TargetStdio,
+    /// 执行当次规划或指定的本机已审阅计划。
+    #[cfg(target_os = "linux")]
+    Apply {
+        /// 已审阅的计划 ID。
+        #[arg(long, value_name = "计划ID")]
+        plan: Option<String>,
+        /// 使用指定的私有目标状态目录。默认 /var/lib/dek。
+        #[arg(long, value_name = "目录")]
+        state_dir: Option<PathBuf>,
+    },
     /// 观测本机目标并预览配置差异。
     Plan {
         /// 使用指定的私有目标状态目录。默认 /var/lib/dek。
@@ -168,6 +178,23 @@ pub fn run<'target>(
                 return Err("目标端入口无需 --repo 或 --host".into());
             }
             dek_target::transport::serve(&local_target()?, &mut io::stdin().lock(), &mut out)?;
+        }
+        #[cfg(target_os = "linux")]
+        Command::Apply { plan, state_dir } => {
+            use dek_target::state::DEFAULT_ROOT;
+
+            let repo = discover_repo(cli.repo.as_deref())?;
+            let selection = HostSelection::from_arg(cli.host)?;
+            let registry = local_target()?;
+            let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
+            crate::applying::apply_local(
+                &mut out,
+                &repo,
+                selection.selector(),
+                &registry,
+                &state_dir,
+                plan.as_deref(),
+            )?;
         }
         Command::Plan {
             json,

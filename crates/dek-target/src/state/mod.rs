@@ -72,6 +72,12 @@ pub struct StateGuard<'a> {
     _single_thread: PhantomData<Cell<()>>,
 }
 
+/// Serializes execution in this target state root while short state transactions
+/// remain independently accessible to status and retention.
+pub(crate) struct ExecutionLease {
+    _lock: File,
+}
+
 #[derive(Clone, Copy)]
 pub struct PlanBinding<'a> {
     pub repository_id: &'a str,
@@ -102,6 +108,12 @@ struct Record<P, R, H> {
 type OwnedRecord = Record<Plan, ResourceSet, String>;
 
 impl StateStore {
+    pub(crate) fn execution_lease(&self) -> Result<ExecutionLease, StateError> {
+        Ok(ExecutionLease {
+            _lock: self.root.lock("execution.lock")?,
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self, StateError> {
         let root = Directory::open_root(path)?;
         let plans = root.private_child("plans")?;

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Run the CLI and file-backend probes as the ordinary user in one isolated guest.
+set -euo pipefail
+umask 077
+
+if [[ $# != 3 ]]; then
+    printf 'Usage: %s IMAGE_ID GUEST_DEK GUEST_APPLY_TEST\n' "$0" >&2
+    exit 2
+fi
+image=$1
+guest_dek=$(realpath -e -- "$2")
+test_binary=$(realpath -e -- "$3")
+cd -- "$(dirname -- "$0")/../.."
+vm=$(pwd -P)/scripts/run-arch-vm
+dev_root=$(realpath -m -- "${DEK_DEV_ROOT:-/data/dek-dev}")
+mkdir -p -- "$dev_root/runs/27"
+evidence=$(mktemp -d "$dev_root/runs/27/acceptance.XXXXXXXX")
+printf 'Evidence: %s\n' "$evidence"
+
+run=$("$vm" start 27 "$image" "$guest_dek")
+printf '%s\n' "$run" > "$evidence/guest"
+cleanup() {
+    if [[ ! -e "$run/result" ]]; then
+        "$vm" finish "$run" failed || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if ! "$vm" ssh "$run" 'command -v ruby' > "$evidence/ruby-path"; then
+    # Reuse wks-lab's installed Ruby without enabling guest network access.
+    ruby=$(realpath -- "$(command -v ruby)")
+    ruby_root=${ruby%/bin/ruby}
+    [[ "$ruby_root" == /nix/store/* && "$ruby_root" != "$ruby" ]]
+    nix-store --query --requisites "$ruby_root" |
+        sed 's,^/,,' |
+        tar -C / -cf - -T - |
+        "$vm" ssh "$run" 'sudo -n tar -xpf - -C /'
+    printf '%s\n' "$ruby" |
+        "$vm" ssh "$run" 'IFS= read -r ruby; sudo -n ln -s -- "$ruby" /usr/local/bin/ruby'
+fi
+"$vm" ssh "$run" 'test "$(id -u)" != 0; id; ruby --version' > "$evidence/environment.log"
+"$vm" ssh "$run" 'install -m 0700 /dev/stdin /home/dek/apply-probe' < "$test_binary"
+local_sha=$(sha256sum < "$test_binary")
+remote_sha=$("$vm" ssh "$run" 'sha256sum /home/dek/apply-probe')
+[[ "${local_sha%% *}" == "${remote_sha%% *}" ]]
+printf '%s\n' "${local_sha%% *}" > "$evidence/probe.sha256"
+"$vm" ssh "$run" '/home/dek/apply-probe --test-threads=1' | tee "$evidence/probe.log"
+"$vm" finish "$run" passed

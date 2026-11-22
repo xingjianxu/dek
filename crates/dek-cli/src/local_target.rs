@@ -195,7 +195,7 @@ impl Backend for LocalFileBackend {
         }])
     }
 
-    fn execute(&self, _: &ActionKind) -> Result<(), BackendError> {
+    fn execute(&self, _: &dek_target::backend::ActionContext<'_>) -> Result<(), BackendError> {
         Err(BackendError(
             "local file planner supports read-only observations".into(),
         ))
