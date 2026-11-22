@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+if [[ $# != 3 ]]; then
+    printf 'Usage: %s IMAGE_ID MANAGER_DEK GUEST_DEK\n' "$0" >&2
+    exit 2
+fi
+image=$1
+manager=$(realpath -e -- "$2")
+guest=$(realpath -e -- "$3")
+cd -- "$(dirname -- "$0")/../.."
+worktree=$(pwd -P)
+vm=$worktree/scripts/run-arch-vm
+dev_root=$(realpath -m -- "${DEK_DEV_ROOT:-/data/dek-dev}")
+mkdir -p -- "$dev_root/runs/40"
+evidence=$(mktemp -d "$dev_root/runs/40/acceptance.XXXXXXXX")
+printf 'Evidence: %s\n' "$evidence"
+
+a=
+b=
+cleanup() {
+    local run
+    for run in "$a" "$b"; do
+        if [[ -n "$run" && ! -e "$run/result" ]]; then
+            "$vm" finish "$run" failed || true
+        fi
+    done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+a=$("$vm" start 40 "$image" "$guest")
+printf '%s\n' "$a" > "$evidence/guest-a"
+b=$("$vm" start 40 "$image" "$guest")
+printf '%s\n' "$b" > "$evidence/guest-b"
+a_id=$(<"$a/instance")
+b_id=$(<"$b/instance")
+[[ "$a_id" != "$b_id" ]]
+
+# Keep the user's OpenSSH files untouched. These stanzas trust only the host
+# public keys that were provisioned by run-arch-vm.
+a_conf=$("$vm" config "$a")
+b_conf=$("$vm" config "$b")
+{
+    sed 's/^Host dek-vm$/Host dek-a/' "$a_conf"
+    sed 's/^Host dek-vm$/Host dek-b/' "$b_conf"
+} > "$evidence/ssh-good"
+sed 's/^Host dek-vm$/Host dek-a/' "$b_conf" > "$evidence/ssh-wrong-target"
+a_port=$(jq -er .sshPort "$a/run.json")
+printf '[127.0.0.1]:%s %s\n' "$a_port" "$(<"$b/host.pub")" > "$evidence/bad-known-hosts"
+
+"$vm" ssh "$a" 'sh -s' > "$evidence/local-a.json" <<'SH'
+set -eu
+repo=$(mktemp -d)
+trap 'rm -r -- "$repo"' EXIT
+printf '%s\n' '{"schemaVersion":1,"hosts":{"local":{"entry":"unused.json","target":{"local":true}}}}' > "$repo/dek.json"
+dek --repo "$repo" -H local target-info --json
+SH
+
+mkdir -- "$evidence/bin" "$evidence/repo" "$evidence/tmp"
+export DEK_TEST_REAL_SSH
+DEK_TEST_REAL_SSH=$(command -v ssh)
+export DEK_TEST_SSH_ARGV="$evidence/ssh-argv"
+export DEK_TEST_ARCH_TARGET_ID="$a_id"
+export DEK_TEST_SSH_CONFIG="$evidence/ssh-good"
+cat > "$evidence/bin/ssh" <<'SH'
+#!/bin/sh
+printf '%s\0' "$@" >> "$DEK_TEST_SSH_ARGV"
+exec "$DEK_TEST_REAL_SSH" -F "$DEK_TEST_SSH_CONFIG" "$@"
+SH
+chmod 0700 -- "$evidence/bin/ssh"
+ssh_test_path="$evidence/bin:$PATH"
+
+jq -n --arg a "$a_id" --arg b "$b_id" '{
+    schemaVersion: 1,
+    hosts: {
+        ($a): {entry: "unused.json", target: {ssh: "dek-a"}},
+        other: {entry: "unused.json", target: {ssh: "dek-b"}, targetId: $b}
+    }
+}' > "$evidence/repo/dek.json"
+target_info() {
+    PATH="$ssh_test_path" "$manager" --repo "$evidence/repo" -H "$1" target-info --json
+}
+target_info "$a_id" > "$evidence/ssh-a.json"
+target_info other > "$evidence/ssh-b.json"
+cmp "$evidence/local-a.json" "$evidence/ssh-a.json"
+jq -e --arg id "$b_id" '.target.id == $id and .protocolVersion == 1' \
+    "$evidence/ssh-b.json" >/dev/null
+
+export CARGO_HOME="$dev_root/cache/cargo"
+export CARGO_TARGET_DIR="$dev_root/cargo/target/${worktree##*/}"
+export TMPDIR="$evidence/tmp"
+PATH="$ssh_test_path" cargo test --locked -p dek-cli --test target_transport quoted_path_round_trips_over_real_ssh \
+    -- --ignored --exact > "$evidence/quoted-path.log" 2>&1
+
+reject() {
+    local label=$1 config=$2 host=$3
+    if DEK_TEST_SSH_CONFIG="$config" target_info "$host" \
+        > "$evidence/$label.stdout" 2> "$evidence/$label.stderr"; then
+        printf 'Expected rejection: %s\n' "$label" >&2
+        exit 1
+    fi
+    [[ ! -s "$evidence/$label.stdout" ]]
+}
+reject wrong-target "$evidence/ssh-wrong-target" "$a_id"
+grep -Fq '目标标识不匹配' "$evidence/wrong-target.stderr"
+grep -Fq "$a_id" "$evidence/wrong-target.stderr"
+grep -Fq "$b_id" "$evidence/wrong-target.stderr"
+
+cp -- "$a/known_hosts" "$evidence/good-known-hosts"
+cp -- "$evidence/bad-known-hosts" "$a/known_hosts"
+reject bad-host-key "$evidence/ssh-good" "$a_id"
+cp -- "$evidence/good-known-hosts" "$a/known_hosts"
+grep -Fiq 'host key verification failed' "$evidence/bad-host-key.stderr"
+grep -Fq 'OpenSSH 连接失败' "$evidence/bad-host-key.stderr"
+
+# A test-only peer on B speaks the stable version-negotiation frame.
+"$vm" ssh "$b" 'sudo mv /usr/local/bin/dek /usr/local/bin/dek.real; sudo install -m 0755 /dev/stdin /usr/local/bin/dek' <<'SH'
+#!/bin/sh
+IFS= read -r hello
+printf '%s\n' "$hello" > "$HOME/handshake-frames"
+printf '%s\n' '{"incompatible":{"versions":[99]}}'
+if IFS= read -r unexpected; then
+    printf '%s\n' "$unexpected" >> "$HOME/handshake-frames"
+fi
+SH
+reject incompatible "$evidence/ssh-good" other
+grep -Fq '目标协议版本不兼容' "$evidence/incompatible.stderr"
+grep -Fq '[99]' "$evidence/incompatible.stderr"
+"$vm" ssh "$b" 'cat "$HOME/handshake-frames"; sudo mv /usr/local/bin/dek.real /usr/local/bin/dek' \
+    > "$evidence/incompatible.frames"
+jq -es '. == [{"hello":{"versions":[1]}}]' "$evidence/incompatible.frames" >/dev/null
+
+python3 - "$evidence/ssh-argv" <<'PY'
+import pathlib
+import sys
+
+arguments = pathlib.Path(sys.argv[1]).read_bytes().split(b"\0")
+assert arguments.pop() == b""
+prefix = [b"-T", b"-S", b"none", b"-o", b"BatchMode=yes", b"-o",
+          b"StrictHostKeyChecking=yes", b"--"]
+assert len(arguments) == 6 * 10
+for offset in range(0, len(arguments), 10):
+    args = arguments[offset:offset + 10]
+    assert args[:8] == prefix, args
+    assert args[8] in (b"dek-a", b"dek-b"), args
+    assert args[9] == b"dek __target-stdio", args
+PY
+
+"$vm" finish "$a" passed
+"$vm" finish "$b" passed
+printf 'Trusted aliases, identity binding, host key rejection, compatibility and quoted paths passed.\n'
