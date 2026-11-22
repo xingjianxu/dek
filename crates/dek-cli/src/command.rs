@@ -114,6 +114,13 @@ enum Command {
         #[arg(long, value_name = "目录")]
         state_dir: Option<PathBuf>,
     },
+    /// 预览完整升级并在交互确认后执行。
+    #[cfg(target_os = "linux")]
+    Upgrade {
+        /// 本机模式使用指定的私有状态目录。默认 /var/lib/dek。
+        #[arg(long, value_name = "目录")]
+        state_dir: Option<PathBuf>,
+    },
     /// 查看最近或指定的执行记录。
     #[cfg(target_os = "linux")]
     Status {
@@ -188,6 +195,9 @@ fn run_command<'target>(
             | Command::Apply {
                 state_dir: Some(root),
                 ..
+            }
+            | Command::Upgrade {
+                state_dir: Some(root),
             }
             | Command::TargetStdio {
                 state_dir: Some(root),
@@ -403,6 +413,49 @@ fn run_command<'target>(
             crate::applying::apply_local(
                 &mut out, &repo, selector, &registry, &state_dir, selection,
             )?;
+        }
+        #[cfg(target_os = "linux")]
+        Command::Upgrade { state_dir } => {
+            use dek_target::state::DEFAULT_ROOT;
+            use std::io::IsTerminal;
+
+            let repo = discover_repo(cli.repo.as_deref())?;
+            let selection = HostSelection::from_arg(cli.host)?;
+            let interactive =
+                _production && io::stdin().is_terminal() && io::stdout().is_terminal();
+            let (name, entry) = repo.select_host(selection.selector())?;
+            match &entry.target {
+                Target::Local => {
+                    let registry = local_target()?;
+                    let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
+                    crate::upgrading::upgrade_local(
+                        &mut out,
+                        &repo,
+                        name,
+                        &registry,
+                        &state_dir,
+                        interactive,
+                    )?;
+                }
+                Target::Ssh(alias) => {
+                    if state_dir.is_some() {
+                        return Err(
+                            "远程 upgrade 的状态目录由目标端配置，请省略 --state-dir".into()
+                        );
+                    }
+                    let expected = entry.target_id.as_deref().unwrap_or(name);
+                    let mut session = SshSession::connect(alias, expected)?;
+                    let review = plan_remote_host(
+                        &repo,
+                        selection.selector(),
+                        &mut session,
+                        normal_cache(&repo)?.as_ref(),
+                        PlanMode::Upgrade,
+                    )?;
+                    session.finish()?;
+                    crate::upgrading::confirm(&mut out, name, &review.plan, false)?;
+                }
+            }
         }
         #[cfg(target_os = "linux")]
         Command::Status {

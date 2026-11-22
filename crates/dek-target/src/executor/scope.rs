@@ -37,6 +37,7 @@ pub(super) fn validate_order(plan: &Plan) -> Result<(), ExecutionError> {
         };
         if action.id.is_empty()
             || bad_sources
+            || (matches!(action.kind, ActionKind::RepositoryTransaction(_)) && !previous.is_empty())
             || previous.contains(action.id.as_str())
             || action
                 .depends_on

@@ -515,7 +515,7 @@ fn run_probe() {
                 plan: id,
                 ..Default::default()
             },
-            |_, _, _| Ok(LoadedPlan::Expired),
+            |_, _, _| Ok(LoadedPlan::Expired(dek_core::PlanMode::Normal)),
         )
     } else {
         if probe.mode == "contender" {

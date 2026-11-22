@@ -15,3 +15,5 @@ mod repository;
 mod show;
 #[cfg(target_os = "linux")]
 mod status;
+#[cfg(target_os = "linux")]
+mod upgrading;

@@ -8,7 +8,7 @@ use std::{
 };
 
 use dek_controller::repo::{HostSelector, Repository, Target};
-use dek_core::{ActionResult, Plan, RepositoryTransactionScope, RunAction};
+use dek_core::{ActionResult, Plan, PlanMode, RunAction};
 use dek_target::{
     backend::BackendRegistry,
     executor::{ExecutionOutcome, ExecutionRequest, Executor, LoadedPlan, load_plan_for_execution},
@@ -20,7 +20,7 @@ use crate::{
     evaluation::normal_cache,
     local_target::LocalEvaluationTarget,
     plan_output::write_plan,
-    planning::{plan_host_with_cache, repository_id},
+    planning::{plan_host_with_cache_mode, repository_id},
 };
 
 #[derive(Clone, Copy, Default)]
@@ -71,7 +71,7 @@ pub fn apply_local_with_loader(
         logical_host: name,
         target: registry.target(),
     };
-    let create_plan = || create_plan(repo, selector, registry, &store);
+    let create_plan = || create_plan(repo, selector, registry, &store, PlanMode::Normal);
     let resume = if let Some(id) = selection.run {
         Some(id.to_owned())
     } else if selection.plan.is_none() {
@@ -138,7 +138,13 @@ pub fn apply_local_with_loader(
                 None if resume.is_some() => {
                     return Err(format!("{reason}。请运行 dek plan 重新审阅").into());
                 }
-                None => create_plan()?,
+                None => crate::applying::create_plan(
+                    repo,
+                    selector,
+                    registry,
+                    &store,
+                    reason.replan_mode(),
+                )?,
             };
             writeln!(out, "{reason}。请审阅新计划后使用 dek apply --plan")?;
             write_plan(&mut *out, name, &plan, false)?;
@@ -148,15 +154,23 @@ pub fn apply_local_with_loader(
     }
 }
 
-fn create_plan(
+pub(crate) fn create_plan(
     repo: &Repository,
     selector: HostSelector<'_>,
     registry: &BackendRegistry<'_>,
     store: &StateStore,
+    mode: PlanMode,
 ) -> Result<Plan, Box<dyn Error>> {
     let cache = normal_cache(repo)?;
     let mut provider = LocalEvaluationTarget(registry);
-    let planned = plan_host_with_cache(repo, selector, registry, &mut provider, cache.as_ref())?;
+    let planned = plan_host_with_cache_mode(
+        repo,
+        selector,
+        registry,
+        &mut provider,
+        cache.as_ref(),
+        mode,
+    )?;
     Ok(store.lock()?.save_plan(
         &planned.name,
         &planned.plan,
@@ -192,8 +206,7 @@ pub(crate) fn write_finished(
 }
 
 pub(crate) fn needs_upgrade_review(plan: &Plan) -> bool {
-    plan.repository_transaction()
-        .is_some_and(|transaction| transaction.scope == RepositoryTransactionScope::Upgrade)
+    plan.mode() == PlanMode::Upgrade
 }
 
 pub(crate) fn write_upgrade_review(
