@@ -31,6 +31,16 @@ const EVALUATOR: &str = concat!(
 
 pub trait TargetProvider {
     fn query(&mut self, query: &TargetQuery) -> Result<TargetAnswer, String>;
+
+    /// Label an existing snapshot when this provider answers target input queries from one.
+    fn snapshot_source(&self) -> Option<&TargetSnapshotSource> {
+        None
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TargetSnapshotSource {
+    pub label: String,
 }
 
 /// Supplies an explicit HTTP input. `None` means no response is available.
