@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use dek_core::{Action, Plan};
+use dek_core::{Action, ActionKind, Plan, Precondition, ResourceId, UnitScope};
 
 use super::ExecutionError;
+use crate::state::{ActionResult, RunRecord};
 
 /// The reviewed program is ordered. Validate it before resolving live changes.
 pub(super) fn validate_order(plan: &Plan) -> Result<(), ExecutionError> {
@@ -35,7 +36,11 @@ pub(super) enum Scope<'a> {
 
 /// Compare operations and their dependencies, whose plan-local ordinal IDs can
 /// shift after an already-satisfied action disappears.
-pub(super) fn match_scope<'a>(reviewed: &'a Plan, fresh: &Plan) -> Scope<'a> {
+pub(super) fn match_scope<'a>(
+    reviewed: &'a Plan,
+    fresh: &Plan,
+    run: Option<&RunRecord>,
+) -> Scope<'a> {
     let approved_by_id: BTreeMap<_, _> = reviewed
         .actions
         .iter()
@@ -60,13 +65,52 @@ pub(super) fn match_scope<'a>(reviewed: &'a Plan, fresh: &Plan) -> Scope<'a> {
         }) {
             return Scope::Expanded;
         }
-        if planned.preconditions != approved.preconditions && conflict.is_none() {
+        if planned.preconditions != approved.preconditions
+            && conflict.is_none()
+            && !run.is_some_and(|run| {
+                observed_after_user_creation(approved, planned, run, &approved_by_id)
+            })
+        {
             conflict = Some(approved);
         }
         live.insert(approved.id.as_str());
         mapped.insert(planned.id.as_str(), approved.id.as_str());
     }
     Scope::Reviewed { live, conflict }
+}
+
+fn observed_after_user_creation(
+    reviewed: &Action,
+    fresh: &Action,
+    run: &RunRecord,
+    graph: &BTreeMap<&str, &Action>,
+) -> bool {
+    let scope = match &reviewed.kind {
+        ActionKind::DeployUnit { unit, .. }
+        | ActionKind::SetUnitEnabled { unit, .. }
+        | ActionKind::SetUnitRunning { unit, .. } => &unit.scope,
+        ActionKind::ReloadManager(scope) => scope,
+        _ => return false,
+    };
+    let UnitScope::User { user } = scope else {
+        return false;
+    };
+    let account = |condition: &Precondition| {
+        matches!(condition,
+        Precondition::ResourceState { resource: ResourceId::User(name), .. } if name == user)
+    };
+    !reviewed.preconditions.iter().any(account)
+        && fresh.preconditions.iter().any(account)
+        && fresh
+            .preconditions
+            .iter()
+            .filter(|condition| !account(condition))
+            .eq(&reviewed.preconditions)
+        && run.actions.iter().any(|item| {
+            matches!(&item.action.kind, ActionKind::EnsureUser(account) if account.name == *user)
+                && matches!(item.result, ActionResult::Verified { .. })
+                && includes_dependency(reviewed, &item.action.id, graph)
+        })
 }
 
 fn includes_dependency(action: &Action, wanted: &str, actions: &BTreeMap<&str, &Action>) -> bool {
