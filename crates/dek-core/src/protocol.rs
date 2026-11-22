@@ -35,21 +35,26 @@ pub struct EvalRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvalPayload<'a> {
     pub entry: &'a Path,
     pub context: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<&'a Path>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TargetQuery {
+pub struct InputQuery<K> {
     pub protocol_version: u32,
     pub parent_id: String,
     pub id: String,
-    pub kind: TargetQueryKind,
+    pub kind: K,
     pub key: String,
     pub origin: Option<Origin>,
 }
+
+pub type TargetQuery = InputQuery<TargetQueryKind>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
