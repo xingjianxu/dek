@@ -1,6 +1,6 @@
 //! Manage Linux regular-file and directory resources.
 
-mod atomic_file;
+pub(crate) mod atomic_file;
 mod directory;
 mod validation;
 

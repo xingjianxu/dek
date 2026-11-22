@@ -28,13 +28,20 @@ use crate::{
     planning::{plan_host_with_cache, repository_id},
 };
 
+#[derive(Clone, Copy, Default)]
+pub struct ApplySelection<'a> {
+    pub plan: Option<&'a str>,
+    pub run: Option<&'a str>,
+    pub request_id: Option<&'a str>,
+}
+
 pub fn apply_local(
     out: &mut impl Write,
     repo: &Repository,
     selector: HostSelector<'_>,
     registry: &BackendRegistry<'_>,
     state_dir: &Path,
-    reviewed_id: Option<&str>,
+    selection: ApplySelection<'_>,
 ) -> Result<(), Box<dyn Error>> {
     apply_local_with_loader(
         out,
@@ -42,7 +49,7 @@ pub fn apply_local(
         selector,
         registry,
         state_dir,
-        reviewed_id,
+        selection,
         load_plan_for_execution,
     )
 }
@@ -53,7 +60,7 @@ pub fn apply_local_with_loader(
     selector: HostSelector<'_>,
     registry: &BackendRegistry<'_>,
     state_dir: &Path,
-    reviewed_id: Option<&str>,
+    selection: ApplySelection<'_>,
     load: impl FnOnce(&StateGuard<'_>, &str, PlanBinding<'_>) -> Result<LoadedPlan, StateError>,
 ) -> Result<(), Box<dyn Error>> {
     let (name, host) = repo.select_host(selector)?;
@@ -70,31 +77,60 @@ pub fn apply_local_with_loader(
         target: registry.target(),
     };
     let create_plan = || create_plan(repo, selector, registry, &store);
-    let current;
-    let plan_id = match reviewed_id {
-        Some(id) => id,
-        None => {
-            current = create_plan()?;
-            &current.id
-        }
+    let resume = if let Some(id) = selection.run {
+        Some(id.to_owned())
+    } else if selection.plan.is_none() {
+        store
+            .lock()?
+            .latest_run(binding)?
+            .filter(|run| !run.finished)
+            .map(|run| run.id)
+    } else {
+        None
     };
-    let mut nonce = [0; 16];
-    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
-    let request_id = format!("{:032x}", u128::from_ne_bytes(nonce));
+
+    let executor = Executor::new(&store, registry);
     let mut provider = LocalEvaluationTarget(registry);
-    let outcome = Executor::new(&store, registry).apply_with_loader(
-        ExecutionRequest {
-            binding,
-            plan_id,
-            request_id: &request_id,
-        },
-        |input| observe(&mut provider, input),
-        |id| {
-            writeln!(out, "run_id {id}")?;
-            out.flush()
-        },
-        load,
-    )?;
+    let started = |id: &str| {
+        if resume.is_some() {
+            writeln!(out, "恢复已审阅的执行 {id}")?;
+        }
+        writeln!(out, "run_id {id}")?;
+        out.flush()
+    };
+    let outcome = if let Some(id) = &resume {
+        executor.resume(binding, id, |input| observe(&mut provider, input), started)?
+    } else {
+        let current;
+        let plan_id = match selection.plan {
+            Some(id) => id,
+            None => {
+                current = create_plan()?;
+                &current.id
+            }
+        };
+        let generated;
+        let request_id = match selection.request_id {
+            Some(id) if id.trim().is_empty() => return Err("请求标识不能为空".into()),
+            Some(id) => id,
+            None => {
+                let mut nonce = [0; 16];
+                File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+                generated = format!("{:032x}", u128::from_ne_bytes(nonce));
+                &generated
+            }
+        };
+        executor.apply_with_loader(
+            ExecutionRequest {
+                binding,
+                plan_id,
+                request_id,
+            },
+            |input| observe(&mut provider, input),
+            started,
+            load,
+        )?
+    };
 
     match outcome {
         ExecutionOutcome::Finished(run) => {
@@ -112,6 +148,9 @@ pub fn apply_local_with_loader(
         } => {
             let plan = match replacement {
                 Some(plan) => *plan,
+                None if resume.is_some() => {
+                    return Err(format!("{reason}。请运行 dek plan 重新审阅").into());
+                }
                 None => create_plan()?,
             };
             writeln!(out, "{reason}。请审阅新计划后使用 dek apply --plan")?;

@@ -53,6 +53,21 @@ impl TargetPath {
         Ok(Some(Self { parent, name }))
     }
 
+    pub(crate) fn ensure_directory(&self, mode: Mode) -> io::Result<()> {
+        match mkdirat(&self.parent, &self.name, mode) {
+            Ok(()) => rustix::fs::fsync(&self.parent)?,
+            Err(Errno::EXIST) => {}
+            Err(err) => return Err(err.into()),
+        }
+        openat(
+            &self.parent,
+            &self.name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn observe(&self) -> io::Result<Option<Stat>> {
         match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {

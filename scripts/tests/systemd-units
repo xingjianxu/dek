@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -e /run/cloud-init/instance-data.json && "$(id -u)" == 0 ]]
+grep -Fx 'ID=arch' /etc/os-release
+repo=$(mktemp -d)
+printf 'systemd fixture %s\n' "$repo"
+export XDG_CACHE_HOME="$repo/cache"
+state="$repo/state"
+first=dek-test-a.service
+second=dek-test-b.service
+
+cat > "$repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"system":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.units":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$repo/options.json" <<'JSON'
+{"options":[
+  {"path":"lab.units.enable","type":"boolean","description":"Enable test module"},
+  {"path":"lab.units.scenario","type":"string","description":"Fixture scenario"}
+]}
+JSON
+cat > "$repo/expand.rb" <<'RUBY'
+scenario = option("lab.units.scenario")
+a = "dek-test-a.service"
+b = "dek-test-b.service"
+
+def unit(name, label, enabled, running, drop_ins: {})
+  definition = content_object(<<~UNIT)
+    [Unit]
+    Description=#{label}
+    [Service]
+    ExecStart=/usr/bin/sleep infinity
+    [Install]
+    WantedBy=multi-user.target
+  UNIT
+  resource("systemdUnit", unit: {scope: "system", name: name}, enabled: enabled,
+    running: running, definition: {content: definition, dropIns: drop_ins})
+end
+
+case scenario
+when "initial"
+  unit(a, "test A initial", true, true)
+  unit(b, "test B initial", true, true)
+when "update"
+  drop_in = content_object("[Service]\nEnvironment=DEK_FIXTURE=1\n")
+  unit(a, "test A updated", true, true, drop_ins: {"fixture.conf" => drop_in})
+  unit(b, "test B updated", true, true)
+when "disable"
+  resource("systemdUnit", unit: {scope: "system", name: a}, enabled: false)
+when "stop"
+  resource("systemdUnit", unit: {scope: "system", name: b}, running: false)
+when "omit"
+  {resources: [], contents: {}}
+else
+  raise "unknown systemd fixture"
+end
+RUBY
+
+entry() {
+    python3 - "$1" > "$repo/entry.json" <<'PY'
+import json
+import sys
+
+json.dump({"schemaVersion": 1, "imports": [], "options": [
+    {"path": "lab.units.enable", "value": True},
+    {"path": "lab.units.scenario", "value": sys.argv[1]},
+]}, sys.stdout)
+PY
+}
+
+plan() {
+    dek --repo "$repo" -H system plan --state-dir "$state" --json > "$repo/plan.json"
+}
+
+apply() {
+    dek --repo "$repo" -H system apply --state-dir "$state" "$@"
+}
+
+expect_updates() {
+    python3 - "$repo/plan.json" "$1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="UTF-8") as source:
+    plan = json.load(source)
+if sys.argv[2] == "update":
+    kinds = [kind for action in plan["actions"] for kind in action["kind"]]
+    assert kinds == ["deployUnit", "deployUnit", "reloadManager"], kinds
+else:
+    assert not plan["actions"], plan["actions"]
+print(plan["plan_id"])
+PY
+}
+
+entry initial
+apply
+for unit in "$first" "$second"; do
+    systemctl is-enabled --quiet "$unit"
+    systemctl is-active --quiet "$unit"
+done
+
+entry update
+plan
+review=$(expect_updates update)
+reload_count() {
+    local count
+    count=$(systemctl --system show --property=ReloadCount --value)
+    if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        printf 'Could not read the system manager ReloadCount.\n' >&2
+        return 1
+    fi
+    printf '%s\n' "$count"
+}
+trace_before=$(reload_count)
+apply --plan "$review"
+trace_after=$(reload_count)
+printf 'Manager reload count before update %s and after %s.\n' "$trace_before" "$trace_after"
+[[ $((trace_after - trace_before)) == 1 ]]
+grep -Fx 'Description=test A updated' "/etc/systemd/system/$first"
+grep -Fx 'Description=test B updated' "/etc/systemd/system/$second"
+grep -Fx 'Environment=DEK_FIXTURE=1' "/etc/systemd/system/$first.d/fixture.conf"
+plan
+expect_updates none
+apply
+trace_reapplied=$(reload_count)
+[[ "$trace_reapplied" == "$trace_after" ]]
+
+entry disable
+apply
+if systemctl is-enabled --quiet "$first"; then
+    printf 'Expected %s to be disabled.\n' "$first" >&2
+    exit 1
+fi
+systemctl is-active --quiet "$first"
+
+entry stop
+apply
+systemctl is-enabled --quiet "$second"
+if systemctl is-active --quiet "$second"; then
+    printf 'Expected %s to be inactive.\n' "$second" >&2
+    exit 1
+fi
+
+systemctl enable --no-reload "$first"
+systemctl start "$second"
+entry omit
+apply
+for unit in "$first" "$second"; do
+    systemctl is-enabled --quiet "$unit"
+    systemctl is-active --quiet "$unit"
+done
+printf 'System unit deployment, manager reload, enablement, running state and withdrawal passed.\n'
