@@ -59,7 +59,8 @@ impl Plan {
                 }
                 ActionKind::DeployUnit { definition, .. } => definition.add_digests(&mut digests),
                 ActionKind::UpdateAuthorizedKeys(keys) => digests.extend(&keys.key_files),
-                ActionKind::DeployAgeSecret(secret) => {
+                ActionKind::DeployAgeSecret(secret)
+                | ActionKind::SetAgeSecretAttributes(secret) => {
                     digests.insert(&secret.ciphertext);
                 }
                 _ => {}
@@ -164,6 +165,7 @@ pub enum ActionKind {
     },
     UpdateAuthorizedKeys(AuthorizedKeysResource),
     DeployAgeSecret(AgeSecretResource),
+    SetAgeSecretAttributes(AgeSecretResource),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -172,6 +174,10 @@ pub enum Precondition {
     File {
         path: String,
         expected: FileObservation,
+    },
+    AgeSecret {
+        path: String,
+        expected: AgeSecretObservation,
     },
     PackageVersion {
         package: PackageId,
@@ -196,4 +202,26 @@ pub enum Precondition {
 pub enum FileObservation {
     Missing,
     Present(FileContent),
+}
+
+/// A target-side verification result. It deliberately has no plaintext fingerprint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum AgeSecretObservation {
+    Missing,
+    Present {
+        verification: AgeSecretVerification,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgeSecretVerification {
+    Matched,
+    Drifted,
+    Unverified,
+    InputsChanged,
 }

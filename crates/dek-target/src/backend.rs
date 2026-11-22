@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use dek_core::{
-    ActionKind, DesiredResource, Precondition, ResourceCapability, ResourceKind,
+    ActionKind, DesiredResource, Precondition, ResourceCapability, ResourceId, ResourceKind,
     ServiceNotification, TargetCapabilities, TargetIdentity,
 };
 use thiserror::Error;
@@ -37,6 +37,15 @@ pub trait Backend {
     }
 
     fn validate(&self, resource: &DesiredResource) -> Result<(), BackendError>;
+
+    /// Protect paths referenced by this resource from conflicting managed resources.
+    fn validate_managed_paths(
+        &self,
+        _resource: &DesiredResource,
+        _managed: &[ResourceId],
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
 
     /// Observe actual state in the same typed form used for reviewed preconditions.
     fn observe(&self, resource: &DesiredResource) -> Result<Vec<Precondition>, BackendError>;

@@ -21,6 +21,18 @@ pub(super) struct Directory {
 
 impl Directory {
     pub(super) fn open_root(path: &Path) -> Result<Self, StateError> {
+        Self::walk_root(path, true)
+    }
+
+    pub(super) fn existing_root(path: &Path) -> Result<Option<Self>, StateError> {
+        optional(Self::walk_root(path, false))
+    }
+
+    pub(super) fn existing_private_child(&self, name: &str) -> Result<Option<Self>, StateError> {
+        optional(self.open_child(OsStr::new(name), true))
+    }
+
+    fn walk_root(path: &Path, create: bool) -> Result<Self, StateError> {
         if !path.is_absolute() || path == Path::new("/") {
             return Err(StateError::invalid(path, "需要绝对路径及私有状态目录"));
         }
@@ -35,10 +47,10 @@ impl Directory {
                 return Err(StateError::invalid(path, "状态目录路径不得包含父目录组件"));
             };
             let final_component = parts.peek().is_none();
-            current = if final_component {
+            current = if final_component && create {
                 current.private_child(name)?
             } else {
-                current.open_child(name, false)?
+                current.open_child(name, final_component)?
             };
         }
         Ok(current)
@@ -182,6 +194,14 @@ impl Directory {
         self.fd
             .sync_all()
             .map_err(|err| StateError::io("同步目录", &self.path, err))
+    }
+}
+
+fn optional<T>(result: Result<T, StateError>) -> Result<Option<T>, StateError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(StateError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
     }
 }
 

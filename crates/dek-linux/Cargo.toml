@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 dek-core.workspace = true
 dek-target.workspace = true
+hmac = "0.12"
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
+sha2 = "0.10"
+zeroize = "1"
