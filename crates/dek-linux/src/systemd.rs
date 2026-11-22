@@ -1,4 +1,8 @@
-//! System manager unit definitions, enablement, and live state.
+//! System and account-scoped unit definitions, enablement, and live state.
+
+mod user;
+
+mod notification;
 
 use std::{
     collections::BTreeMap,
@@ -9,17 +13,23 @@ use std::{
 
 use dek_core::{
     Action, ActionKind, ContentDigest, DesiredResource, Observation, Precondition,
-    ResourceCapability, ResourceId, ResourceKind, SystemdUnitResource, UnitDefinition, UnitId,
-    UnitScope,
+    ResourceCapability, ResourceId, ResourceKind, ResourceSet, ServiceNotification,
+    SystemdUnitResource, UnitDefinition, UnitId, UnitScope,
 };
-use dek_target::backend::{ActionContext, ActionReadiness, Backend, BackendError, PlannedAction};
+use dek_target::backend::{
+    ActionContext, ActionReadiness, Backend, BackendError, NotificationError, PlannedAction,
+    PlannedNotification,
+};
 use rustix::{
     fs::{Mode, Stat, fstat},
     process::{Gid, Uid},
 };
 use sha2::{Digest, Sha256};
 
-use crate::filesystem::atomic_file::{StagedFile, TargetPath, same_revision};
+use crate::{
+    accounts::UserAccount,
+    filesystem::atomic_file::{StagedFile, TargetPath, same_revision},
+};
 
 pub struct SystemdBackend;
 
@@ -28,10 +38,19 @@ impl Backend for SystemdBackend {
         vec![ResourceCapability {
             kind: ResourceKind::SystemdUnit,
             version: 1,
-            attributes: ["content", "dropIns", "enabled", "running", "activates"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            attributes: [
+                "content",
+                "dropIns",
+                "enabled",
+                "running",
+                "activates",
+                "user",
+                "reload",
+                "restart",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         }]
     }
 
@@ -41,14 +60,44 @@ impl Backend for SystemdBackend {
         validate_definition(&resource.definition)?;
         if let Some(service) = &resource.activates {
             validate_unit(service)?;
+            if service.scope != resource.unit.scope {
+                return Err(BackendError(
+                    "timer 与被触发的服务须属于同一 manager".into(),
+                ));
+            }
         }
         Ok(())
+    }
+
+    fn resource_dependencies(
+        &self,
+        resource: &DesiredResource,
+        managed: &ResourceSet,
+    ) -> Result<Vec<ResourceId>, BackendError> {
+        let UnitScope::User { user: name } = &unit_resource(resource)?.unit.scope else {
+            return Ok(Vec::new());
+        };
+        let id = ResourceId::User(name.clone());
+        if managed.resources.iter().any(|resource| resource.id() == id) {
+            return Ok(vec![id]);
+        }
+        if user::resolve(name)?.is_none() {
+            return Err(BackendError(format!(
+                "用户单元需要已存在或同计划声明的账户 {name:?}"
+            )));
+        }
+        Ok(Vec::new())
     }
 
     fn observe(&self, resource: &DesiredResource) -> Result<Vec<Precondition>, BackendError> {
         let resource = unit_resource(resource)?;
         let unit = &resource.unit;
         let mut conditions = Vec::new();
+        if let UnitScope::User { user: name } = &unit.scope
+            && let Some(account) = user::resolve(name)?
+        {
+            conditions.push(account_condition(name, &account));
+        }
         if declares_definition(&resource.definition) {
             let definition = read_definition(unit, &resource.definition)?;
             conditions.push(Precondition::ResourceState {
@@ -65,7 +114,7 @@ impl Backend for SystemdBackend {
         if resource.running.is_some() {
             conditions.push(Precondition::UnitRunning {
                 unit: unit.clone(),
-                expected: is_running(unit)?,
+                expected: is_running(unit)?.unwrap_or(false),
             });
         }
         Ok(conditions)
@@ -78,6 +127,15 @@ impl Backend for SystemdBackend {
     ) -> Result<Vec<PlannedAction>, BackendError> {
         let resource = unit_resource(resource)?;
         let unit = &resource.unit;
+        let account = observed.iter().find(|condition| {
+            matches!(
+                condition,
+                Precondition::ResourceState {
+                    resource: ResourceId::User(_),
+                    ..
+                }
+            )
+        });
         let mut actions = Vec::new();
         for condition in observed {
             let (kind, reason, content_changed) = match condition {
@@ -93,7 +151,7 @@ impl Backend for SystemdBackend {
                             unit: unit.clone(),
                             definition: resource.definition.clone(),
                         },
-                        "系统级单元定义或 drop-in 需要更新",
+                        "单元定义或 drop-in 需要部署",
                         true,
                     )
                 }
@@ -113,9 +171,9 @@ impl Backend for SystemdBackend {
                             enabled,
                         },
                         if enabled {
-                            "启用系统级单元自启"
+                            "启用单元自启"
                         } else {
-                            "取消系统级单元自启"
+                            "取消单元自启"
                         },
                         false,
                     )
@@ -135,24 +193,45 @@ impl Backend for SystemdBackend {
                             unit: unit.clone(),
                             running,
                         },
-                        if running {
-                            "启动系统级单元"
+                        if running && !manager_online(&unit.scope)? {
+                            "单元待激活，启动需要在线的用户 manager"
+                        } else if running {
+                            "启动单元"
                         } else {
-                            "停止系统级单元"
+                            "停止单元"
                         },
                         false,
                     )
                 }
-                _ => return Err(BackendError("无效的系统级单元观测".into())),
+                Precondition::ResourceState {
+                    resource: ResourceId::User(_),
+                    ..
+                } => continue,
+                _ => return Err(BackendError("无效的单元观测".into())),
             };
             actions.push(PlannedAction {
                 kind,
                 reason: reason.into(),
-                preconditions: vec![condition.clone()],
+                preconditions: std::iter::once(condition).chain(account).cloned().collect(),
                 content_changed,
             });
         }
         Ok(actions)
+    }
+
+    fn validate_notification(
+        &self,
+        notification: &ServiceNotification,
+    ) -> Result<(), BackendError> {
+        notification::validate(&notification.unit)
+    }
+
+    fn plan_notification(
+        &self,
+        notification: &ServiceNotification,
+        service_will_start: bool,
+    ) -> Result<Option<PlannedNotification>, BackendError> {
+        notification::plan(notification, service_will_start)
     }
 
     fn validate_action(&self, action: &Action) -> Result<(), BackendError> {
@@ -164,24 +243,21 @@ impl Backend for SystemdBackend {
             ActionKind::SetUnitEnabled { unit, .. } | ActionKind::SetUnitRunning { unit, .. } => {
                 validate_unit(unit)
             }
-            ActionKind::ReloadManager(UnitScope::System) => Ok(()),
-            _ => Err(BackendError("后端无法执行此系统级单元动作".into())),
+            ActionKind::ReloadManager(scope) => validate_scope(scope),
+            ActionKind::NotifyService { unit, .. } => notification::validate(unit),
+            _ => Err(BackendError("后端无法执行此类单元动作".into())),
         }
     }
 
     fn inspect_action(&self, action: &Action) -> Result<ActionReadiness, BackendError> {
         self.validate_action(action)?;
+        if let Some(UnitScope::User { user }) = action_scope(&action.kind) {
+            reviewed_account(action, user)?;
+        }
         let (origin, actual, satisfied) = match &action.kind {
             ActionKind::DeployUnit { unit, definition } => {
                 let actual = read_definition(unit, definition)?;
-                (
-                    &unit.name,
-                    Precondition::ResourceState {
-                        resource: ResourceId::SystemdUnit(unit.clone()),
-                        expected: definition_digest(&actual),
-                    },
-                    actual == *definition,
-                )
+                return Ok(inspect_definition(action, unit, definition, &actual));
             }
             ActionKind::SetUnitEnabled { unit, enabled } => {
                 let actual = is_enabled(unit)?;
@@ -195,7 +271,7 @@ impl Backend for SystemdBackend {
                 )
             }
             ActionKind::SetUnitRunning { unit, running } => {
-                let actual = is_running(unit)?;
+                let actual = is_running(unit)?.unwrap_or(false);
                 (
                     &unit.name,
                     Precondition::UnitRunning {
@@ -205,14 +281,15 @@ impl Backend for SystemdBackend {
                     actual == *running,
                 )
             }
-            ActionKind::ReloadManager(UnitScope::System) => {
-                return Ok(ActionReadiness::Ready);
+            ActionKind::ReloadManager(_) => return Ok(ActionReadiness::Ready),
+            ActionKind::NotifyService { unit, effect } => {
+                return notification::inspect(action, unit, *effect);
             }
-            _ => return Err(BackendError("未知的系统级单元动作".into())),
+            _ => return Err(BackendError("未知的单元动作".into())),
         };
         if satisfied {
             Ok(ActionReadiness::Satisfied)
-        } else if action.preconditions == [actual] {
+        } else if action.preconditions.first() == Some(&actual) {
             Ok(ActionReadiness::Ready)
         } else {
             Ok(ActionReadiness::Conflict(format!(
@@ -221,7 +298,34 @@ impl Backend for SystemdBackend {
         }
     }
 
+    fn deferred_reason(&self, action: &Action) -> Result<Option<String>, BackendError> {
+        let scope = match &action.kind {
+            ActionKind::ReloadManager(scope) => scope,
+            ActionKind::SetUnitRunning {
+                unit,
+                running: true,
+            } => &unit.scope,
+            _ => return Ok(None),
+        };
+        if let UnitScope::User { user } = scope
+            && !user::online(&reviewed_account(action, user)?)?
+        {
+            return Ok(Some(format!(
+                "账户 {user:?} 的用户 manager 离线，动作待激活"
+            )));
+        }
+        Ok(None)
+    }
+
     fn execute(&self, context: &ActionContext<'_>) -> Result<(), BackendError> {
+        if let Some(reason) = self.deferred_reason(context.action)? {
+            return Err(BackendError(reason));
+        }
+        if matches!(context.action.kind, ActionKind::NotifyService { .. }) {
+            return self
+                .execute_notification(context)
+                .map_err(|error| BackendError(error.to_string()));
+        }
         match self.inspect_action(context.action)? {
             ActionReadiness::Satisfied => return Ok(()),
             ActionReadiness::Conflict(reason) => return Err(BackendError(reason)),
@@ -229,16 +333,52 @@ impl Backend for SystemdBackend {
         }
         match &context.action.kind {
             ActionKind::DeployUnit { unit, definition } => deploy(unit, definition, context),
-            ActionKind::ReloadManager(UnitScope::System) => ctl(&["daemon-reload"]).map(|_| ()),
+            ActionKind::ReloadManager(scope) => {
+                action_ctl(context.action, scope, false, &["daemon-reload"])
+            }
             ActionKind::SetUnitEnabled { unit, enabled } => {
+                if *enabled && let UnitScope::User { user } = &unit.scope {
+                    let account = reviewed_account(context.action, user)?;
+                    ensure_account_home(&account)?;
+                }
                 let action = if *enabled { "enable" } else { "disable" };
-                ctl(&[action, "--no-reload", "--", &unit.name]).map(|_| ())
+                action_ctl(
+                    context.action,
+                    &unit.scope,
+                    true,
+                    &[action, "--no-reload", "--", &unit.name],
+                )
             }
             ActionKind::SetUnitRunning { unit, running } => {
                 let action = if *running { "start" } else { "stop" };
-                ctl(&[action, "--", &unit.name]).map(|_| ())
+                action_ctl(
+                    context.action,
+                    &unit.scope,
+                    false,
+                    &[action, "--", &unit.name],
+                )
             }
-            _ => Err(BackendError("未知的系统级单元动作".into())),
+            _ => Err(BackendError("未知的单元动作".into())),
+        }
+    }
+
+    fn execute_notification(&self, context: &ActionContext<'_>) -> Result<(), NotificationError> {
+        let ActionKind::NotifyService { unit, effect } = &context.action.kind else {
+            return Err(NotificationError::Unverified(BackendError(
+                "动作类型与服务通知不符".into(),
+            )));
+        };
+        match self
+            .inspect_action(context.action)
+            .map_err(NotificationError::Unverified)?
+        {
+            ActionReadiness::Ready => notification::execute(unit, *effect),
+            ActionReadiness::Conflict(reason) => {
+                Err(NotificationError::Unverified(BackendError(reason)))
+            }
+            ActionReadiness::Satisfied => Err(NotificationError::Unverified(BackendError(
+                "尚无服务通知回执".into(),
+            ))),
         }
     }
 
@@ -248,13 +388,16 @@ impl Backend for SystemdBackend {
                 Ok(read_definition(unit, definition)? == *definition)
             }
             ActionKind::SetUnitEnabled { unit, enabled } => Ok(is_enabled(unit)? == *enabled),
-            ActionKind::SetUnitRunning { unit, running } => Ok(is_running(unit)? == *running),
-            ActionKind::ReloadManager(UnitScope::System) => {
+            ActionKind::SetUnitRunning { unit, running } => {
+                Ok(is_running(unit)?.unwrap_or(false) == *running)
+            }
+            ActionKind::ReloadManager(scope) => {
                 // The reload command is synchronous. Confirm the manager can reply afterwards.
-                ctl(&["show", "--property=Version", "--value"])
+                ctl(scope, false, &["show", "--property=Version", "--value"])
                     .map(|version| !version.trim().is_empty())
             }
-            _ => Err(BackendError("未知的系统级单元动作".into())),
+            ActionKind::NotifyService { unit, .. } => Ok(is_running(unit)?.unwrap_or(false)),
+            _ => Err(BackendError("未知的单元动作".into())),
         }
     }
 }
@@ -262,15 +405,35 @@ impl Backend for SystemdBackend {
 fn unit_resource(resource: &DesiredResource) -> Result<&SystemdUnitResource, BackendError> {
     match resource {
         DesiredResource::SystemdUnit(unit) => Ok(unit),
-        _ => Err(BackendError("后端收到非系统级单元资源".into())),
+        _ => Err(BackendError("后端收到非单元资源".into())),
+    }
+}
+
+fn action_scope(kind: &ActionKind) -> Option<&UnitScope> {
+    match kind {
+        ActionKind::DeployUnit { unit, .. }
+        | ActionKind::SetUnitEnabled { unit, .. }
+        | ActionKind::SetUnitRunning { unit, .. } => Some(&unit.scope),
+        ActionKind::ReloadManager(scope) => Some(scope),
+        _ => None,
+    }
+}
+
+fn account_condition(name: &str, account: &UserAccount) -> Precondition {
+    let mut hash = Sha256::new();
+    hash.update(b"systemd-user-account-v1");
+    hash.update(account.uid.to_be_bytes());
+    hash.update(account.gid.to_be_bytes());
+    hash.update(account.home.as_os_str().as_encoded_bytes());
+    Precondition::ResourceState {
+        resource: ResourceId::User(name.into()),
+        expected: Observation::Digest(format!("sha256:{:x}", hash.finalize())),
     }
 }
 
 fn validate_unit(unit: &UnitId) -> Result<(), BackendError> {
     let name = &unit.name;
-    if unit.scope != UnitScope::System {
-        return Err(BackendError("此后端只支持系统级单元".into()));
-    }
+    validate_scope(&unit.scope)?;
     if name.is_empty()
         || name.starts_with('-')
         || !name.contains('.')
@@ -279,9 +442,27 @@ fn validate_unit(unit: &UnitId) -> Result<(), BackendError> {
         })
         || Path::new(name).file_name().is_none()
     {
-        return Err(BackendError(format!("无效的系统级单元名称 {name:?}")));
+        return Err(BackendError(format!("无效的单元名称 {name:?}")));
     }
     Ok(())
+}
+
+fn validate_scope(scope: &UnitScope) -> Result<(), BackendError> {
+    match scope {
+        UnitScope::System => Ok(()),
+        UnitScope::User { user }
+            if !user.is_empty()
+                && !user.starts_with('-')
+                && !matches!(user.as_str(), "." | "..")
+                && user.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                }) =>
+        {
+            Ok(())
+        }
+        UnitScope::User { user } => Err(BackendError(format!("无效的用户名称 {user:?}"))),
+        UnitScope::UserGlobal => Err(BackendError("此后端需要指定用户级单元的账户".into())),
+    }
 }
 
 fn validate_definition(definition: &UnitDefinition) -> Result<(), BackendError> {
@@ -327,7 +508,25 @@ fn read_definition(
 ) -> Result<UnitDefinition, BackendError> {
     validate_unit(unit)?;
     validate_definition(desired)?;
-    let root = Path::new(UNIT_ROOT);
+    match &unit.scope {
+        UnitScope::System => read_definition_at(Path::new(UNIT_ROOT), unit, desired),
+        UnitScope::User { user: name } => {
+            let Some(account) = user::resolve(name)? else {
+                return Ok(UnitDefinition::default());
+            };
+            user::with_permissions(&account, || {
+                read_definition_at(&user::config_dir(&account), unit, desired)
+            })
+        }
+        UnitScope::UserGlobal => unreachable!("validated unit scope"),
+    }
+}
+
+fn read_definition_at(
+    root: &Path,
+    unit: &UnitId,
+    desired: &UnitDefinition,
+) -> Result<UnitDefinition, BackendError> {
     let content = if desired.content.is_some() {
         file_digest(&root.join(&unit.name))?
     } else {
@@ -341,6 +540,25 @@ fn read_definition(
         }
     }
     Ok(UnitDefinition { content, drop_ins })
+}
+
+fn inspect_definition(
+    action: &Action,
+    unit: &UnitId,
+    desired: &UnitDefinition,
+    observed: &UnitDefinition,
+) -> ActionReadiness {
+    let condition = Precondition::ResourceState {
+        resource: ResourceId::SystemdUnit(unit.clone()),
+        expected: definition_digest(observed),
+    };
+    if desired == observed {
+        ActionReadiness::Satisfied
+    } else if action.preconditions.first() == Some(&condition) {
+        ActionReadiness::Ready
+    } else {
+        ActionReadiness::Conflict(format!("单元 {:?} 在审阅后发生变化", unit.name))
+    }
 }
 
 fn file_digest(path: &Path) -> Result<Option<ContentDigest>, BackendError> {
@@ -373,7 +591,61 @@ fn deploy(
     definition: &UnitDefinition,
     context: &ActionContext<'_>,
 ) -> Result<(), BackendError> {
-    let root = Path::new(UNIT_ROOT);
+    match &unit.scope {
+        UnitScope::System => deploy_at(Path::new(UNIT_ROOT), unit, definition, context),
+        UnitScope::User { user: name } => {
+            let account = reviewed_account(context.action, name)?;
+            ensure_account_home(&account)?;
+            user::with_permissions(&account, || {
+                let root = user::config_dir(&account);
+                for directory in [
+                    account.home.join(".config"),
+                    account.home.join(".config/systemd"),
+                    root.clone(),
+                ] {
+                    required_target(&directory)?
+                        .ensure_directory(Mode::from_bits_truncate(0o755))
+                        .map_err(|err| file_error(&directory, err))?;
+                }
+                deploy_at(&root, unit, definition, context)
+            })
+        }
+        UnitScope::UserGlobal => unreachable!("validated unit scope"),
+    }
+}
+
+fn reviewed_account(action: &Action, name: &str) -> Result<UserAccount, BackendError> {
+    let account = user::resolve(name)?
+        .ok_or_else(|| BackendError(format!("缺少用户单元所属账户 {name:?}")))?;
+    let actual = account_condition(name, &account);
+    if action.preconditions.iter().any(|condition| {
+        matches!(
+            condition,
+            Precondition::ResourceState {
+                resource: ResourceId::User(_),
+                ..
+            }
+        ) && *condition != actual
+    }) {
+        return Err(BackendError(format!(
+            "账户 {name:?} 的 UID、主组或 home 在审阅后变化，请重新规划"
+        )));
+    }
+    Ok(account)
+}
+
+fn ensure_account_home(account: &UserAccount) -> Result<(), BackendError> {
+    required_target(&account.home)?
+        .create_home(Uid::from_raw(account.uid), Gid::from_raw(account.gid))
+        .map_err(|err| file_error(&account.home, err))
+}
+
+fn deploy_at(
+    root: &Path,
+    unit: &UnitId,
+    definition: &UnitDefinition,
+    context: &ActionContext<'_>,
+) -> Result<(), BackendError> {
     let mut candidates = Vec::<(PathBuf, &ContentDigest)>::new();
     if let Some(content) = &definition.content {
         candidates.push((root.join(&unit.name), content));
@@ -407,14 +679,15 @@ fn deploy(
         let file = StagedFile::new(
             target,
             context.content(expected)?,
-            Some(Uid::from_raw(0)),
-            Some(Gid::from_raw(0)),
+            (unit.scope == UnitScope::System).then(|| Uid::from_raw(0)),
+            (unit.scope == UnitScope::System).then(|| Gid::from_raw(0)),
             Mode::from_bits_truncate(0o644),
         )
         .map_err(|err| file_error(path, err))?;
         staged.push((path, file, prior.as_ref()));
     }
-    match SystemdBackend.inspect_action(context.action)? {
+    let observed = read_definition_at(root, unit, definition)?;
+    match inspect_definition(context.action, unit, definition, &observed) {
         ActionReadiness::Satisfied => return Ok(()),
         ActionReadiness::Conflict(reason) => return Err(BackendError(reason)),
         ActionReadiness::Ready => {}
@@ -433,7 +706,9 @@ fn required_target(path: &Path) -> Result<TargetPath, BackendError> {
 
 fn is_enabled(unit: &UnitId) -> Result<bool, BackendError> {
     validate_unit(unit)?;
-    let output = ctl_output(&["is-enabled", "--", &unit.name])?;
+    let Some(output) = ctl_output(&unit.scope, true, &["is-enabled", "--", &unit.name])? else {
+        return Ok(false);
+    };
     let state = std::str::from_utf8(&output.stdout)
         .map_err(|_| BackendError("systemctl 返回无效 UTF-8".into()))?;
     match state.trim() {
@@ -445,9 +720,16 @@ fn is_enabled(unit: &UnitId) -> Result<bool, BackendError> {
     }
 }
 
-fn is_running(unit: &UnitId) -> Result<bool, BackendError> {
+fn is_running(unit: &UnitId) -> Result<Option<bool>, BackendError> {
     validate_unit(unit)?;
-    let output = ctl_output(&["show", "--property=LoadState,ActiveState", "--", &unit.name])?;
+    let Some(output) = ctl_output(
+        &unit.scope,
+        false,
+        &["show", "--property=LoadState,ActiveState", "--", &unit.name],
+    )?
+    else {
+        return Ok(None);
+    };
     let stdout = std::str::from_utf8(&output.stdout)
         .map_err(|_| BackendError("systemctl 返回无效 UTF-8".into()))?;
     let values: BTreeMap<_, _> = stdout
@@ -455,7 +737,7 @@ fn is_running(unit: &UnitId) -> Result<bool, BackendError> {
         .filter_map(|line| line.split_once('='))
         .collect();
     if values.get("LoadState") == Some(&"not-found") {
-        return Ok(false);
+        return Ok(Some(false));
     }
     if !output.status.success()
         || !values.contains_key("ActiveState")
@@ -463,26 +745,79 @@ fn is_running(unit: &UnitId) -> Result<bool, BackendError> {
     {
         return Err(ctl_error("show", &output));
     }
-    Ok(values
-        .get("ActiveState")
-        .is_some_and(|state| matches!(*state, "active" | "reloading")))
+    Ok(Some(values.get("ActiveState").is_some_and(|state| {
+        matches!(*state, "active" | "reloading")
+    })))
 }
 
-fn ctl_output(args: &[&str]) -> Result<Output, BackendError> {
+fn manager_online(scope: &UnitScope) -> Result<bool, BackendError> {
+    match scope {
+        UnitScope::System => Ok(true),
+        UnitScope::User { user: name } => match user::resolve(name)? {
+            Some(account) => user::online(&account),
+            None => Ok(false),
+        },
+        UnitScope::UserGlobal => unreachable!("validated unit scope"),
+    }
+}
+
+fn system_ctl_output(args: &[&str]) -> Result<Output, BackendError> {
     Command::new("systemctl")
         .args(["--system", "--no-pager"])
         .args(args)
         .env("LC_ALL", "C")
+        .env("SYSTEMD_COLORS", "0")
         .output()
         .map_err(|err| BackendError(format!("无法启动 systemctl：{err}")))
 }
 
-fn ctl(args: &[&str]) -> Result<String, BackendError> {
-    let output = ctl_output(args)?;
+fn ctl_output(
+    scope: &UnitScope,
+    disk_only: bool,
+    args: &[&str],
+) -> Result<Option<Output>, BackendError> {
+    match scope {
+        UnitScope::System => system_ctl_output(args).map(Some),
+        UnitScope::User { user: name } => {
+            let Some(account) = user::resolve(name)? else {
+                return Ok(None);
+            };
+            if !disk_only && !user::online(&account)? {
+                return Ok(None);
+            }
+            user::command(&account, disk_only, args).map(Some)
+        }
+        UnitScope::UserGlobal => unreachable!("validated unit scope"),
+    }
+}
+
+fn ctl(scope: &UnitScope, disk_only: bool, args: &[&str]) -> Result<String, BackendError> {
+    let output = ctl_output(scope, disk_only, args)?
+        .ok_or_else(|| BackendError(format!("systemctl {} 无法访问 {scope:?}", args[0])))?;
     if !output.status.success() {
         return Err(ctl_error(args[0], &output));
     }
     String::from_utf8(output.stdout).map_err(|_| BackendError("systemctl 返回无效 UTF-8".into()))
+}
+
+fn action_ctl(
+    action: &Action,
+    scope: &UnitScope,
+    disk_only: bool,
+    args: &[&str],
+) -> Result<(), BackendError> {
+    let output = match scope {
+        UnitScope::User { user: name } => {
+            user::command(&reviewed_account(action, name)?, disk_only, args)?
+        }
+        UnitScope::System => system_ctl_output(args)?,
+        UnitScope::UserGlobal => unreachable!("validated unit scope"),
+    };
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(ctl_error(args[0], &output))
+    }
 }
 
 fn ctl_error(command: &str, output: &Output) -> BackendError {

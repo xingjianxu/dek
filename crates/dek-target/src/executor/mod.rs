@@ -7,12 +7,13 @@ use std::{
     io,
 };
 
-use dek_core::{Action, ActionKind, InputObservation, Observation, Plan, ResourceKind};
+use dek_core::{Action, ActionKind, InputObservation, Observation, Plan, ResourceKind, UnitId};
 use thiserror::Error;
 
 use crate::{
     backend::{
-        ActionContext, ActionReadiness, Backend, BackendRegistry, PriorAttempt, RecoveryReadiness,
+        ActionContext, ActionReadiness, Backend, BackendError, BackendRegistry, NotificationError,
+        PriorAttempt, RecoveryReadiness,
     },
     planner::{self, PlanError},
     state::{
@@ -83,6 +84,13 @@ pub enum ExecutionError {
         id: String,
         resource: String,
         message: String,
+    },
+    #[error("服务通知 {id}（{unit:?}）：{error}")]
+    Notification {
+        id: String,
+        unit: UnitId,
+        #[source]
+        error: NotificationError,
     },
     #[error("无法复核目标输入 {input:?}：{message}。请重新规划")]
     Input { input: String, message: String },
@@ -233,7 +241,12 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             &reviewed.plan.used_inputs,
             &reviewed.contents,
         )?;
-        let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh) else {
+        let resumed = match &application {
+            Application::Resume(run) => Some(run.as_ref()),
+            Application::New { .. } => None,
+        };
+        let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh, resumed)
+        else {
             return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
         };
         if let Application::Resume(run) = &application
@@ -366,6 +379,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         live: &BTreeSet<&str>,
     ) -> Result<(), ExecutionError> {
         let mut triggered = BTreeSet::new();
+        let mut deferred = BTreeSet::new();
         for item in &run.actions {
             let action = &item.action;
             if let ActionResult::Verified { changed } = item.result {
@@ -400,7 +414,29 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                         continue;
                     }
                 }
+                ActionResult::Deferred { .. } => {
+                    deferred.insert(action.id.as_str());
+                    continue;
+                }
                 ActionResult::Verified { .. } => unreachable!("verified actions were handled"),
+            }
+            let deferred_reason = if let Some(dependency) = action
+                .depends_on
+                .iter()
+                .find(|id| deferred.contains(id.as_str()))
+            {
+                Some(format!("依赖动作 {dependency} 待激活"))
+            } else {
+                backend
+                    .deferred_reason(action)
+                    .map_err(|error| ExecutionError::action(action, error.0))?
+            };
+            if let Some(message) = deferred_reason {
+                self.store
+                    .lock()?
+                    .defer_action(&run.id, binding, &action.id, message)?;
+                deferred.insert(action.id.as_str());
+                continue;
             }
             let readiness = backend
                 .inspect_action(action)
@@ -413,6 +449,20 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                 Ok(ActionReadiness::Conflict(
                     "目标文件在范围复核后发生变化，请重新规划".into(),
                 ))
+            } else {
+                readiness
+            };
+            let readiness = if matches!(action.kind, ActionKind::NotifyService { .. }) {
+                match readiness? {
+                    ActionReadiness::Conflict(reason) => {
+                        return Err(ExecutionError::action(action, reason));
+                    }
+                    ActionReadiness::Ready => {
+                        self.verify_notification_files(run, action)?;
+                        Ok(ActionReadiness::Ready)
+                    }
+                    ActionReadiness::Satisfied => Ok(ActionReadiness::Satisfied),
+                }
             } else {
                 readiness
             };
@@ -434,12 +484,15 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         backend: &dyn Backend,
     ) -> Result<bool, ExecutionError> {
         let action = &item.action;
-        let unverified = item.result == ActionResult::Unverified;
-        let prior = if unverified {
-            PriorAttempt::Unverified
-        } else {
-            PriorAttempt::Failed
+        let prior = match item.result {
+            ActionResult::Unverified => PriorAttempt::Unverified,
+            ActionResult::Failed {
+                notification_job_failed: true,
+                ..
+            } => PriorAttempt::NotificationJobFailed,
+            _ => PriorAttempt::Failed,
         };
+        let unverified = prior == PriorAttempt::Unverified;
         let readiness = backend
             .inspect_recovery(action, prior)
             .unwrap_or_else(|error| {
@@ -535,16 +588,45 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         }
 
         let context = ActionContext::new(action, &reviewed.contents);
+        if let ActionKind::NotifyService { unit, .. } = &action.kind {
+            return backend
+                .execute_notification(&context)
+                .and_then(|()| verify(backend, action).map_err(NotificationError::Unverified))
+                .map(|()| true)
+                .map_err(|error| ExecutionError::Notification {
+                    id: action.id.clone(),
+                    unit: unit.clone(),
+                    error,
+                });
+        }
         backend
             .execute(&context)
+            .and_then(|()| verify(backend, action))
             .map_err(|error| ExecutionError::action(action, error.0))?;
-        if !backend
-            .verify(&action.kind)
-            .map_err(|error| ExecutionError::action(action, error.0))?
-        {
-            return Err(ExecutionError::action(action, "执行后的状态核验未通过"));
-        }
         Ok(true)
+    }
+
+    fn verify_notification_files(
+        &self,
+        run: &RunRecord,
+        notice: &Action,
+    ) -> Result<(), ExecutionError> {
+        for item in &run.actions {
+            let source = &item.action;
+            if action_kind(&source.kind) == ResourceKind::File
+                && notice.depends_on.contains(&source.id)
+                && !self
+                    .backend(source)?
+                    .verify(&source.kind)
+                    .map_err(|error| ExecutionError::action(source, error.0))?
+            {
+                return Err(ExecutionError::action(
+                    source,
+                    "通知前复核发现文件与已审阅状态不符",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn record(
@@ -557,6 +639,28 @@ impl<'a, 'backend> Executor<'a, 'backend> {
     ) -> Result<(), StateError> {
         let receipt = match result {
             Ok(changed) => ActionReceipt::Verified { changed: *changed },
+            Err(
+                error @ ExecutionError::Notification {
+                    error: NotificationError::JobFailed(_),
+                    ..
+                },
+            ) => ActionReceipt::NotificationJobFailed {
+                message: error.to_string(),
+            },
+            Err(
+                error @ ExecutionError::Notification {
+                    error: NotificationError::Unverified(_),
+                    ..
+                },
+            ) => {
+                return self.store.lock()?.record_recovery_diagnostic(
+                    &run.id,
+                    binding,
+                    &action.id,
+                    attempt,
+                    error.to_string(),
+                );
+            }
             Err(error) => ActionReceipt::Failed {
                 message: error.to_string(),
             },
@@ -572,6 +676,14 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             .backend(kind)
             .map(|(_, backend)| backend)
             .ok_or_else(|| ExecutionError::action(action, format!("缺少 {kind:?} 后端")))
+    }
+}
+
+fn verify(backend: &dyn Backend, action: &Action) -> Result<(), BackendError> {
+    if backend.verify(&action.kind)? {
+        Ok(())
+    } else {
+        Err(BackendError("执行后的状态核验未通过".into()))
     }
 }
 

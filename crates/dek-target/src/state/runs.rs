@@ -59,8 +59,21 @@ pub struct RunAction {
 pub enum ActionResult {
     Pending,
     Unverified,
-    Verified { changed: bool },
-    Failed { message: String },
+    Deferred {
+        message: String,
+    },
+    Verified {
+        changed: bool,
+    },
+    Failed {
+        message: String,
+        #[serde(
+            default,
+            rename = "notificationJobFailed",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        notification_job_failed: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +87,7 @@ pub enum ActionAttempt {
 pub enum ActionReceipt {
     Verified { changed: bool },
     Failed { message: String },
+    NotificationJobFailed { message: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -275,7 +289,7 @@ impl StateGuard<'_> {
                 runs.sync()?;
                 return Ok(ActionAttempt::NeedsVerification(action.attempt));
             }
-            ActionResult::Verified { .. } => {
+            ActionResult::Verified { .. } | ActionResult::Deferred { .. } => {
                 return Err(StateError::invalid(
                     &runs.path,
                     format!("动作 {action_id} 已核验完成"),
@@ -293,6 +307,31 @@ impl StateGuard<'_> {
         Ok(ActionAttempt::Started(attempt))
     }
 
+    /// Record an action that requires a live manager without starting an attempt.
+    pub(crate) fn defer_action(
+        &self,
+        run_id: &str,
+        binding: PlanBinding<'_>,
+        action_id: &str,
+        message: String,
+    ) -> Result<(), StateError> {
+        let runs = self.runs_directory()?;
+        let mut run = bound_run(&runs, run_id, binding)?;
+        let action = action_mut(&runs, &mut run, action_id)?;
+        if !matches!(
+            action.result,
+            ActionResult::Pending | ActionResult::Failed { .. }
+        ) {
+            return Err(StateError::invalid(
+                &runs.path,
+                "仅可延后未开始的动作或明确失败的动作",
+            ));
+        }
+        action.result = ActionResult::Deferred { message };
+        action.recovery_diagnostic = None;
+        replace_run(&runs, &run)
+    }
+
     pub fn record_action_result(
         &self,
         run_id: &str,
@@ -306,7 +345,22 @@ impl StateGuard<'_> {
         let action = action_mut(&runs, &mut run, action_id)?;
         let next = match receipt {
             ActionReceipt::Verified { changed } => ActionResult::Verified { changed },
-            ActionReceipt::Failed { message } => ActionResult::Failed { message },
+            ActionReceipt::Failed { message } => ActionResult::Failed {
+                message,
+                notification_job_failed: false,
+            },
+            ActionReceipt::NotificationJobFailed { message } => {
+                if !matches!(action.action.kind, ActionKind::NotifyService { .. }) {
+                    return Err(StateError::invalid(
+                        &runs.path,
+                        "服务通知回执与动作类型不符",
+                    ));
+                }
+                ActionResult::Failed {
+                    message,
+                    notification_job_failed: true,
+                }
+            }
         };
         if attempt != action.attempt || attempt == 0 {
             return Err(StateError::invalid(
@@ -369,7 +423,7 @@ impl StateGuard<'_> {
         replace_run(&runs, &run)
     }
 
-    /// Mark a fully verified run complete. Retention may release its plan afterwards.
+    /// Mark a run complete after verifying or explicitly deferring every action.
     pub fn finish_run(&self, id: &str, binding: PlanBinding<'_>) -> Result<(), StateError> {
         let runs = self.runs_directory()?;
         let mut run = bound_run(&runs, id, binding)?;
@@ -377,10 +431,12 @@ impl StateGuard<'_> {
             return runs.sync();
         }
         if !run.pending_notifications.is_empty()
-            || run
-                .actions
-                .iter()
-                .any(|action| !matches!(action.result, ActionResult::Verified { .. }))
+            || run.actions.iter().any(|action| {
+                !matches!(
+                    action.result,
+                    ActionResult::Verified { .. } | ActionResult::Deferred { .. }
+                )
+            })
         {
             return Err(StateError::invalid(
                 &runs.path.join(run_filename(&runs, id)?),

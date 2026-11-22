@@ -139,7 +139,16 @@ pub fn apply_local_with_loader(
                 .iter()
                 .filter(|action| action.result == ActionResult::Verified { changed: true })
                 .count();
-            writeln!(out, "已核验完成，实际变更 {changes} 项")?;
+            let deferred = run
+                .actions
+                .iter()
+                .filter(|action| matches!(action.result, ActionResult::Deferred { .. }))
+                .count();
+            if deferred == 0 {
+                writeln!(out, "已核验完成，实际变更 {changes} 项")?;
+            } else {
+                writeln!(out, "实际变更 {changes} 项，待激活 {deferred} 项")?;
+            }
             Ok(())
         }
         ExecutionOutcome::ReviewRequired {
