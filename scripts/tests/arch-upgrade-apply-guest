@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# Run only in a fresh disposable Arch guest started by arch-upgrade-apply.
+set -euo pipefail
+[[ $(id -u) == 0 && -e /run/cloud-init/instance-data.json ]]
+grep -Fx 'ID=arch' /etc/os-release
+export LC_ALL=C SOURCE_DATE_EPOCH=1700000000
+
+base=/run/dek-upgrade-apply
+install -d -m 0755 "$base"/{seed,a,b,c,repo}
+install -d -m 0700 "$base"/{cache,state,signing,keyring}
+work=$(mktemp -d)
+chmod 0755 "$work"
+export GNUPGHOME="$base/signing"
+gpg --batch --pinentry-mode loopback --passphrase '' \
+    --quick-generate-key 'Dek Arch Upgrade Fixture <upgrade@example.invalid>' ed25519 sign 0
+key=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+gpg --batch --export "$key" > "$work/fixture-key.gpg"
+pacman-key --gpgdir "$base/keyring" --init
+pacman-key --gpgdir "$base/keyring" --add "$work/fixture-key.gpg"
+pacman-key --gpgdir "$base/keyring" --lsign-key "$key"
+unset GNUPGHOME
+mkpkg() {
+    local directory=$1 name=$2 version=$3 hook=${4:-}
+    local source="$work/$name"
+    local archive="$base/$directory/$name-$version-any.pkg.tar.zst"
+    install -d -m 0755 "$source/usr/share/$name"
+    {
+        printf 'pkgname = %s\npkgver = %s\npkgdesc = dek reviewed upgrade fixture\n' "$name" "$version"
+        printf 'url = https://example.invalid/dek-fixture\nbuilddate = %s\nsize = 1\narch = any\n' "$SOURCE_DATE_EPOCH"
+    } > "$source/.PKGINFO"
+    printf '%s\n' "$version" > "$source/usr/share/$name/version"
+    local paths=(.PKGINFO usr)
+    if [[ "$hook" == hook ]]; then
+        cat > "$source/.INSTALL" <<'HOOK'
+post_upgrade() {
+    printf 'package-generated\n' > /run/dek-upgrade-apply/drifted.conf
+    printf '%s\n' "$1" >> /run/dek-upgrade-apply/hook-commits
+}
+HOOK
+        paths+=(.INSTALL)
+    fi
+    bsdtar -cf - --format=mtree --options='!all,use-set,type,uid,gid,mode,size,sha256' \
+        -C "$source" "${paths[@]}" | gzip -n > "$source/.MTREE"
+    tar --mtime="@$SOURCE_DATE_EPOCH" --sort=name --owner=0 --group=0 --numeric-owner \
+        -cf - -C "$source" "${paths[@]}" .MTREE | zstd -q -o "$archive"
+    gpg --homedir "$base/signing" --batch --local-user "$key" --detach-sign "$archive"
+    rm -r -- "$source"
+}
+
+mkpkg seed dek-upgrade-main 1-1
+mkpkg a dek-upgrade-main 2-1 hook
+mkpkg a dek-upgrade-addon 1-1
+mkpkg b dek-upgrade-main 3-1 hook
+mkpkg b dek-upgrade-addon 2-1
+mkpkg c dek-upgrade-main 4-1 hook
+cp -- "$base/b/dek-upgrade-addon-2-1-any.pkg.tar.zst"{,.sig} "$base/c/"
+for state in a b c; do
+    (cd "$base/$state" &&
+        GNUPGHOME="$base/signing" repo-add --sign --key "$key" fixture.db.tar.gz ./*.pkg.tar.zst &&
+        sha256sum -- fixture.db fixture.db.sig ./*.pkg.tar.zst)
+done
+ln -s "$base/a" "$base/current"
+cat > /etc/pacman.conf <<CONF
+[options]
+Architecture = auto
+SigLevel = Required TrustedOnly
+GPGDir = $base/keyring
+DownloadUser = alpm
+[fixture]
+Server = file://$base/current
+CONF
+pacman -U --noconfirm -- "$base/seed/"*.pkg.tar.zst
+printf 'declared\n' > "$base/drifted.conf"
+
+cat > "$base/repo/dek.json" <<'JSON'
+{"schemaVersion":1,"hosts":{"fixture":{"entry":"entry.json","target":{"local":true}}},"modules":{"lab.upgrade":{"schema":"options.json","expand":"expand.rb"}}}
+JSON
+cat > "$base/repo/options.json" <<'JSON'
+{"options":[{"path":"lab.upgrade.enable","type":"boolean","description":"Enable the fixture configuration"}]}
+JSON
+cat > "$base/repo/entry.json" <<'JSON'
+{"schemaVersion":1,"imports":[],"options":[
+  {"path":"environment.systemPackages","value":["dek-upgrade-addon"]},
+  {"path":"lab.upgrade.enable","value":true}
+]}
+JSON
+cat > "$base/repo/expand.rb" <<'RUBY'
+file_resource "/run/dek-upgrade-apply/drifted.conf", content: "declared\n"
+file_resource "/run/dek-upgrade-apply/pending.conf", content: "approved\n"
+RUBY
+
+export XDG_CACHE_HOME="$base/cache"
+run_dek() {
+    /usr/local/bin/dek --repo "$base/repo" -H fixture "$@" --state-dir "$base/state"
+}
+snapshot() {
+    find /var/lib/pacman/local /var/lib/pacman/sync -type f -print0 |
+        sort -z | xargs -0 sha256sum
+    sha256sum "$base/drifted.conf"
+    [[ ! -e "$base/pending.conf" && ! -e "$base/hook-commits" ]]
+}
+review_id() {
+    local id
+    id=$(awk '/^计划 / {print $2}' "$1" | tail -n 1)
+    [[ "$id" =~ ^[0-9a-f]{64}$ ]]
+    printf '%s\n' "$id"
+}
+expect_review() {
+    local label=$1
+    shift
+    if run_dek "$@" > "$base/$label.log" 2>&1; then
+        printf 'Expected review stop in %s\n' "$label" >&2
+        exit 1
+    fi
+    cat "$base/$label.log"
+    grep -Fq '等待审阅计划' "$base/$label.log"
+}
+tx_count() {
+    sed -n 's/^.*\[ALPM\] transaction started$/1/p' /var/log/pacman.log | wc -l
+}
+
+snapshot > "$base/initial.sha256"
+# Both descriptors must be terminals, even if piped stdin contains an affirmative answer.
+printf 'yes\n' | run_dek upgrade > "$base/noninteractive.log"
+old=$(review_id "$base/noninteractive.log")
+grep -Fq "dek apply -H fixture --plan $old" "$base/noninteractive.log"
+! grep -Fq 'run_id ' "$base/noninteractive.log"
+printf 'n\n' | script --quiet --return \
+    --command "/usr/local/bin/dek --repo $base/repo -H fixture upgrade --state-dir $base/state" \
+    /dev/null > "$base/cancel.log"
+grep -Fq '[y/N]' "$base/cancel.log"
+grep -Fq '已取消升级' "$base/cancel.log"
+! grep -Fq 'run_id ' "$base/cancel.log"
+snapshot > "$base/after-review.sha256"
+cmp "$base/initial.sha256" "$base/after-review.sha256"
+cat "$base/noninteractive.log" "$base/cancel.log"
+
+install -m 0600 /dev/stdin "$base/state/retention.json" <<'JSON'
+{"planTtlSeconds":1}
+JSON
+sleep 2
+expect_review expired apply --plan "$old"
+renewed=$(review_id "$base/expired.log")
+[[ "$renewed" != "$old" ]]
+grep -Fq '已审阅计划过期' "$base/expired.log"
+grep -Fq '完整仓库升级事务' "$base/expired.log"
+! grep -Fq 'run_id ' "$base/expired.log"
+rm -- "$base/state/retention.json"
+
+ln -sfn "$base/b" "$base/current"
+expect_review changed apply --plan "$renewed"
+new=$(review_id "$base/changed.log")
+[[ "$renewed" != "$new" ]]
+! grep -Fq 'run_id ' "$base/changed.log"
+snapshot > "$base/after-stale.sha256"
+cmp "$base/initial.sha256" "$base/after-stale.sha256"
+
+before=$(tx_count)
+expect_review widened apply --plan "$new" --request-id reviewed-upgrade
+followup=$(review_id "$base/widened.log")
+run_id=$(awk '/^run_id / { print $2 }' "$base/widened.log")
+[[ "$run_id" =~ ^[0-9a-f]{64}$ && "$followup" != "$new" ]]
+[[ "$(tx_count)" == "$((before + 1))" ]]
+[[ "$(pacman -Q dek-upgrade-main)" == 'dek-upgrade-main 3-1' ]]
+[[ "$(pacman -Q dek-upgrade-addon)" == 'dek-upgrade-addon 2-1' ]]
+for package in dek-upgrade-main-3-1 dek-upgrade-addon-2-1; do
+    for record in desc files mtree; do
+        test -s "/var/lib/pacman/local/$package/$record"
+    done
+    sha256sum "/var/lib/pacman/local/$package/"{desc,files,mtree}
+done
+cmp "$base/b/fixture.db" /var/lib/pacman/sync/fixture.db
+cmp "$base/b/fixture.db.sig" /var/lib/pacman/sync/fixture.db.sig
+[[ "$(cat "$base/drifted.conf")" == package-generated && ! -e "$base/pending.conf" ]]
+[[ "$(cat "$base/hook-commits")" == '3-1' ]]
+run_dek status --run "$run_id" --json > "$base/partial.json"
+python3 - "$base/partial.json" "$new" "$followup" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+run = json.loads(Path(sys.argv[1]).read_bytes())
+assert run["plan_id"] == sys.argv[2]
+assert run["finished"] and run["replacement_plan_id"] == sys.argv[3]
+transaction, pending = run["actions"]
+assert transaction["action"]["kind"]["repositoryTransaction"]["scope"] == "upgrade"
+assert transaction["result"] == {"verified": {"changed": True}}
+assert pending["result"] == "pending"
+PY
+cat "$base/partial.json"
+
+# Replay proves the previously verified transaction remains available and cannot re-run.
+expect_review replay apply --plan "$new" --request-id reviewed-upgrade
+grep -Fq "run_id $run_id" "$base/replay.log"
+[[ "$(review_id "$base/replay.log")" == "$followup" && "$(tx_count)" == "$((before + 1))" ]]
+run_dek apply --plan "$followup"
+[[ "$(cat "$base/drifted.conf")" == declared && "$(cat "$base/pending.conf")" == approved ]]
+[[ "$(tx_count)" == "$((before + 1))" ]]
+printf 'Local configuration review, single native transaction and persisted journal verified.\n'
+
+# Prepare an independently reviewed remote transaction. The test VM grants its
+# fixed internal endpoint package privileges while Ruby remains on the controller.
+ln -sfn "$base/c" "$base/current"
+if ! run_dek plan --upgrade --json > "$base/next-local.json"; then
+    native=$(mktemp -d)
+    cp -a /var/lib/pacman/local "$native/"
+    install -d "$native/sync"
+    cp -- "$base/c/fixture.db"{,.sig} "$native/sync/"
+    pacman --debug --dbpath "$native" -Sup || true
+    exit 1
+fi
+mv /usr/local/bin/dek /usr/local/bin/dek-native
+cat > /usr/local/bin/dek <<'SH'
+#!/bin/sh
+exec sudo -n /usr/local/bin/dek-native "$@"
+SH
+chmod 0755 /usr/local/bin/dek

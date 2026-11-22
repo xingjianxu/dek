@@ -19,7 +19,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dek_core::{ContentDigest, Plan, ResourceSet, TargetIdentity};
+use dek_core::{ContentDigest, Plan, PlanMode, ResourceSet, TargetIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -33,7 +33,11 @@ const FORMAT_VERSION: u32 = 1;
 #[derive(Debug, Error)]
 pub enum StateError {
     #[error("计划 {id} 已于 Unix 时间 {expired_at} 过期。请重新运行 dek plan 并审阅新计划")]
-    ExpiredPlan { id: String, expired_at: u64 },
+    ExpiredPlan {
+        id: String,
+        expired_at: u64,
+        mode: PlanMode,
+    },
     #[error("缺少已审阅计划 {id}（{path}）。请重新运行 dek plan")]
     MissingPlan { id: String, path: PathBuf },
     #[error("无法{action} {path}：{source}。请检查目标状态目录后重新运行 dek plan")]
@@ -400,6 +404,7 @@ impl StateGuard<'_> {
                 return Err(StateError::ExpiredPlan {
                     id: id.into(),
                     expired_at: retired.expired_at,
+                    mode: retired.mode,
                 });
             }
         }
@@ -408,6 +413,7 @@ impl StateGuard<'_> {
                 return Err(StateError::ExpiredPlan {
                     id: id.into(),
                     expired_at: retired.expired_at,
+                    mode: retired.mode,
                 });
             }
             return Err(StateError::MissingPlan {
@@ -438,6 +444,7 @@ impl StateGuard<'_> {
             return Err(StateError::ExpiredPlan {
                 id: id.into(),
                 expired_at: self.retention.expires_at(record.created_at),
+                mode: record.plan.mode(),
             });
         }
         let contents = referenced(&record.plan, &record.resources)

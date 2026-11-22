@@ -69,4 +69,6 @@ pub struct RunStatus {
     pub actions: Vec<RunAction>,
     pub pending_notifications: Vec<RunNotification>,
     pub finished: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_plan_id: Option<String>,
 }

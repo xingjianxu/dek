@@ -72,6 +72,17 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn mode(&self) -> PlanMode {
+        if self
+            .repository_transaction()
+            .is_some_and(|transaction| transaction.scope == RepositoryTransactionScope::Upgrade)
+        {
+            PlanMode::Upgrade
+        } else {
+            PlanMode::Normal
+        }
+    }
+
     pub fn repository_transaction(&self) -> Option<&RepositoryTransaction> {
         self.actions.iter().find_map(|action| match &action.kind {
             ActionKind::RepositoryTransaction(transaction) => Some(transaction),

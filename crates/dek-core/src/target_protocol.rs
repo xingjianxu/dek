@@ -93,10 +93,16 @@ pub enum TargetResult {
     ReviewRequired {
         reason: String,
         replacement: Option<Box<Plan>>,
+        #[serde(default, skip_serializing_if = "normal_plan_mode")]
+        mode: PlanMode,
     },
     Error {
         message: String,
     },
+}
+
+fn normal_plan_mode(mode: &PlanMode) -> bool {
+    *mode == PlanMode::Normal
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]

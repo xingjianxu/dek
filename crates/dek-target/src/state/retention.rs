@@ -4,7 +4,7 @@ use std::{
     num::NonZeroU64,
 };
 
-use dek_core::{ContentDigest, Plan, TargetIdentity};
+use dek_core::{ContentDigest, Plan, PlanMode, TargetIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -62,6 +62,8 @@ pub(super) struct ExpiredReview {
     pub(super) repository_id: String,
     pub(super) logical_host: String,
     pub(super) target: TargetIdentity,
+    #[serde(default)]
+    pub(super) mode: PlanMode,
 }
 
 pub(super) struct ReviewCollection {
@@ -231,6 +233,7 @@ impl StateGuard<'_> {
                     repository_id: record.plan.repository_id.clone(),
                     logical_host: record.logical_host.clone(),
                     target: record.plan.target.clone(),
+                    mode: record.plan.mode(),
                 };
                 let path = self.store.expired.path.join(&name);
                 Some(rmp_serde::to_vec_named(&marker).map_err(|err| {

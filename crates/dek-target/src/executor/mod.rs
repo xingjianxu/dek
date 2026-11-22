@@ -7,7 +7,9 @@ use std::{
     io,
 };
 
-use dek_core::{Action, ActionKind, InputObservation, Observation, Plan, ResourceKind, UnitId};
+use dek_core::{
+    Action, ActionKind, InputObservation, Observation, Plan, PlanMode, ResourceKind, UnitId,
+};
 use thiserror::Error;
 
 use crate::{
@@ -34,22 +36,31 @@ pub struct ExecutionRequest<'a> {
 /// A reader can distinguish policy expiry from invalid binding or corrupt records.
 pub enum LoadedPlan {
     Approved(Box<ReviewedPlan>),
-    Expired,
+    Expired(PlanMode),
 }
 
 #[derive(Debug)]
 pub enum ReviewReason {
-    Expired,
-    InputChanged(String),
+    Expired(PlanMode),
+    InputChanged { input: String, mode: PlanMode },
     ScopeExpanded,
     CompletedActionDrift,
+}
+
+impl ReviewReason {
+    pub fn replan_mode(&self) -> PlanMode {
+        match self {
+            Self::Expired(mode) | Self::InputChanged { mode, .. } => *mode,
+            _ => PlanMode::Normal,
+        }
+    }
 }
 
 impl std::fmt::Display for ReviewReason {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Expired => out.write_str("已审阅计划过期"),
-            Self::InputChanged(input) => write!(out, "已审阅的目标输入 {input} 发生变化"),
+            Self::Expired(_) => out.write_str("已审阅计划过期"),
+            Self::InputChanged { input, .. } => write!(out, "已审阅的目标输入 {input} 发生变化"),
             Self::ScopeExpanded => out.write_str("目标实际所需的变更超出已审阅范围"),
             Self::CompletedActionDrift => out.write_str("上次已核验的动作需要重新规划"),
         }
@@ -169,8 +180,11 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             return self.resume_locked(request.binding, run, observe_input, started);
         }
         let loaded = load(&self.store.lock()?, request.plan_id, request.binding)?;
-        let LoadedPlan::Approved(reviewed) = loaded else {
-            return Ok(ExecutionOutcome::review(ReviewReason::Expired));
+        let reviewed = match loaded {
+            LoadedPlan::Approved(reviewed) => reviewed,
+            LoadedPlan::Expired(mode) => {
+                return Ok(ExecutionOutcome::review(ReviewReason::Expired(mode)));
+            }
         };
         if reviewed.plan.id != request.plan_id {
             return Err(ExecutionError::RunMismatch(request.plan_id.to_owned()));
@@ -208,6 +222,19 @@ impl<'a, 'backend> Executor<'a, 'backend> {
     ) -> Result<ExecutionOutcome, ExecutionError> {
         if run.finished {
             started(&run.id).map_err(ExecutionError::Output)?;
+            if let Some(id) = &run.replacement_plan_id {
+                let replacement = self.store.lock()?.load_plan(id, binding);
+                return match replacement {
+                    Ok(review) => Ok(ExecutionOutcome::ReviewRequired {
+                        reason: ReviewReason::ScopeExpanded,
+                        replacement: Some(Box::new(review.plan)),
+                    }),
+                    Err(StateError::ExpiredPlan { mode, .. }) => {
+                        Ok(ExecutionOutcome::review(ReviewReason::Expired(mode)))
+                    }
+                    Err(error) => Err(error.into()),
+                };
+            }
             return Ok(ExecutionOutcome::Finished(Box::new(run)));
         }
         let reviewed = self.store.lock()?.load_run_plan(&run.id, binding)?;
@@ -225,43 +252,74 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         &self,
         binding: PlanBinding<'_>,
         reviewed: &ReviewedPlan,
-        application: Application<'_>,
+        mut application: Application<'_>,
         mut observe_input: impl FnMut(&InputObservation) -> Result<Observation, String>,
         started: impl FnOnce(&str) -> io::Result<()>,
     ) -> Result<ExecutionOutcome, ExecutionError> {
         planner::check_compatibility(self.registry, &reviewed.plan)?;
         validate_order(&reviewed.plan)?;
 
-        for input in &reviewed.plan.used_inputs {
-            let actual = observe_input(input).map_err(|message| ExecutionError::Input {
-                input: input.id.clone(),
-                message,
-            })?;
-            if actual != input.observation {
-                return Ok(ExecutionOutcome::review(ReviewReason::InputChanged(
-                    input.id.clone(),
-                )));
+        let upgrade = (reviewed.plan.mode() == PlanMode::Upgrade)
+            .then(|| reviewed.plan.actions.first().expect("upgrade transaction"));
+        let already_upgraded = if let Some(action) = upgrade
+            && let Application::Resume(run) = &mut application
+        {
+            let item = &run.actions[0];
+            if matches!(
+                item.result,
+                ActionResult::Unverified | ActionResult::Failed { .. }
+            ) {
+                self.recover_attempt(run, binding, item, action, self.backend(action)?)?;
+                **run = self.store.lock()?.load_run(&run.id, binding)?;
             }
-        }
-
-        let replan = || {
-            planner::plan_for_host_with_contents(
-                self.registry,
-                binding.repository_id,
-                binding.logical_host,
-                &reviewed.resources,
-                &reviewed.plan.used_inputs,
-                &reviewed.contents,
-            )
+            if matches!(run.actions[0].result, ActionResult::Verified { .. }) {
+                if !self
+                    .backend(action)?
+                    .verify(&action.kind)
+                    .map_err(|error| ExecutionError::action(action, error.0))?
+                {
+                    let fresh = self.replan(binding, reviewed, PlanMode::Upgrade)?;
+                    return self.replacement(
+                        binding,
+                        reviewed,
+                        &fresh,
+                        ReviewReason::CompletedActionDrift,
+                    );
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         };
-        let fresh = replan()?;
+        let mode = if already_upgraded {
+            PlanMode::Normal
+        } else {
+            reviewed.plan.mode()
+        };
+        if let Some(input) = changed_input(&reviewed.plan, &mut observe_input)? {
+            return Ok(ExecutionOutcome::review(ReviewReason::InputChanged {
+                input,
+                mode,
+            }));
+        }
+        let fresh = self.replan(binding, reviewed, mode)?;
         let resumed = match &application {
             Application::Resume(run) => Some(run.as_ref()),
             Application::New { .. } => None,
         };
-        let Scope::Reviewed { live, conflict } = match_scope(&reviewed.plan, &fresh, resumed)
-        else {
-            return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
+        let (live, conflict) = match match_scope(&reviewed.plan, &fresh, resumed) {
+            Scope::Reviewed { live, conflict } if upgrade.is_none() || conflict.is_none() => {
+                (live, conflict)
+            }
+            _ => {
+                if already_upgraded && let Some(run) = resumed {
+                    started(&run.id).map_err(ExecutionError::Output)?;
+                    return self.replacement_after_upgrade(binding, reviewed, &fresh, run);
+                }
+                return self.replacement(binding, reviewed, &fresh, ReviewReason::ScopeExpanded);
+            }
         };
         if let Application::Resume(run) = &application
             && run.actions.iter().any(|item| {
@@ -311,7 +369,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                     return self.replacement(
                         binding,
                         reviewed,
-                        &replan()?,
+                        &self.replan(binding, reviewed, mode)?,
                         ReviewReason::ScopeExpanded,
                     );
                 }
@@ -325,8 +383,8 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                     .lock()?
                     .begin_run(&reviewed.plan.id, binding, request_id);
                 match result {
-                    Err(StateError::ExpiredPlan { .. }) => {
-                        return Ok(ExecutionOutcome::review(ReviewReason::Expired));
+                    Err(StateError::ExpiredPlan { mode, .. }) => {
+                        return Ok(ExecutionOutcome::review(ReviewReason::Expired(mode)));
                     }
                     result => result?,
                 }
@@ -357,12 +415,59 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             return Err(failure);
         }
 
-        self.run_actions(&run, binding, reviewed, &live, repository_commit)?;
+        if let Some(transaction) = upgrade
+            && !already_upgraded
+        {
+            self.run_actions(
+                &run,
+                binding,
+                reviewed,
+                &live,
+                repository_commit,
+                Some(&transaction.id),
+            )?;
+            let run = self.store.lock()?.load_run(&run.id, binding)?;
+            if let Some(input) = changed_input(&reviewed.plan, &mut observe_input)? {
+                return Ok(ExecutionOutcome::review(ReviewReason::InputChanged {
+                    input,
+                    mode: PlanMode::Normal,
+                }));
+            }
+            let fresh = self.replan(binding, reviewed, PlanMode::Normal)?;
+            let Scope::Reviewed {
+                live,
+                conflict: None,
+            } = match_scope(&reviewed.plan, &fresh, Some(&run))
+            else {
+                return self.replacement_after_upgrade(binding, reviewed, &fresh, &run);
+            };
+            self.validate_batches(reviewed, &live)?;
+            self.run_actions(&run, binding, reviewed, &live, None, None)?;
+        } else {
+            self.run_actions(&run, binding, reviewed, &live, repository_commit, None)?;
+        }
         let guard = self.store.lock()?;
         guard.finish_run(&run.id, binding)?;
         Ok(ExecutionOutcome::Finished(Box::new(
             guard.load_run(&run.id, binding)?,
         )))
+    }
+
+    fn replan(
+        &self,
+        binding: PlanBinding<'_>,
+        reviewed: &ReviewedPlan,
+        mode: PlanMode,
+    ) -> Result<Plan, PlanError> {
+        planner::plan_for_host_with_contents_mode(
+            self.registry,
+            binding.repository_id,
+            binding.logical_host,
+            &reviewed.resources,
+            &reviewed.plan.used_inputs,
+            &reviewed.contents,
+            mode,
+        )
     }
 
     fn replacement(
@@ -380,6 +485,27 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         )?;
         Ok(ExecutionOutcome::ReviewRequired {
             reason,
+            replacement: Some(Box::new(stored)),
+        })
+    }
+
+    fn replacement_after_upgrade(
+        &self,
+        binding: PlanBinding<'_>,
+        reviewed: &ReviewedPlan,
+        fresh: &Plan,
+        run: &RunRecord,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        let guard = self.store.lock()?;
+        let stored = guard.save_plan(
+            binding.logical_host,
+            fresh,
+            &reviewed.resources,
+            &reviewed.contents,
+        )?;
+        guard.finish_upgrade_for_review(&run.id, binding, &stored.id)?;
+        Ok(ExecutionOutcome::ReviewRequired {
+            reason: ReviewReason::ScopeExpanded,
             replacement: Some(Box::new(stored)),
         })
     }
@@ -416,6 +542,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
         reviewed: &ReviewedPlan,
         live: &BTreeSet<&str>,
         mut repository_commit: Option<RepositoryCommit>,
+        stop_after: Option<&str>,
     ) -> Result<(), ExecutionError> {
         let mut triggered = BTreeSet::new();
         let mut deferred = BTreeSet::new();
@@ -517,7 +644,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             }
             let attempt = self.begin(run, binding, action)?;
             let outcome = if matches!(&readiness, Ok(ActionReadiness::Ready))
-                && matches!(action.kind, ActionKind::RepositoryTransaction(_))
+                && let ActionKind::RepositoryTransaction(transaction) = &action.kind
                 && let Some(commit) = repository_commit.take()
             {
                 Self::queue_dependent_notifications(self.store, run, binding, action, true)
@@ -525,7 +652,7 @@ impl<'a, 'backend> Executor<'a, 'backend> {
                     .and_then(|()| {
                         commit()
                             .and_then(|()| verify(backend, action))
-                            .map(|()| true)
+                            .map(|()| !transaction.changes.is_empty())
                             .map_err(|error| ExecutionError::action(action, error.0))
                     })
             } else {
@@ -534,6 +661,9 @@ impl<'a, 'backend> Executor<'a, 'backend> {
             self.record(run, binding, action, attempt, &outcome.as_ref().copied())?;
             if outcome? && !runtime_content_check(&action.kind) {
                 triggered.insert(item.action.id.as_str());
+            }
+            if stop_after == Some(action.id.as_str()) {
+                break;
             }
         }
         Ok(())
@@ -856,6 +986,22 @@ fn verify(backend: &dyn Backend, action: &Action) -> Result<(), BackendError> {
     }
 }
 
+fn changed_input(
+    plan: &Plan,
+    observe: &mut impl FnMut(&InputObservation) -> Result<Observation, String>,
+) -> Result<Option<String>, ExecutionError> {
+    for input in &plan.used_inputs {
+        let actual = observe(input).map_err(|message| ExecutionError::Input {
+            input: input.id.clone(),
+            message,
+        })?;
+        if actual != input.observation {
+            return Ok(Some(input.id.clone()));
+        }
+    }
+    Ok(None)
+}
+
 fn validate_run(run: &RunRecord, reviewed: &ReviewedPlan) -> Result<(), ExecutionError> {
     if run
         .actions
@@ -908,7 +1054,7 @@ pub fn load_plan_for_execution(
 ) -> Result<LoadedPlan, StateError> {
     match guard.load_plan(id, binding) {
         Ok(plan) => Ok(LoadedPlan::Approved(Box::new(plan))),
-        Err(StateError::ExpiredPlan { .. }) => Ok(LoadedPlan::Expired),
+        Err(StateError::ExpiredPlan { mode, .. }) => Ok(LoadedPlan::Expired(mode)),
         Err(error) => Err(error),
     }
 }

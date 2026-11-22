@@ -4,6 +4,7 @@ mod cache;
 mod config;
 mod execution;
 mod native;
+mod upgrade_apply;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,7 +24,7 @@ use dek_target::backend::BackendError;
 use config::{Config, INSTALL, Repository, SYNC, UPGRADE};
 use native::{Database, Handle, List, Native, Package, Question, ReplaceQuestion, items, text};
 
-pub(super) use execution::prepare_install;
+pub(super) use execution::prepare_transaction;
 
 pub(super) fn preview(
     installed: &BTreeMap<&str, &str>,
@@ -63,14 +64,7 @@ pub(super) fn preview(
         }
     }
     let gpg = path.join("gnupg");
-    fs::create_dir(&gpg).map_err(db_error)?;
-    fs::set_permissions(&gpg, fs::Permissions::from_mode(0o700)).map_err(db_error)?;
-    for file in ["pubring.gpg", "pubring.kbx", "trustdb.gpg", "gpg.conf"] {
-        // The system keyring is often readable without root. Unreadable public
-        // keys will cause ALPM to reject a database whose signature is required.
-        ignore_missing_or_permissions(fs::copy(config.gpg.join(file), gpg.join(file)))
-            .map_err(db_error)?;
-    }
+    snapshot_public_keyring(&config.gpg, &gpg).map_err(db_error)?;
     if unsafe { libc::geteuid() } == 0 && config.download_user.is_some() {
         // The downloader needs to traverse the scratch directory. The keyring
         // remains private and ALPM owns the temporary download directory.
@@ -146,6 +140,16 @@ fn ignore_missing_or_permissions(copied: io::Result<u64>) -> io::Result<()> {
     }
 }
 
+fn snapshot_public_keyring(source: &Path, staging: &Path) -> io::Result<()> {
+    fs::create_dir(staging)?;
+    fs::set_permissions(staging, fs::Permissions::from_mode(0o700))?;
+    for file in ["pubring.gpg", "pubring.kbx", "trustdb.gpg", "gpg.conf"] {
+        // ALPM rejects signed metadata if the snapshot lacks a trusted key.
+        ignore_missing_or_permissions(fs::copy(source.join(file), staging.join(file)))?;
+    }
+    Ok(())
+}
+
 struct Alpm {
     native: Native,
     handle: NonNull<Handle>,
@@ -171,6 +175,12 @@ impl Alpm {
         gpg: &Path,
         log: &Path,
     ) -> Result<Self, BackendError> {
+        let mut alpm = Self::initialize(config, database)?;
+        alpm.configure(config, gpg, log)?;
+        Ok(alpm)
+    }
+
+    fn initialize(config: &Config, database: &Path) -> Result<Self, BackendError> {
         let native = Native::load()?;
         let root = as_c(config.root.as_os_str().as_bytes())?;
         let db = as_c(database.as_os_str().as_bytes())?;
@@ -182,14 +192,12 @@ impl Alpm {
             let message = unsafe { text((native.alpm_strerror)(error)) }.unwrap_or_default();
             BackendError(format!("无法初始化 pacman 数据库：{message}"))
         })?;
-        let mut alpm = Self {
+        Ok(Self {
             native,
             handle,
             repositories: Vec::new(),
             sync: database.join("sync"),
-        };
-        alpm.configure(config, gpg, log)?;
-        Ok(alpm)
+        })
     }
 
     fn configure(&mut self, config: &Config, gpg: &Path, log: &Path) -> Result<(), BackendError> {

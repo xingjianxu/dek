@@ -133,6 +133,7 @@ pub(crate) fn apply_remote(
         TargetResult::ReviewRequired {
             reason,
             replacement,
+            mode,
         } => {
             let plan = match replacement {
                 Some(plan) => *plan,
@@ -142,13 +143,17 @@ pub(crate) fn apply_remote(
                         HostSelector::Named(name),
                         &mut session,
                         normal_cache(repo)?.as_ref(),
-                        PlanMode::Normal,
+                        mode,
                     )?
                     .plan
                 }
             };
             session.finish()?;
-            writeln!(out, "{reason}。请审阅新计划后使用 dek apply --plan")?;
+            writeln!(
+                out,
+                "{reason}。请审阅新计划并运行 dek apply -H {name} --plan {}",
+                plan.id
+            )?;
             write_plan(&mut *out, name, &plan, false)?;
             out.flush()?;
             Err(format!("等待审阅计划 {}", plan.id).into())

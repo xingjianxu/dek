@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+if [[ $# != 3 ]]; then
+    printf 'Usage: %s IMAGE_ID MANAGER_DEK GUEST_DEK\n' "$0" >&2
+    exit 2
+fi
+scripts=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+manager=$(realpath -e -- "$2")
+guest=$(realpath -e -- "$3")
+run_root="${DEK_DEV_ROOT:-/data/dek-dev}/runs/47"
+mkdir -p -- "$run_root"
+evidence=$(mktemp -d "$run_root/upgrade-apply.XXXXXXXX")
+printf 'Evidence: %s\n' "$evidence"
+ruby=$(realpath -e -- "$(command -v ruby)")
+[[ "$ruby" == /nix/store/*/bin/ruby ]]
+ruby_root="${ruby%/bin/ruby}"
+nix-store -qR "$ruby_root" | sed 's#^/##' > "$evidence/ruby-paths"
+
+run=
+cleanup() {
+    if [[ -n "$run" && ! -e "$run/result" ]]; then
+        "$scripts/run-arch-vm" finish "$run" failed || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+run=$("$scripts/run-arch-vm" start 47 "$1" "$guest")
+printf '%s\n' "$run" > "$evidence/run"
+grep -F 'restrict=on' "$run/qemu.command" > "$evidence/offline-network"
+tar -C / -cf - -T "$evidence/ruby-paths" | gzip -1 |
+    "$scripts/run-arch-vm" ssh "$run" sudo tar -xzpf - -C /
+"$scripts/run-arch-vm" ssh "$run" sudo env "PATH=$ruby_root/bin:/usr/bin" bash -s \
+    < "$scripts/tests/arch-upgrade-apply-guest" 2>&1 | tee "$evidence/local.log"
+
+export DEK_TEST_REAL_SSH DEK_TEST_SSH_CONFIG
+DEK_TEST_REAL_SSH=$(command -v ssh)
+DEK_TEST_SSH_CONFIG=$("$scripts/run-arch-vm" config "$run")
+mkdir -- "$evidence/bin" "$evidence/repo"
+cat > "$evidence/bin/ssh" <<'SH'
+#!/bin/sh
+exec "$DEK_TEST_REAL_SSH" -F "$DEK_TEST_SSH_CONFIG" "$@"
+SH
+chmod 0700 -- "$evidence/bin/ssh"
+target_id=$(<"$run/instance")
+jq -n --arg id "$target_id" '{
+    schemaVersion:1, hosts:{fixture:{entry:"entry.json",target:{ssh:"dek-vm"},targetId:$id}}
+}' > "$evidence/repo/dek.json"
+printf '%s\n' '{"schemaVersion":1,"imports":[],"options":[]}' > "$evidence/repo/entry.json"
+run_remote() {
+    XDG_CACHE_HOME="$evidence/cache" PATH="$evidence/bin:$PATH" \
+        "$manager" --repo "$evidence/repo" -H fixture "$@"
+}
+printf 'yes\n' | run_remote upgrade > "$evidence/remote-review.log"
+id=$(awk '/^计划 / {print $2}' "$evidence/remote-review.log")
+[[ "$id" =~ ^[0-9a-f]{64}$ ]]
+grep -Fq '3-1 → 4-1' "$evidence/remote-review.log"
+grep -Fq "dek apply -H fixture --plan $id" "$evidence/remote-review.log"
+! grep -Fq 'run_id ' "$evidence/remote-review.log"
+"$scripts/run-arch-vm" ssh "$run" sudo -n pacman -Q dek-upgrade-main | grep -Fx 'dek-upgrade-main 3-1'
+run_remote apply --plan "$id" --request-id remote-upgrade > "$evidence/remote-apply.log"
+run_id=$(awk '/^run_id / {print $2}' "$evidence/remote-apply.log")
+[[ "$run_id" =~ ^[0-9a-f]{64}$ ]]
+run_remote status --run "$run_id" --json > "$evidence/remote-status.json"
+jq -e --arg plan "$id" '.finished and .plan_id == $plan and .actions[0].result.verified.changed' \
+    "$evidence/remote-status.json" >/dev/null
+"$scripts/run-arch-vm" ssh "$run" sudo -n pacman -Q dek-upgrade-main | grep -Fx 'dek-upgrade-main 4-1'
+"$scripts/run-arch-vm" ssh "$run" cmp /run/dek-upgrade-apply/c/fixture.db /var/lib/pacman/sync/fixture.db
+"$scripts/run-arch-vm" ssh "$run" cmp /run/dek-upgrade-apply/c/fixture.db.sig /var/lib/pacman/sync/fixture.db.sig
+"$scripts/run-arch-vm" ssh "$run" sha256sum /var/lib/pacman/local/dek-upgrade-main-4-1/{desc,files,mtree} \
+    > "$evidence/remote-package-record.sha256"
+"$scripts/run-arch-vm" finish "$run" passed
+printf 'Reviewed local and SSH upgrade transactions passed.\n'
