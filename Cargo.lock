@@ -154,7 +154,9 @@ dependencies = [
  "dek-linux",
  "dek-target",
  "hostname",
+ "libc",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
