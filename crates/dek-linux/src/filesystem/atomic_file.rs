@@ -17,8 +17,8 @@ use rustix::{
 };
 
 pub(crate) struct TargetPath {
-    parent: OwnedFd,
-    name: OsString,
+    pub(super) parent: OwnedFd,
+    pub(super) name: OsString,
 }
 
 impl TargetPath {
@@ -30,12 +30,15 @@ impl TargetPath {
                 "expected an absolute path",
             ));
         }
-        let name = path
-            .file_name()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "expected a target file name")
-            })?
-            .to_owned();
+        let name = if path == Path::new("/") {
+            OsString::from(".")
+        } else {
+            path.file_name()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "expected a target file name")
+                })?
+                .to_owned()
+        };
         let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let mut parent = open("/", directory, Mode::empty())?;
         if let Some(prefix) = path.parent() {
@@ -103,7 +106,7 @@ pub(crate) fn same_revision(expected: &Stat, actual: &Stat) -> bool {
         && expected.st_size == actual.st_size
 }
 
-fn same_inode(expected: &Stat, actual: &Stat) -> bool {
+pub(super) fn same_inode(expected: &Stat, actual: &Stat) -> bool {
     expected.st_dev == actual.st_dev && expected.st_ino == actual.st_ino
 }
 
@@ -111,11 +114,7 @@ fn changed_path() -> io::Error {
     io::Error::other("the target file changed while preparing the action")
 }
 
-pub(crate) struct StagedFile<'a> {
-    target: &'a TargetPath,
-    directory: OwnedFd,
-    directory_name: String,
-}
+pub(crate) struct StagedFile<'a>(StagingDirectory<'a>);
 
 impl<'a> StagedFile<'a> {
     pub(crate) fn new(
@@ -125,9 +124,9 @@ impl<'a> StagedFile<'a> {
         gid: Option<Gid>,
         mode: Mode,
     ) -> io::Result<Self> {
-        let stage = Self::private_directory(target)?;
+        let stage = Self(StagingDirectory::new(target)?);
         let mut file = File::from(openat(
-            &stage.directory,
+            &stage.0.directory,
             "content",
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
@@ -150,7 +149,34 @@ impl<'a> StagedFile<'a> {
         Ok(stage)
     }
 
-    fn private_directory(target: &'a TargetPath) -> io::Result<Self> {
+    pub(crate) fn publish(self, expected: Option<&Stat>) -> io::Result<()> {
+        let stage = &self.0;
+        stage.target.require_unchanged(expected)?;
+        renameat(
+            &stage.directory,
+            "content",
+            &stage.target.parent,
+            &stage.target.name,
+        )?;
+        rustix::fs::fsync(&stage.target.parent)?;
+        Ok(())
+    }
+}
+
+impl Drop for StagedFile<'_> {
+    fn drop(&mut self) {
+        let _ = unlinkat(&self.0.directory, "content", AtFlags::empty());
+    }
+}
+
+pub(super) struct StagingDirectory<'a> {
+    target: &'a TargetPath,
+    pub(super) directory: OwnedFd,
+    directory_name: String,
+}
+
+impl<'a> StagingDirectory<'a> {
+    pub(super) fn new(target: &'a TargetPath) -> io::Result<Self> {
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let mode = Mode::RUSR | Mode::WUSR | Mode::XUSR;
         let directory_name = loop {
@@ -169,35 +195,30 @@ impl<'a> StagedFile<'a> {
             Mode::empty(),
         )?;
         let stat = fstat(&directory)?;
-        if stat.st_uid != geteuid().as_raw() || stat.st_mode & 0o7777 != 0o700 {
+        if stat.st_uid != geteuid().as_raw() || stat.st_mode & 0o077 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "unsafe staging directory",
             ));
         }
-        Ok(Self {
+        let stage = Self {
             target,
             directory,
             directory_name,
-        })
-    }
-
-    pub(crate) fn publish(self, expected: Option<&Stat>) -> io::Result<()> {
-        self.target.require_unchanged(expected)?;
-        renameat(
-            &self.directory,
-            "content",
-            &self.target.parent,
-            &self.target.name,
-        )?;
-        rustix::fs::fsync(&self.target.parent)?;
-        Ok(())
+        };
+        // umask may restrict the private owner bits. Preserve inherited setgid.
+        if stat.st_mode & 0o700 != 0o700 {
+            fchmod(
+                &stage.directory,
+                Mode::from_bits_truncate(stat.st_mode | 0o700),
+            )?;
+        }
+        Ok(stage)
     }
 }
 
-impl Drop for StagedFile<'_> {
+impl Drop for StagingDirectory<'_> {
     fn drop(&mut self) {
-        let _ = unlinkat(&self.directory, "content", AtFlags::empty());
         let info = fstat(&self.directory).ok().zip(
             statat(
                 &self.target.parent,
