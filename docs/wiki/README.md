@@ -1,6 +1,6 @@
 # dek GitHub Wiki 文档源码
 
-主仓库的 `docs/wiki/` 是 dek 用户文档的维护位置。通过主仓库的 PR 更新文档，合入后从已审阅的提交单向发布到 [GitHub Wiki](https://github.com/xingjianxu/dek/wiki)。页面间链接遵循 GitHub Wiki 约定（省略 `.md` 后缀，例如 `[快速上手](Quick-Start)`）。
+主仓库的 `docs/wiki/` 是 dek 用户文档的维护位置。通过主仓库的 PR 更新文档，合入后从已审阅的提交单向发布到 GitHub Wiki。页面间链接遵循 GitHub Wiki 约定，省略 `.md` 后缀，例如 `[快速上手](Quick-Start)`。[dek GitHub Wiki](https://github.com/xingjianxu/dek/wiki)
 
 ## 页面结构
 
@@ -42,11 +42,23 @@ wiki_dir=$(mktemp -d /tmp/dek-wiki.XXXXXXXX)
 )
 ```
 
-从源码移除页面时，在 Wiki 工作副本中用 `git rm` 暂存对应页面的删除。核对全部暂存差异。差异为空时，跳过提交和推送。有差异时，执行以下命令发布到 Wiki 的默认分支。
+从源码移除页面时，在 Wiki 工作副本中用 `git rm` 暂存对应页面的删除。核对全部暂存差异后，在同一 Bash 会话执行以下命令。差异为空时，命令会跳过提交和推送。
 
 ```bash
-git -C "$wiki_dir" commit -m "docs(wiki): 同步 dek 使用文档" &&
+(
+    set -e
+    : "${wiki_dir:?请先在当前 Bash 会话准备 Wiki 工作副本}"
+    wiki_origin=$(git -C "$wiki_dir" config --local --get remote.origin.url)
+    if [[ "$wiki_origin" != https://github.com/xingjianxu/dek.wiki.git ]]; then
+        printf '%s\n' '发布目录的远端地址与 dek Wiki 不符。' >&2
+        exit 1
+    fi
+    if git -C "$wiki_dir" diff --cached --quiet; then
+        exit 0
+    fi
+    git -C "$wiki_dir" commit -m "docs(wiki): 同步 dek 使用文档"
     git -C "$wiki_dir" push origin HEAD
+)
 ```
 
 推送后打开 Wiki，确认更新的页面和导航可访问。
