@@ -31,6 +31,7 @@ cd "$tree"
 
 ## 提交与评审
 
+- 实现受管动作时，优先通过重新观测目标状态和跳过已达标动作保证幂等。确实无法保证时，向开发者说明触发条件、原因及重复执行的影响，请开发者确认处理方式，并将结论写入 Issue 和任务卡。
 - 使用[仓库 git-commit skill](.agents/skills/git-commit/SKILL.md)。新克隆在仓库根目录执行 `git config --local core.hooksPath .githooks` 启用已有钩子。标题格式为 `<type>(<scope>): <中文摘要>`，scope 可省略，首行不超过 72 字符，末尾不加句号。正文用中文解释改动与原因，type、scope 和 footer token 用英文。
 - Feature 通常对应 `feat`，Bug 对应 `fix`，Task 可用 `refactor/docs/test/build/ci/perf/style/chore`。辅助文档、测试、回滚提交可按实际内容选 type。提交引用 `Refs: #<编号>`；agent 按 skill 写入相邻的 `Co-authored-by:` 和 `Model:` 两条 trailer。squash 提交同样遵循语言、Type 映射及署名约定。
 - PR 正文写明交付与验收证据。单个或最终 PR 使用 `Closes #<编号>`，中间 PR 普通引用 `#<编号>`。设计中的长期取舍随实现记录到 [docs/adr/](docs/adr/README.md)。
